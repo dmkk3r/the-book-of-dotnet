@@ -1,0 +1,359 @@
+---
+id: il-grundlagen
+title: IL und der Evaluation Stack
+summary: Warum der C#-Compiler keinen Maschinencode erzeugt, wie die Stackmaschine des IL mit Argumenten, Locals und dem Evaluation Stack rechnet und wie du IL liest, ohne dich vom Debug-Build täuschen zu lassen.
+status: draft
+sources:
+  - title: 'ECMA-335 (CLI-Standard), Partition I und III: Stackmodell und Instruktionssatz'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'OpCodes-Klasse (System.Reflection.Emit, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.reflection.emit.opcodes
+  - title: 'MethodBody-Klasse (System.Reflection, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.reflection.methodbody
+  - title: 'DebuggableAttribute-Klasse (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.debuggableattribute
+  - title: 'RyuJIT Overview (dotnet/runtime, Design Docs)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/ryujit-overview.md
+  - title: 'ILVerify (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/tree/main/src/coreclr/tools/ILVerify
+  - title: 'Ildasm.exe (IL-Disassembler, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/framework/tools/ildasm-exe-il-disassembler
+  - title: 'ILSpy (GitHub)'
+    url: https://github.com/icsharpcode/ILSpy
+  - title: 'SharpLab'
+    url: https://sharplab.io/
+updated: 2026-11-26
+---
+
+import { Block, Callout, CodeBlock, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './il-grundlagen.steps';
+import debugScript from './il-grundlagen-debug.steps';
+import objectScript from './il-grundlagen-objekte.steps';
+import { sharplabCode, reflectionCode } from './il-grundlagen-verify';
+
+<Block n={1} title="Das Problem">
+
+Der C#-Compiler weiß beim Übersetzen fast nichts über die Maschine, auf der dein Programm später läuft. Ob x64 oder Arm64, ob der Prozessor AVX-512 kann, ob das Programm unter Windows, Linux oder macOS startet: All das entscheidet sich erst beim Anwender. Würde der Compiler direkt Maschinencode erzeugen, bräuchtest du für jede Kombination ein eigenes Kompilat, und keines davon könnte die Fähigkeiten einer neueren CPU nutzen.
+
+Deshalb erzeugt der Compiler eine **Zwischensprache**, die Common Intermediate Language, kurz **IL** (früher MSIL oder CIL). Sie ist in ECMA-335 standardisiert und hat vier Eigenschaften, die alle auf dieses Problem antworten:
+
+- **Portabel:** IL beschreibt Rechenschritte ohne Register, ohne Aufrufkonvention und ohne Zeigerbreite. Dieselbe Assembly läuft auf jeder Plattform, für die es eine Runtime gibt.
+- **Typisiert und prüfbar:** Jede Instruktion hat genau festgelegte Typen für ihre Ein- und Ausgaben. Ein Werkzeug kann allein aus dem IL beweisen, dass eine Methode keinen Speicher falsch interpretiert.
+- **Kompakt:** Die meisten Instruktionen sind ein Byte lang, häufige Fälle haben eigene Kurzformen ohne Operanden.
+- **Gut zu übersetzen:** IL ist so gebaut, dass ein JIT-Compiler es in einem Durchgang lesen und in seine eigene Darstellung überführen kann.
+
+Dazu kommt ein Nebeneffekt, der .NET geprägt hat: C#, F# und Visual Basic erzeugen alle dasselbe IL. Die Runtime kennt keine dieser Sprachen, sie kennt nur IL und Metadaten.
+
+Wer das Rechenmodell hinter IL verstanden hat, kann jede IL-Ausgabe in SharpLab oder ILSpy lesen. Genau das brauchst du für den Rest dieses Kapitels.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+IL beschreibt eine **Stackmaschine**. Eine Methode hat während ihrer Ausführung drei Arten von Speicherplätzen:
+
+1. **Argumente:** nummeriert ab 0. Bei Instanzmethoden ist Argument 0 der Verweis `this`, die eigentlichen Parameter folgen ab 1.
+2. **Locals:** die lokalen Variablen der Methode, ebenfalls nummeriert ab 0. Ihre Typen stehen in einer Signatur in den Metadaten, ihre Namen gar nicht im IL, sondern höchstens in der PDB-Datei für den Debugger.
+3. **Evaluation Stack:** ein Stapel für Zwischenergebnisse. Zu Beginn der Methode ist er leer.
+
+Instruktionen haben keine Register und meist auch keine Operanden für ihre Daten. Sie nehmen ihre Eingaben **oben vom Stack** und legen ihr Ergebnis **oben auf den Stack**. `add` etwa nimmt zwei Werte und legt einen zurück. Um zwei Variablen zu addieren und das Ergebnis zu speichern, braucht IL deshalb vier Schritte: laden, laden, addieren, speichern. Daten fließen immer über den Stack: Argumente und Locals werden auf den Stack **geladen** (`ldarg`, `ldloc`) und vom Stack in Locals **gespeichert** (`stloc`).
+
+Merke dir dazu zwei Regeln, die ECMA-335 verlangt und die jeder Compiler einhalten muss:
+
+- An jeder Stelle im IL steht fest, **wie viele** Einträge welchen **Typs** auf dem Stack liegen, unabhängig davon, auf welchem Weg die Ausführung dorthin kam.
+- Die größte Anzahl an Einträgen, die jemals gleichzeitig auf dem Stack liegt, steht als `.maxstack` im Methodenkopf.
+
+<Callout kind="fehlannahme">
+  „Der Evaluation Stack ist der Stack aus dem Stack-Frame, also der Speicherbereich, auf dem auch
+  die lokalen Variablen liegen.“ Nein: Der Evaluation Stack ist ein Modell, mit dem IL Datenflüsse
+  beschreibt. Zur Laufzeit gibt es ihn nicht als eigenen Speicherbereich. Der JIT verteilt seine
+  Einträge auf Register und, wenn nötig, auf Plätze im Stack-Frame, ganz wie es ihm passt.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Die folgende Methode multipliziert zwei Zahlen und begrenzt das Ergebnis auf 100. Spiel den Aufruf `Scale(30, 5)` Schritt für Schritt durch. Achte darauf, wie Werte zwischen Argumenten, Locals und Stack hin und her wandern, und auf die Spalte „Tiefe“: Sie zeigt, wie viele Einträge vor und nach jeder Instruktion auf dem Stack liegen.
+
+<StepPlayer script={script} />
+
+Drei Dinge lohnen einen zweiten Blick. Erstens rechnet `mul` ohne jede Angabe, *was* es multipliziert: Die Eingaben ergeben sich allein aus dem Zustand des Stacks. Zweitens hat der Compiler aus `if (result > 100)` einen Sprung gemacht, der bei der **umgekehrten** Bedingung über den Rumpf des `if` hinwegspringt. So sehen fast alle Verzweigungen im IL aus. Drittens ist der Stack an der Stelle `IL_000c`, an der sich der Weg mit Sprung und der Weg ohne Sprung treffen, in beiden Fällen leer. Das ist kein Zufall, sondern eine Pflicht.
+
+</Block>
+
+<Block n={4} title="Der Befehlssatz">
+
+ECMA-335 definiert gut 200 Instruktionen. Für das Lesen von Compiler-Ausgaben reichen ein paar Familien, deren Namen einem festen Muster folgen: `ld` heißt laden (auf den Stack), `st` heißt speichern (vom Stack), danach folgt, *woher* oder *wohin*.
+
+{/* TODO(verify): Number of instructions in ECMA-335 Partition III (roughly 220 opcodes incl. prefixes). */}
+
+| Familie                                         | Wirkung                                                                                       |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `ldarg`, `starg`, `ldloc`, `stloc`              | Argument oder Local laden bzw. speichern                                                      |
+| `ldarga`, `ldloca`                              | Adresse eines Arguments oder Locals laden (für `ref` und Aufrufe auf Structs)                 |
+| `ldc.i4`, `ldc.i8`, `ldc.r4`, `ldc.r8`, `ldnull` | Konstante laden                                                                               |
+| `ldstr`                                         | Verweis auf ein String-Literal laden                                                          |
+| `add`, `sub`, `mul`, `div`, `ceq`, `cgt`, `clt` | Zwei Werte nehmen, Ergebnis zurücklegen                                                       |
+| `br`, `brtrue`, `brfalse`, `beq`, `blt`, `ble` … | Sprung, unbedingt oder abhängig von einem oder zwei Werten                                    |
+| `newobj`, `ldfld`, `stfld`, `ldsfld`, `stsfld`  | Objekt anlegen, Instanz- oder statisches Feld lesen bzw. schreiben                            |
+| `call`, `callvirt`, `ret`                       | Methode aufrufen, Methode verlassen                                                           |
+| `box`, `unbox.any`, `castclass`, `isinst`       | Boxing, Unboxing, Typumwandlung und Typtest                                                   |
+| `dup`, `pop`                                    | Obersten Eintrag verdoppeln oder verwerfen                                                    |
+
+Viele Instruktionen haben einen Operanden direkt hinter dem Opcode im Byte-Strom: eine Konstante, ein Sprungziel oder ein **Metadaten-Token**, das auf eine Methode, ein Feld oder einen Typ verweist. Wie diese Tokens aufgebaut sind und auf welche Tabellen sie zeigen, erklärt die Lektion „Metadatentabellen und Tokens“.
+
+### Kurzformen
+
+Weil bestimmte Fälle extrem häufig sind, hat IL für sie eigene Opcodes ohne Operanden:
+
+- `ldarg.0` bis `ldarg.3`, `ldloc.0` bis `ldloc.3`, `stloc.0` bis `stloc.3` für die ersten vier Argumente und Locals,
+- `ldc.i4.m1` sowie `ldc.i4.0` bis `ldc.i4.8` für die Zahlen -1 bis 8,
+- Varianten mit `.s` („short“) für alles, was in ein Byte passt: `ldarg.s` und `ldloc.s` für Index 4 bis 255, `ldc.i4.s` für -128 bis 127 und `br.s`, `brtrue.s`, `ble.s` und Co. für Sprünge um höchstens 127 Byte vorwärts oder 128 Byte zurück, gerechnet vom Ende der Sprunginstruktion.
+
+Für dich als Leser bedeuten alle Varianten dasselbe: `ldc.i4.5`, `ldc.i4.s 5` und `ldc.i4 5` laden alle die Zahl 5. Der Compiler wählt einfach die kürzeste Form. Opcodes sind ein Byte lang, seltenere Instruktionen wie `ceq`, `cgt` oder `ldftn` zwei Byte mit dem Präfix `0xFE`.
+
+### Der Stack ist typisiert, aber grob
+
+Auf dem Evaluation Stack gibt es nur wenige Typen: `int32`, `int64`, `native int`, Gleitkomma (`F`), Objektverweise (`O`) und verwaltete Zeiger (`&`), dazu Werttypen als Ganzes. Kleinere Ganzzahlen wie `bool`, `byte`, `char` und `short` gibt es dort nicht. Beim Laden werden sie auf `int32` erweitert, beim Speichern in ein Feld oder einen Local wieder abgeschnitten. Deshalb ist ein `bool` im IL einfach eine 0 oder eine 1 vom Typ `int32`, und deshalb kann `brtrue` sowohl auf Zahlen als auch auf Verweisen arbeiten: Es springt bei allem, was nicht 0 beziehungsweise `null` ist.
+
+Arithmetik wie `add` hat übrigens keinen Typ im Opcode. Ob sie zwei `int32` oder zwei `float64` addiert, ergibt sich aus den Typen auf dem Stack. Nur wo das nicht reicht, gibt es Varianten, etwa `add.ovf` für Addition mit Überlaufprüfung (`checked` in C#) oder `div.un` für vorzeichenlose Division.
+
+</Block>
+
+<Block n={5} title="Objekte, Felder und Aufrufe">
+
+Bisher lagen nur Zahlen auf dem Stack. Sobald Objekte ins Spiel kommen, liegen dort Verweise, und einige Instruktionen erledigen mehr als einen Schritt auf einmal. Das folgende Beispiel legt ein Objekt an, ruft eine Methode darauf auf und gibt ein Feld als `object` zurück:
+
+<StepPlayer script={objectScript} />
+
+### Aufrufe
+
+Für einen Aufruf legt der Aufrufer alle Argumente in Reihenfolge auf den Stack, bei Instanzmethoden zuerst das Objekt. Die aufgerufene Methode bekommt sie als ihre Argumente 0, 1, 2 und so weiter und beginnt mit einem eigenen, leeren Evaluation Stack. Kehrt sie zurück, liegt beim Aufrufer der Rückgabewert oben auf dem Stack, bei `void` nichts.
+
+Es gibt zwei Aufrufinstruktionen, und C# nutzt sie anders, als ihre Namen vermuten lassen:
+
+- `call` ruft genau die angegebene Methode auf, ohne virtuellen Dispatch. C# nimmt es für statische Methoden, für Methoden auf Structs und für `base.M()`.
+- `callvirt` sucht bei virtuellen Methoden die Implementierung des tatsächlichen Objekttyps. Zusätzlich prüft es vorher, ob das Objekt `null` ist. C# verwendet `callvirt` deshalb für Instanzmethoden auf Klassen in aller Regel auch dann, wenn die Methode **nicht** virtuell ist, wie `Add` im Beispiel. Der Grund ist allein diese Null-Prüfung: Ein Aufruf auf `null` soll sofort eine `NullReferenceException` werfen, nicht erst irgendwann innerhalb der Methode.
+
+{/* TODO(verify): Cases in which Roslyn emits call instead of callvirt for non-virtual instance methods on reference types (e.g. receiver known to be non-null). */}
+
+Wie `callvirt` bei virtuellen Methoden das Ziel findet, erklärt die Lektion „Virtuelle Aufrufe und Interface-Dispatch“. Für Aufrufe auf generischen Typparametern gibt es zusätzlich das Präfix `constrained.`, das Boxing vermeidet, wenn der Typ ein Werttyp ist.
+
+### newobj, Felder und box
+
+`newobj` ist eine der mächtigsten Instruktionen: Es reserviert Speicher für das Objekt, ruft den Konstruktor mit dem neuen Objekt als Argument 0 auf und legt danach den Verweis auf den Stack. Bei Werttypen ohne Heap-Objekt erzeugt C# stattdessen oft `initobj` oder einen `call` auf den Konstruktor mit der Adresse eines Locals.
+
+`ldfld` und `stfld` arbeiten immer mit einem Objekt auf dem Stack: `ldfld` nimmt den Verweis und legt den Feldwert ab, `stfld` nimmt Verweis und neuen Wert. Darum beginnt die Methode `Add` im IL-Tab mit zweimal `ldarg.0`: einmal als Ziel für `stfld`, einmal für das `ldfld`, das den alten Wert liest. Statische Felder brauchen kein Objekt und haben eigene Instruktionen, `ldsfld` und `stsfld`.
+
+Schließlich `box`: Es nimmt einen Werttyp vom Stack, kopiert ihn in ein neues Heap-Objekt und legt den Verweis zurück. Im C#-Quelltext steht davon nichts, der Compiler fügt es ein, weil die Methode `object` zurückgibt. Was dabei im Speicher passiert, zeigt die Lektion „Boxing und Unboxing“.
+
+</Block>
+
+<Block n={6} title="Sprünge, maxstack und Verifikation">
+
+### Feste Stackform an jeder Stelle
+
+ECMA-335 verlangt, dass an jeder Instruktion die **Stackform** feststeht: Anzahl und Typen der Einträge. Treffen sich zwei Wege, etwa nach einem `if` oder am Anfang einer Schleife, müssen beide dieselbe Form mitbringen. Ein Programm, das in einer Schleife bei jedem Durchlauf einen Wert mehr auf dem Stack liegen lässt, ist kein gültiges IL.
+
+Diese Regel macht IL für Werkzeuge einfach: Ein einziger Durchlauf von vorn nach hinten genügt, um für jede Instruktion die Typen auf dem Stack zu kennen. Genau das nutzen sowohl der JIT als auch Prüfwerkzeuge. Für Ausnahmeblöcke gibt es eine verschärfte Form: Beim Betreten eines `try`-Blocks muss der Stack leer sein, und verlassen wird er mit `leave`, das den Stack leert.
+
+### maxstack
+
+`.maxstack` gibt an, wie tief der Stack in dieser Methode höchstens wird. Im Beispiel oben ist es 2. Der Compiler berechnet den Wert, er steht im Kopf des Methodenrumpfs. Bei sehr kleinen Methoden ohne Locals passt er nicht in den Kopf, dann gilt implizit 8. Mehr zum Aufbau des Methodenrumpfs steht in „Aufbau einer Assembly“, siehe den Abschnitt „Metadaten und Methodenrümpfe“.
+
+Wichtig: `.maxstack` zählt **Einträge**, nicht Byte. Ein Eintrag kann eine Zahl, ein Verweis oder ein ganzes Struct sein. Der Wert ist eine Hilfe für Werkzeuge, die den Speicherbedarf ihrer Analyse vorab kennen wollen, keine Größenangabe für den Maschinenstack.
+
+### Gültig und verifizierbar
+
+ECMA-335 unterscheidet zwei Stufen. **Gültiges** IL hält sich an die Grammatik: richtige Opcodes, Stackform konsistent, Sprünge landen auf Instruktionsanfängen. **Verifizierbares** IL erfüllt zusätzlich die Typsicherheitsregeln: Es liest kein Feld eines Objekts, das den falschen Typ hat, und erzeugt keine Zeiger, die ins Leere zeigen können. Code mit `unsafe`, Zeigerarithmetik oder bestimmten `Unsafe`-Aufrufen ist gültig, aber nicht verifizierbar.
+
+Im .NET Framework spielte die Verifikation eine Rolle für teilweise vertrauenswürdigen Code. Moderne .NET-Versionen prüfen die Verifizierbarkeit zur Laufzeit nicht mehr. Ungültiges IL lehnt der JIT aber weiterhin ab, typischerweise mit einer `InvalidProgramException`. Wer selbst IL erzeugt, etwa mit `Reflection.Emit` oder einem IL-Weaver, kann es mit dem Werkzeug ILVerify aus dem dotnet/runtime-Repository prüfen.
+
+{/* TODO(verify): CoreCLR does not run the IL verifier at runtime; invalid IL leads to InvalidProgramException at JIT time; ILVerify location and distribution (dotnet-ilverify tool). */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Debug-IL ist nicht das IL deiner Anwendung
+
+Das häufigste Missverständnis beim Lesen von IL: Man schaut sich die Ausgabe eines Debug-Builds an und zieht daraus Schlüsse über die Performance. Der Compiler erzeugt im Debug-Modus bewusst anderes IL, damit der Debugger gut damit arbeiten kann. Vergleiche dieselbe Methode in beiden Konfigurationen:
+
+<StepPlayer script={debugScript} />
+
+Die Unterschiede haben alle einen Grund im Debugger: `nop`-Instruktionen geben Klammern und leeren Zeilen eine eigene IL-Position für Haltepunkte, Zwischenwerte wie das Ergebnis einer Bedingung oder der Rückgabewert landen in eigenen Locals, damit du sie im Debugger ansehen kannst, und ein gemeinsamer Ausgang mit `br.s` sorgt dafür, dass ein Haltepunkt auf der schließenden Klammer jede Rückkehr erwischt.
+
+Schwerer wiegt die Assembly-Eigenschaft aus dem letzten Schritt. Ein Debug-Build trägt ein `DebuggableAttribute`, das den JIT anweist, nicht zu optimieren. Ein Benchmark gegen einen Debug-Build misst also nicht nur anderes IL, sondern auch anderen Maschinencode. BenchmarkDotNet weigert sich aus diesem Grund, Debug-Builds zu messen.
+
+{/* TODO(verify): DebuggableAttribute with DisableOptimizations in Debug builds; BenchmarkDotNet validation error for non-optimized assemblies. */}
+
+### Kürzeres IL heißt nicht schnellerer Code
+
+Die zweite Falle ist subtiler. IL ist ein Austauschformat, kein Maschinencode. Eine Methode mit 30 Instruktionen kann schneller sein als eine mit 10, etwa weil der JIT einen Aufruf inlinen oder eine Bereichsprüfung entfernen kann. Lies IL, um zu verstehen, **was** der Compiler tut: Wo boxt er, wo legt er Objekte an, welche Methode ruft er auf. Wie schnell das ist, beantworten erst der JIT-Assembler oder eine Messung.
+
+### Ein Local im C#-Code ist nicht immer ein Local im IL
+
+Umgekehrt muss nicht jede Variable aus deinem Code im IL auftauchen. Im Release-Build lässt der Compiler einen Local weg, wenn er den Wert einfach auf dem Stack liegen lassen kann, und ersetzt ein zweites Lesen manchmal durch `dup`. Wer im IL nach einer bestimmten Variablen sucht, findet sie deshalb nicht immer, und die Nummerierung der Locals passt nicht zur Reihenfolge im Quelltext.
+
+{/* TODO(verify): Concrete Roslyn behaviour for eliminating locals in Release (stack scheduling of single-use locals, dup for two uses). */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Drei Werkzeuge decken fast alles ab:
+
+- **SharpLab** (sharplab.io) zeigt zu einem C#-Schnipsel sofort das IL, den gelowerten C#-Code und den JIT-Assembler. Mit dem Umschalter zwischen Debug und Release kannst du die Unterschiede von oben selbst sehen. Für kleine Fragen ist es das schnellste Werkzeug, mehr dazu in „SharpLab als Mikroskop“.
+- **ILSpy** öffnet beliebige Assemblies, auch die der Runtime selbst, und zeigt wahlweise C#, IL oder beides verschränkt. Damit siehst du, was in einer fertigen DLL steckt, die du nicht selbst kompiliert hast.
+- **ildasm** ist der klassische IL-Disassembler von Microsoft. Er liefert das IL in der Syntax, die auch `ilasm` wieder einlesen kann, und ist nützlich, wenn du IL bearbeiten und neu assemblieren willst.
+
+{/* TODO(verify): How ildasm is obtained for modern .NET (Windows SDK / Visual Studio, NuGet package Microsoft.NETCore.ILDAsm). */}
+
+Beim Lesen hilft ein einfacher Trick: Schreib dir hinter jede Instruktion die Stacktiefe, so wie in der Spalte „Tiefe“ oben. Jede Anweisung im C#-Code beginnt und endet fast immer bei Tiefe 0. Die Stellen dazwischen sind ein Ausdruck, der gerade ausgewertet wird. So findest du schnell die Grenzen zwischen den Anweisungen, auch ohne Debug-Informationen.
+
+Achte außerdem auf diese Instruktionen, denn sie verraten Kosten, die im Quelltext unsichtbar sind:
+
+- `box`: eine Heap-Allokation für einen Werttyp,
+- `newobj` auf einem Typ mit spitzen Klammern im Namen: ein vom Compiler erzeugtes Objekt, etwa für eine Closure (siehe „Lambdas und Closures“) oder eine State Machine,
+- `callvirt` auf Interface-Methoden in heißen Schleifen: ein Aufruf, den der JIT nicht immer direkt machen kann.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Runtime führt IL nicht Instruktion für Instruktion aus. Bevor eine Methode zum ersten Mal läuft, übersetzt der JIT ihr IL in Maschinencode. Die erste Phase dieser Übersetzung, der **Importer**, liest das IL von vorn nach hinten und **simuliert** dabei den Evaluation Stack: `ldarg.0` legt keinen Wert ab, sondern einen Knoten „Argument 0“, `mul` nimmt zwei Knoten und baut daraus einen Knoten „Multiplikation“, `stloc.0` hängt diesen Baum an eine Zuweisung an Local 0. Am Ende des Imports ist vom Stack nichts mehr übrig. Es gibt nur noch Bäume aus Operationen und Variablen.
+
+Erst die späteren Phasen entscheiden, wo Werte wirklich liegen. Die Registerzuteilung legt Argumente, Locals und Zwischenergebnisse so weit wie möglich in Register und nur den Rest in den Stack-Frame. Aus `Scale` wird so auf x64 eine Handvoll Instruktionen, die weder einen Evaluation Stack noch einen Local im Speicher kennen. Wie die Phasen zusammenspielen, erklärt „Die Pipeline von RyuJIT“.
+
+Das räumt mit einer zweiten verbreiteten Fehlannahme auf: IL werde ähnlich wie früher Java-Bytecode interpretiert. CoreCLR, die Runtime für Server- und Desktop-Anwendungen, übersetzt jede Methode vor der ersten Ausführung in Maschinencode. Nur in Umgebungen, in denen kein JIT erlaubt ist, etwa im Browser über WebAssembly, kommt ein Interpreter zum Einsatz.
+
+<Callout kind="version">
+  Wie gründlich übersetzt wird, hängt von der Stufe ab. Mit Tiered Compilation (Standard seit .NET
+  Core 3.0) entsteht zuerst schnell erzeugter, kaum optimierter Code, häufig aufgerufene Methoden
+  werden später neu übersetzt, siehe „Tiered Compilation und OSR“. ReadyToRun und Native AOT
+  übersetzen dasselbe IL schon vor der Ausführung. Am Ausgangspunkt IL ändert das nichts.
+</Callout>
+
+{/* TODO(verify): Interpreter usage: Mono interpreter for Blazor WebAssembly; status of the CoreCLR interpreter for iOS/WASM in .NET 10/11. Tiered compilation default since .NET Core 3.0. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente: das IL beider Methoden in SharpLab ansehen und das IL zur Laufzeit per Reflection auslesen.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „IL“. Vergleiche die Methode Scale mit dem Durchspielen oben und schalte dann zwischen Release und Debug um: Im Debug-Modus erscheinen nop, cgt mit einem bool-Local und ein zusätzlicher Local für den Rückgabewert. Prüfe bei Run, ob der Compiler einen Local für c anlegt oder dup verwendet, und finde das callvirt auf die nicht virtuelle Methode Add."
+  code={sharplabCode}
+/>
+
+`MethodBody` liefert für jede Methode den rohen IL-Strom, `.maxstack` und die Typen der Locals. Starte das folgende Programm einmal mit `dotnet run -c Release` und einmal mit `dotnet run -c Debug`:
+
+<CodeBlock code={reflectionCode} />
+
+Erwartete Ausgabe. Die Bytes sind die Opcodes aus dem Durchspielen: `02` ist `ldarg.0`, `5A` ist `mul`, `1F 64` ist `ldc.i4.s 100`, `31 03` ist `ble.s` mit einem Sprung um drei Byte, `2A` ist `ret`. In der Debug-Fassung findest du `00` (`nop`) und `FE 02` (`cgt`).
+
+{/* TODO(verify): Output of reflectionCode with dotnet run -c Release and -c Debug (current SDK). */}
+
+```text
+Release:
+maxstack: 2
+Locals:   Int32
+IL:       14 Byte, 02035A0A061F6431031F640A062A
+
+Debug:
+maxstack: 2
+Locals:   Int32, Boolean, Int32
+IL:       23 Byte, 0002035A0A061F64FE020B072C031F640A060C2B00082A
+```
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="il-grundlagen"
+  questions={[
+    {
+      q: 'Der Stack ist leer. Was liegt nach ldarg.0, ldarg.1, add darauf?',
+      options: [
+        'Drei Einträge: beide Argumente und die Summe',
+        'Ein Eintrag: die Summe',
+        'Nichts, add speichert das Ergebnis in Local 0',
+      ],
+      correct: 1,
+      explanation:
+        'add nimmt die beiden obersten Einträge vom Stack und legt nur das Ergebnis zurück. Gespeichert wird erst mit einem stloc.',
+    },
+    {
+      q: 'Warum ruft C# eine nicht virtuelle Instanzmethode einer Klasse in der Regel mit callvirt auf?',
+      options: [
+        'Damit die Methode später virtuell werden kann',
+        'Weil callvirt vorher prüft, ob das Objekt null ist',
+        'Weil call nur für statische Methoden erlaubt ist',
+      ],
+      correct: 1,
+      explanation:
+        'callvirt wirft bei null sofort eine NullReferenceException. call ist für Instanzmethoden durchaus erlaubt, C# nutzt es etwa für Structs und base-Aufrufe.',
+    },
+    {
+      q: 'Was bedeutet .maxstack 2?',
+      options: [
+        'Die Methode belegt höchstens 2 Byte auf dem Maschinenstack',
+        'Die Methode hat höchstens 2 lokale Variablen',
+        'Auf dem Evaluation Stack liegen nie mehr als 2 Einträge gleichzeitig',
+      ],
+      correct: 2,
+      explanation:
+        '.maxstack zählt Einträge des Evaluation Stack, unabhängig von deren Größe. Mit Locals und dem Maschinenstack hat der Wert nichts zu tun.',
+    },
+    {
+      q: 'Wo liegen die Einträge des Evaluation Stack, wenn die Methode als Maschinencode läuft?',
+      options: [
+        'In einem eigenen Speicherbereich, den die Runtime pro Thread verwaltet',
+        'Wo der JIT sie hinlegt: meist in Registern, sonst im Stack-Frame',
+        'Immer im Stack-Frame direkt hinter den Locals',
+      ],
+      correct: 1,
+      explanation:
+        'Der Evaluation Stack existiert nur als Modell. Der Importer des JIT löst ihn in Bäume auf, die Registerzuteilung entscheidet über den Ort jedes Werts.',
+    },
+    {
+      q: 'Kann der Compiler die Zahl 200 mit ldc.i4.s laden?',
+      options: [
+        'Ja, ldc.i4.s ist für alle Werte bis 255',
+        'Nein, ldc.i4.s nimmt ein vorzeichenbehaftetes Byte (-128 bis 127), für 200 braucht es ldc.i4',
+      ],
+      correct: 1,
+      explanation:
+        'Der Operand von ldc.i4.s ist ein int8 und wird auf int32 erweitert. 200 passt nicht hinein, also nimmt der Compiler die Form mit vier Byte.',
+    },
+    {
+      q: 'Du vergleichst zwei Varianten einer Methode im IL eines Debug-Builds. Was ist das Problem?',
+      options: [
+        'Keins, Debug-IL und Release-IL sind bis auf die nop-Instruktionen gleich',
+        'Debug-IL enthält zusätzliche Locals und Sprünge, und der JIT optimiert Debug-Assemblies nicht',
+        'Debug-IL wird interpretiert statt kompiliert',
+      ],
+      correct: 1,
+      explanation:
+        'Der Compiler erzeugt für den Debugger zusätzliche Locals, nop und Sprünge, und das DebuggableAttribute schaltet die JIT-Optimierungen ab. Interpretiert wird es trotzdem nicht.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Der C#-Compiler erzeugt **IL**, eine portable, typisierte und kompakte Zwischensprache. Maschinencode entsteht erst durch JIT, ReadyToRun oder Native AOT.
+- IL ist eine **Stackmaschine**: Instruktionen nehmen ihre Eingaben vom **Evaluation Stack** und legen Ergebnisse dort ab. Argumente und Locals sind eigene, nummerierte Plätze, die mit `ldarg`, `ldloc` und `stloc` angesprochen werden.
+- An jeder Stelle steht die **Stackform** fest, auch dort, wo sich Wege treffen. Die größte Tiefe steht als `.maxstack` im Methodenkopf und zählt Einträge, nicht Byte.
+- `newobj` legt an und ruft den Konstruktor, `ldfld` und `stfld` brauchen das Objekt auf dem Stack, `box` macht aus einem Wert ein Objekt. C# ruft Instanzmethoden von Klassen mit **`callvirt`** auf, auch nicht virtuelle, wegen der Null-Prüfung.
+- **Debug-IL** enthält `nop`, zusätzliche Locals und Sprünge für den Debugger, und der JIT optimiert Debug-Assemblies nicht. Lies und miss immer Release.
+- Der Evaluation Stack ist **ein Modell**: Der JIT löst ihn beim Import in Bäume auf und legt die Werte in Register. Interpretiert wird IL in CoreCLR nicht.
+
+</Block>

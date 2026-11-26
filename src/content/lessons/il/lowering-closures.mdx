@@ -1,0 +1,432 @@
+---
+id: lowering-closures
+title: Lambdas und Closures
+summary: Was der C#-Compiler aus Lambdas macht, warum eingefangene Variablen auf den Heap umziehen, wann dabei Objekte entstehen und wie du die typischen Fallen mit Schleifen, Lebensdauer und versteckten Allokationen erkennst.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Lambdaausdrücke (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/lambda-expressions
+  - title: 'Lokale Funktionen (C#-Programmierhandbuch, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/local-functions
+  - title: 'Static anonymous functions (C# 9 Feature-Spezifikation, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/proposals/csharp-9.0/static-anonymous-functions
+  - title: 'Neuerungen in C# 11 (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-11
+  - title: 'Iterationsanweisungen: for und foreach (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/iteration-statements
+  - title: 'Delegates (C#-Programmierhandbuch, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/delegates/
+  - title: 'ClosureConversion im Roslyn-Compiler (dotnet/roslyn)'
+    url: https://github.com/dotnet/roslyn/tree/main/src/Compilers/CSharp/Portable/Lowering/ClosureConversion
+  - title: 'Delegate.CoreCLR.cs (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/System.Private.CoreLib/src/System/Delegate.CoreCLR.cs
+  - title: 'ECMA-335 (CLI-Standard), Partition II: Delegates'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'SharpLab'
+    url: https://sharplab.io/
+updated: 2026-11-26
+---
+
+import { Block, Callout, CodeBlock, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './lowering-closures.steps';
+import forScript from './lowering-closures-for.steps';
+import copyScript from './lowering-closures-copy.steps';
+import { sharplabCode, benchmarkCode, cachedDelegateIl } from './lowering-closures-verify';
+
+<Block n={1} title="Das Problem">
+
+Lambdas sind so selbstverständlich geworden, dass man kaum noch darüber nachdenkt, was sie eigentlich leisten. Betrachte diese Methode:
+
+```csharp
+static Func<int> MakeCounter()
+{
+    int count = 0;
+    return () => ++count;
+}
+
+var next = MakeCounter();
+next(); next();
+Console.WriteLine(next());   // 3
+```
+
+`count` ist eine lokale Variable von `MakeCounter`. Lokale Variablen leben im Stack-Frame ihrer Methode, und dieser Frame ist weg, sobald `MakeCounter` zurückkehrt. Trotzdem liest und schreibt die Lambda `count` noch Minuten später, und der Wert bleibt zwischen den Aufrufen erhalten. Irgendwo muss diese Variable also weiterleben.
+
+Die Runtime hilft dabei nicht. Sie kennt keine Lambdas und keine Closures. IL hat keine Instruktion für „fang diese Variable ein“. Was die Runtime kennt, sind **Delegates**: Objekte, die auf eine Methode zeigen und optional auf ein Objekt, auf dem diese Methode aufgerufen wird. Mehr nicht.
+
+Der C#-Compiler muss jede Lambda also in Dinge übersetzen, die es in IL gibt: Methoden, Klassen, Felder und Delegates. Diese Übersetzung heißt **Lowering**, und ihr Ergebnis erklärt nicht nur, warum Closures funktionieren, sondern auch drei Dinge, die viele überraschen: warum manche Lambdas bei jedem Aufruf Speicher allozieren und andere nie, warum eine Schleife plötzlich dreimal dieselbe Zahl ausgibt und warum ein harmloser Event-Handler ein großes Array am Leben halten kann.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Ein **Delegate** ist ein Paar: ein **Ziel** (das Objekt, das beim Aufruf `this` wird, oder keins) und eine **Methode**. Jede Lambda wird deshalb zu zwei Dingen: Ihr Rumpf wird zu einer echten Methode mit einem vom Compiler erzeugten Namen, und an der Stelle, an der die Lambda im Code steht, entsteht ein Delegate auf diese Methode.
+
+Wo die Methode landet und was das Ziel ist, hängt allein davon ab, **was die Lambda einfängt**:
+
+| Die Lambda verwendet                           | Ihre Methode wird                                  | Ziel des Delegates  | Allokationen pro Ausführung                     |
+| ---------------------------------------------- | -------------------------------------------------- | ------------------- | ----------------------------------------------- |
+| nichts von außen                               | Instanzmethode einer Singleton-Klasse `<>c`        | das Singleton       | keine, der Delegate wird gecacht                |
+| nur `this` (Felder, Instanzmethoden)           | private Instanzmethode deiner Klasse               | `this`              | ein Delegate                                    |
+| lokale Variablen oder Parameter                | Instanzmethode einer **Display-Klasse**            | das Display-Objekt  | ein Display-Objekt und ein Delegate pro Lambda  |
+
+Der dritte Fall ist die eigentliche **Closure**. Für jeden Gültigkeitsbereich (Scope), in dem eingefangene Variablen deklariert sind, erzeugt der Compiler eine Klasse, die Display-Klasse. Jede eingefangene Variable wird ein **Feld** dieser Klasse. Und zwar nicht nur für die Lambda: Auch die umgebende Methode liest und schreibt die Variable ab jetzt über dieses Feld. Die Variable zieht um, vom Stack-Frame in ein Objekt auf dem Heap. Dort lebt sie so lange, wie irgendjemand das Objekt erreicht.
+
+<Callout kind="fehlannahme">
+  „Eine Closure kopiert die verwendeten Variablen in dem Moment, in dem die Lambda erzeugt wird.“
+  Nein: Es gibt keine Kopie. Lambda und umgebende Methode teilen sich dieselbe Variable, ein Feld im
+  Display-Objekt. Ändert eine Seite den Wert, sieht die andere die Änderung sofort.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Zwei Lambdas fangen dieselbe Variable ein: eine erhöht sie, die andere liest sie. Achte darauf, dass `count` von Anfang an nicht im Stack-Frame steht, und auf den Schritt, in dem `Main` selbst `count = 10` schreibt.
+
+<StepPlayer script={script} />
+
+Schau dir in diesem Beispiel die Tabs „IL“ und „Gelowert“ an. Der Tab „Gelowert“ zeigt den Code so, wie der Compiler ihn intern umgeschrieben hat, als C# mit den unaussprechlichen Namen, die SharpLab ebenfalls anzeigt. Im IL erkennst du das typische Muster für jede Lambda mit Ziel: `ldloc` (das Ziel), `ldftn` (die Adresse der Methode), `newobj` auf den Konstruktor des Delegate-Typs. Jeder Aufruf `inc()` wird zu einem `callvirt` auf `Invoke`.
+
+Die Namen der erzeugten Typen und Methoden enthalten spitze Klammern. Das ist Absicht: In C# sind solche Bezeichner ungültig, also kann kein von dir geschriebener Name je mit ihnen kollidieren. In IL und in den Metadaten sind sie erlaubt.
+
+{/* TODO(verify): Naming scheme of generated members (<>c__DisplayClass{method}_{scope}, <Main>b__0, <>c, <>9, <>9__0_0, <M>g__Local|0_0, <>O) against current Roslyn; the names are an implementation detail and not specified. */}
+
+</Block>
+
+<Block n={4} title="Lambdas ohne Closure">
+
+### Der Cache in `<>c`
+
+Eine Lambda, die nichts von außen verwendet, braucht kein individuelles Ziel. Jeder Delegate für sie wäre gleichwertig. Der Compiler erzeugt deshalb eine verschachtelte Klasse `<>c` mit einer einzigen Instanz und einem statischen Feld pro Lambda, in dem der Delegate beim ersten Gebrauch abgelegt wird:
+
+```csharp
+// public Func<int, int> NoCapture() => x => x * 2;  wird sinngemäß zu:
+[CompilerGenerated]
+private sealed class <>c
+{
+    public static readonly <>c <>9 = new <>c();
+    public static Func<int, int> <>9__0_0;
+
+    internal int <NoCapture>b__0_0(int x) => x * 2;
+}
+
+public Func<int, int> NoCapture()
+    => <>c.<>9__0_0 ??= new Func<int, int>(<>c.<>9.<NoCapture>b__0_0);
+```
+
+Im IL sieht das so aus: Feld laden, bei `null` den Delegate bauen und im Feld ablegen, sonst den vorhandenen nehmen.
+
+<CodeBlock code={cachedDelegateIl} lang="il" />
+
+{/* TODO(verify): Exact IL of the cached-delegate pattern in SharpLab (Release), including offsets. */}
+
+Nach dem ersten Aufruf alloziert diese Lambda also nie wieder. Die Initialisierung ist nicht synchronisiert. Rufen zwei Threads gleichzeitig zum ersten Mal auf, entstehen eventuell zwei Delegates, einer davon überschreibt den anderen. Da beide gleichwertig sind, schadet das nicht.
+
+Auffällig ist, dass der Rumpf eine **Instanzmethode** auf einem Singleton wird und keine statische Methode, obwohl er gar kein `this` braucht. Der Grund liegt in der Runtime: Ein Delegate mit Ziel ruft seine Methode direkt mit dem Ziel als `this` auf. Ein Delegate auf eine statische Methode muss dagegen beim Aufruf die Argumente umsortieren, weil der Aufrufer das Ziel immer mitschickt. Das kostet einen kleinen Umweg, den das Singleton vermeidet.
+
+{/* TODO(verify): Rationale for instance methods on <>c (closed delegates are invoked faster than open static delegates, which need a shuffle thunk) in Roslyn design notes or dotnet/runtime. */}
+
+### Nur `this`
+
+Verwendet eine Lambda Felder oder Instanzmethoden, aber keine lokalen Variablen, wird ihr Rumpf eine private Instanzmethode deiner eigenen Klasse. Ziel des Delegates ist `this`. Eine Display-Klasse braucht es nicht, `this` ist ja schon ein Objekt auf dem Heap.
+
+```csharp
+// public Func<int, int> CaptureThis() => x => x * _factor;  wird sinngemäß zu:
+private int <CaptureThis>b__1_0(int x) => x * _factor;
+
+public Func<int, int> CaptureThis() => new Func<int, int>(<CaptureThis>b__1_0);
+```
+
+Cachen kann der Compiler diesen Delegate nicht, denn jedes Objekt braucht seinen eigenen. Jede Ausführung von `CaptureThis` alloziert deshalb einen neuen Delegate. Genau das passiert bei LINQ-Aufrufen wie `_data.Count(x => x > _threshold)`, wie die Lektion „Allokation und Allocation Contexts“ misst.
+
+### static-Lambdas und Methodengruppen
+
+Seit C# 9 kannst du eine Lambda mit `static` markieren: `static x => x * 2`. Verwendet sie dann doch eine lokale Variable oder `this`, meldet der Compiler einen Fehler. Am erzeugten Code ändert `static` nichts, die Lambda landet wie jede andere ohne Closure in `<>c`. Der Nutzen ist eine Garantie: Niemand kann später versehentlich eine Variable hineinziehen und damit eine Allokation pro Aufruf einführen.
+
+{/* TODO(verify): That static lambdas produce the same code as non-capturing lambdas (cached in <>c). */}
+
+Ähnlich, aber mit anderer Geschichte, verhalten sich **Methodengruppen**: `Func<int, int> f = Twice;` mit einer statischen Methode `Twice`. Bis C# 10 erzeugte jede solche Umwandlung einen neuen Delegate, während die gleichwertige Lambda `x => Twice(x)` gecacht wurde. Seit C# 11 darf der Compiler auch Delegates aus statischen Methodengruppen in einem statischen Feld cachen. Methodengruppen auf Instanzmethoden, etwa `list.ForEach(Print)` mit einer Instanzmethode `Print`, erzeugen weiterhin jedes Mal einen Delegate mit `this` als Ziel.
+
+{/* TODO(verify): C# 11 caching of static method group conversions (nested class <>O, field naming) and that it applies only to static methods. */}
+
+</Block>
+
+<Block n={5} title="Die Display-Klasse im Detail">
+
+### Sie entsteht beim Betreten des Scopes
+
+Die Display-Klasse gehört nicht zur Lambda, sondern zum **Scope**, in dem die eingefangenen Variablen deklariert sind. Das Objekt wird angelegt, sobald die Ausführung diesen Scope betritt, also bevor die Variable ihren ersten Wert bekommt, und nicht erst an der Stelle, an der die Lambda steht. Bei eingefangenen Parametern ist der Scope die ganze Methode: Das Display-Objekt entsteht direkt am Anfang, und die Parameter werden hineinkopiert. Danach arbeitet die Methode nur noch mit den Feldern.
+
+Fängt eine Lambda zusätzlich `this` ein, bekommt die Display-Klasse ein Feld für den Verweis auf `this`, im erzeugten Code meist `<>4__this` genannt.
+
+### Ein Scope, eine Display-Klasse
+
+Alle Lambdas, die Variablen aus demselben Scope einfangen, teilen sich **eine** Display-Klasse und damit ein Objekt. Das war im Durchspielen gewollt, kann aber die Lebensdauer von Objekten unbemerkt verlängern:
+
+```csharp
+void Attach(Button button, byte[] hugeBuffer)
+{
+    button.Click += (s, e) => Console.WriteLine(button.Name);
+    Task.Run(() => Process(hugeBuffer));
+}
+```
+
+Beide Lambdas fangen Parameter derselben Methode ein, also landen `button` und `hugeBuffer` als Felder im selben Display-Objekt. Der Click-Handler braucht nur `button`, hält aber über sein Ziel das ganze Display-Objekt fest und damit auch `hugeBuffer`. Solange der Button lebt und der Handler registriert ist, kann der GC das Array nicht einsammeln, obwohl `Process` längst fertig ist.
+
+{/* TODO(verify): Current Roslyn still merges all captured variables of one scope into one display class (no splitting by lambda). */}
+
+Abhilfe schafft, die Lambdas in getrennte Methoden zu verlagern oder Variablen in getrennten Scopes zu deklarieren, sodass jede Lambda ihre eigene Display-Klasse bekommt.
+
+### Verschachtelte Scopes
+
+Fängt eine Lambda Variablen aus zwei verschachtelten Scopes ein, etwa eine Variable der Methode und eine aus einem Schleifenrumpf, entstehen zwei Display-Klassen. Die innere bekommt ein Feld mit einem Verweis auf die äußere. So teilen sich alle Durchläufe die äußere Variable, während jeder Durchlauf seine eigene innere hat. Genau diese Unterscheidung zwischen „ein Scope für alle Durchläufe“ und „ein Scope pro Durchlauf“ entscheidet über die berühmteste Falle mit Closures.
+
+</Block>
+
+<Block n={6} title="Lokale Funktionen">
+
+Lokale Funktionen sehen aus wie benannte Lambdas, werden aber anders übersetzt. Eine lokale Funktion ist zunächst nur eine Methode, kein Delegate. Solange du sie direkt aufrufst und nie in einen Delegate umwandelst, kann sie nicht länger leben als die umgebende Methode. Der Compiler nutzt das aus:
+
+```csharp
+public int LocalFunction(int offset)
+{
+    return Add(1) + Add(2);
+
+    int Add(int x) => x + offset;
+}
+
+// wird sinngemäß zu:
+private struct <>c__DisplayClass4_0
+{
+    public int offset;
+}
+
+public int LocalFunction(int offset)
+{
+    <>c__DisplayClass4_0 closure = default;
+    closure.offset = offset;
+    return <LocalFunction>g__Add|4_0(1, ref closure) + <LocalFunction>g__Add|4_0(2, ref closure);
+}
+
+internal static int <LocalFunction>g__Add|4_0(int x, ref <>c__DisplayClass4_0 closure)
+    => x + closure.offset;
+```
+
+{/* TODO(verify): Struct display class for local functions not converted to delegates, passed by ref as an extra last parameter; generated names in SharpLab. */}
+
+Die Display-Klasse ist hier ein **Struct** und liegt als Local im Stack-Frame. Die lokale Funktion bekommt sie per `ref` als zusätzlichen Parameter. Es gibt weder ein Heap-Objekt noch einen Delegate, die Closure kostet keine einzige Allokation. Fängt die lokale Funktion gar nichts ein, wird sie eine gewöhnliche statische Methode.
+
+Das ändert sich, sobald du die lokale Funktion irgendwo in einen Delegate umwandelst, etwa `list.ForEach(Add)`, oder wenn eine Lambda sie verwendet. Dann muss die Closure den Methodenaufruf überleben können, und der Compiler fällt auf eine Display-**Klasse** auf dem Heap zurück, genau wie bei einer Lambda. Mit `static` (seit C# 8) kannst du auch bei lokalen Funktionen erzwingen, dass sie nichts einfangen.
+
+Wie Structs im Stack-Frame liegen und warum `ref` dabei keine Kopie erzeugt, erklärt die Lektion „Wert- und Referenztypen“.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Die Schleifenvariable der for-Schleife
+
+Die bekannteste Falle: Lambdas, die in einer `for`-Schleife die Schleifenvariable einfangen.
+
+<StepPlayer script={forScript} />
+
+Die Variable `i` einer `for`-Schleife ist **einmal** für die gesamte Schleife deklariert. Also gibt es eine Display-Klasse und ein Objekt, und alle Delegates zeigen darauf. Wenn sie später aufgerufen werden, lesen sie den letzten Wert, den die Schleife hinterlassen hat. Das ist bei Rückrufen besonders tückisch, die erst später laufen, etwa mit `Task.Run` in einer Schleife.
+
+### Eine Kopie pro Durchlauf
+
+Die Lösung ist eine Variable, deren Scope der **Schleifenrumpf** ist:
+
+<StepPlayer script={copyScript} />
+
+Bei `foreach` brauchst du diese Kopie nicht. Seit C# 5 ist die Iterationsvariable so definiert, als wäre sie im Rumpf deklariert. Jede Iteration bekommt eine eigene Variable und damit, falls sie eingefangen wird, ein eigenes Display-Objekt:
+
+```csharp
+foreach (int n in numbers)
+    actions.Add(() => Console.Write(n));
+
+// seit C# 5 sinngemäß (ohne try/finally):
+var e = numbers.GetEnumerator();
+while (e.MoveNext())
+{
+    var closure = new <>c__DisplayClass0_0();
+    closure.n = e.Current;
+    actions.Add(new Action(closure.<Main>b__0));
+}
+```
+
+Vor C# 5 lag `n` außerhalb der Schleife, und `foreach` hatte dieselbe Falle wie `for`. Die Änderung war einer der seltenen bewusst in Kauf genommenen Breaking Changes in C#. Bei `for` blieb es beim alten Verhalten, weil dort die Variable sichtbar im Kopf der Schleife verändert wird. Wie `foreach` sonst übersetzt wird, zeigt „foreach, using und lock“.
+
+### Allokation auf dem schnellen Weg
+
+Weil das Display-Objekt beim Betreten des Scopes entsteht, kostet eine Lambda manchmal auch dann, wenn sie gar nicht ausgeführt wird:
+
+```csharp
+public int GetOrCompute(string key, int factor)
+{
+    if (_cache.TryGetValue(key, out int value))
+        return value;   // auch hier wurde schon ein Display-Objekt angelegt
+    return _cache.GetOrAdd(key, k => Compute(k, factor));
+}
+```
+
+`factor` ist ein Parameter, also beginnt sein Scope am Anfang der Methode, und dort entsteht das Display-Objekt. Auch jeder Cache-Treffer alloziert. Zwei Auswege: die Lambda in eine eigene kleine Methode auslagern, sodass die Closure nur auf dem langsamen Weg entsteht, oder eine Überladung mit Zustandsparameter nutzen und die Lambda `static` machen:
+
+```csharp
+return _cache.GetOrAdd(key, static (k, f) => Compute(k, f), factor);
+```
+
+Hier reicht `GetOrAdd` den Wert selbst an die Lambda weiter. Sie fängt nichts ein, wird in `<>c` gecacht und alloziert nichts (vorausgesetzt, `Compute` ist statisch). Viele APIs der BCL bieten solche Überladungen, etwa `string.Create` oder `ConcurrentDictionary.GetOrAdd`.
+
+{/* TODO(verify): Display class allocated at method entry for captured parameters even when the lambda is not reached (Roslyn), check with SharpLab. */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die Übersicht der Kosten, jeweils pro Ausführung der Stelle, an der der Delegate entsteht:
+
+| Form                                                   | Allokationen pro Ausführung                                  |
+| ------------------------------------------------------ | ------------------------------------------------------------ |
+| Lambda ohne Closure, auch `static`                     | keine (nach dem ersten Mal)                                  |
+| Methodengruppe auf statischer Methode, ab C# 11        | keine (nach dem ersten Mal)                                  |
+| Methodengruppe auf Instanzmethode                      | ein Delegate                                                 |
+| Lambda, die nur `this` verwendet                       | ein Delegate                                                 |
+| Lambda mit lokalen Variablen oder Parametern           | ein Display-Objekt pro Scope-Eintritt und ein Delegate pro Lambda |
+| lokale Funktion mit Closure, nur direkt aufgerufen     | keine                                                        |
+
+{/* TODO(verify): Sizes on x64: delegate 64 B, display class with one int 24 B (BenchmarkDotNet MemoryDiagnoser, see VerifyCard). */}
+
+Auf einem 64-Bit-System ist ein Delegate 64 Byte groß, ein Display-Objekt mit einem `int` 24 Byte. Das sind gewöhnliche, kurzlebige Gen0-Objekte, die Allokation selbst ist billig. Für die meisten Codepfade spielt das keine Rolle, und du solltest deinen Code deswegen nicht verbiegen. Interessant wird es in heißen Pfaden: in Schleifen über Millionen Elemente, in Request-Pipelines eines Servers, in Code, der pro Frame läuft.
+
+Für solche Stellen haben sich einige Muster bewährt:
+
+- **Erst im IL nachsehen.** In SharpLab verrät die Ansicht „C#“ mit den gelowerten Namen sofort, ob eine Display-Klasse oder ein `<>c`-Cache entsteht. Im IL suchst du nach `newobj` auf Typen mit `DisplayClass` im Namen und nach `newobj` auf Delegate-Konstruktoren ohne vorheriges `ldsfld`.
+- **`static` als Absicherung.** Markiere Lambdas in heißen Pfaden als `static`. Dann bricht der Build, wenn jemand später eine Closure einführt.
+- **Zustand durchreichen statt einfangen.** Nutze Überladungen mit einem Zustandsparameter, wie oben bei `GetOrAdd`.
+- **Delegates einmal erzeugen.** Eine Lambda, die nur `this` braucht und oft übergeben wird, kannst du einmal im Konstruktor in einem Feld ablegen.
+- **Lokale Funktionen für Hilfslogik.** Brauchst du nur eine Hilfsfunktion innerhalb einer Methode und keinen Delegate, ist eine lokale Funktion kostenlos.
+
+Und vergiss die Lebensdauer nicht: Ein Delegate, der in einem Event, einem Cache oder einem statischen Feld landet, hält sein Ziel und damit alle eingefangenen Variablen fest. Wie man solche Verweisketten im Speicherabbild findet, zeigt „dotnet-counters, -trace, -dump, -gcdump“.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Für die Runtime ist eine Closure nichts Besonderes. Sie sieht eine Klasse mit Feldern, eine Methode und einen Delegate, der auf beides zeigt. Der Delegate-Typ selbst, etwa `Func<int, int>`, hat keinen IL-Rumpf für `Invoke`: Die Methode ist laut ECMA-335 „runtime managed“, die Runtime stellt den Code dafür bereit. Ein Aufruf über einen Delegate ist deshalb ein indirekter Sprung auf den gespeicherten Methodenzeiger mit `_target` als `this`.
+
+Indirekte Aufrufe sind für den JIT normalerweise eine Grenze: Er weiß nicht, welche Methode dahinter steckt, und kann sie nicht inlinen. Neuere Versionen schieben diese Grenze hinaus:
+
+- **Dynamic PGO** beobachtet zur Laufzeit, welche Methode hinter einem Delegate-Aufruf meistens steckt. Der optimierte Code prüft dann, ob es wieder diese Methode ist, und ruft sie direkt auf oder inlinet sie sogar. Mehr dazu in „Dynamic PGO“.
+- **Escape Analysis** erkennt Objekte, die eine Methode nicht verlassen, und legt sie auf den Stack statt auf den Heap. Neuere .NET-Versionen wenden das auch auf Delegates an, wenn der JIT den Aufruf sehen und die Lambda inlinen kann. Dann verschwindet die Allokation, obwohl im IL weiterhin `newobj` steht, siehe „Escape Analysis“.
+
+<Callout kind="version">
+  Das Lowering hängt von der C#-Version ab: `foreach` mit einer Variable pro Iteration seit C# 5,
+  `static` für Lambdas seit C# 9, gecachte statische Methodengruppen seit C# 11. Was der JIT danach
+  noch wegoptimiert, hängt von der .NET-Version ab. Verlass dich nicht auf diese Optimierungen,
+  sondern miss sie.
+</Callout>
+
+{/* TODO(verify): .NET version in which Dynamic PGO devirtualizes delegate calls (guarded devirtualization for delegates, .NET 7 or 8) and in which escape analysis stack-allocates delegates/closures (.NET 10?). */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente: in SharpLab nachsehen, was aus den fünf Varianten wird, und mit BenchmarkDotNet messen, was sie kosten.
+
+{/* TODO(verify): Expected allocations on x64 with current .NET (CaptureLocal 24 B display class + 64 B delegate = 88 B). Apply is NoInlining so that escape analysis cannot remove the delegate. */}
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „C#“ (Release). Du siehst die Klasse <>c mit dem Cache für NoCapture, eine private Methode für CaptureThis, eine Display-Klasse für CaptureLocal, die direkt am Methodenanfang angelegt wird, und für LocalFunction ein Struct, das per ref übergeben wird. Wechsle dann auf „IL“ und finde für jede Variante das ldftn und das newobj des Delegates."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'NoCapture', allocated: 'keine' },
+    { method: 'CaptureThis', allocated: '64 B' },
+    { method: 'CaptureLocal', allocated: '88 B' },
+    { method: 'LocalFunction', allocated: 'keine' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. CaptureThis alloziert einen Delegate, CaptureLocal zusätzlich das Display-Objekt. Apply ist mit NoInlining markiert, damit der JIT den Delegate nicht wegoptimieren kann."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="lowering-closures"
+  questions={[
+    {
+      q: 'int x = 1; Func<int> f = () => x; x = 5; Was liefert f()?',
+      options: ['1', '5'],
+      correct: 1,
+      explanation:
+        'x ist ein Feld der Display-Klasse, das Methode und Lambda gemeinsam nutzen. Die Lambda liest den aktuellen Wert.',
+    },
+    {
+      q: 'Eine Methode gibt bei jedem Aufruf x => x * 2 als Func<int, int> zurück. Wie oft wird ein Delegate alloziert?',
+      options: ['Bei jedem Aufruf', 'Nur beim ersten Aufruf, danach kommt er aus einem statischen Feld'],
+      correct: 1,
+      explanation:
+        'Lambdas ohne Closure cacht der Compiler in einem statischen Feld der Klasse <>c. Jeder spätere Aufruf liefert denselben Delegate.',
+    },
+    {
+      q: 'for (int i = 0; i < 3; i++) actions.Add(() => Console.Write(i)); Was geben die Delegates danach aus?',
+      options: ['012', '333', '222'],
+      correct: 1,
+      explanation:
+        'i ist einmal für die ganze Schleife deklariert, alle Delegates teilen sich ein Display-Objekt. Nach der Schleife steht i auf 3.',
+    },
+    {
+      q: 'Zwei Lambdas in derselben Methode fangen verschiedene Parameter ein, eine davon ein großes Array. Die andere wird als Event-Handler registriert. Was ist die Folge?',
+      options: [
+        'Keine, jede Lambda hat ihre eigene Closure',
+        'Das Array bleibt so lange erreichbar wie der Event-Handler',
+      ],
+      correct: 1,
+      explanation:
+        'Variablen aus demselben Scope teilen sich eine Display-Klasse. Der Handler hält das Display-Objekt fest und damit auch das Array.',
+    },
+    {
+      q: 'Was kostet eine lokale Funktion, die eine lokale Variable verwendet und nur direkt aufgerufen wird?',
+      options: [
+        'Ein Display-Objekt auf dem Heap pro Aufruf der umgebenden Methode',
+        'Keine Allokation, die Closure ist ein Struct im Stack-Frame',
+        'Einen Delegate pro Aufruf der lokalen Funktion',
+      ],
+      correct: 1,
+      explanation:
+        'Solange die lokale Funktion nicht in einen Delegate umgewandelt wird, nutzt der Compiler ein Struct als Display-Klasse und übergibt es per ref.',
+    },
+    {
+      q: 'Was ändert das Schlüsselwort static vor einer Lambda am erzeugten Code?',
+      options: [
+        'Nichts, es verbietet nur das Einfangen von Variablen und this',
+        'Die Lambda wird zu einer statischen Methode statt zu einer Instanzmethode',
+        'Der Delegate wird erst durch static überhaupt gecacht',
+      ],
+      correct: 0,
+      explanation:
+        'Eine Lambda ohne Closure wird ohnehin gecacht. static ist eine Garantie zur Compilezeit, damit niemand später eine Closure einführt.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Die Runtime kennt keine Closures, nur **Delegates** aus Ziel und Methode. Der Compiler übersetzt jede Lambda in eine echte Methode und einen Delegate auf sie.
+- Lambdas **ohne Closure** werden Methoden einer Singleton-Klasse `<>c`, ihr Delegate wird beim ersten Gebrauch in einem statischen Feld gecacht. `static` garantiert das, statische Methodengruppen werden seit C# 11 ebenfalls gecacht.
+- Lambdas, die nur **`this`** verwenden, werden Instanzmethoden deiner Klasse und kosten einen Delegate pro Ausführung.
+- Eingefangene lokale Variablen und Parameter **ziehen in eine Display-Klasse um**. Methode und Lambdas teilen sich das Feld, es gibt keine Kopie.
+- Das Display-Objekt entsteht beim **Betreten des Scopes**, eines pro Scope. Alle Lambdas dieses Scopes teilen es, was Objekte unbemerkt am Leben halten kann.
+- Die `for`-Variable gibt es einmal pro Schleife, die `foreach`-Variable seit C# 5 einmal pro Durchlauf. Eine Kopie im Rumpf trennt die Durchläufe.
+- **Lokale Funktionen**, die nicht zu Delegates werden, nutzen ein Struct als Closure und allozieren nichts.
+
+</Block>

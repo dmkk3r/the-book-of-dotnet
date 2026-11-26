@@ -1,0 +1,400 @@
+---
+id: pattern-matching
+title: Pattern Matching im IL
+summary: Was der Compiler aus is, Mustern und switch-Ausdrücken macht, warum ein switch die Arme nicht von oben nach unten durchprobiert und wo Sprungtabellen, Hashes und versteckte Allokationen entstehen.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Pattern matching overview (C#-Grundlagen, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/functional/pattern-matching
+  - title: 'Patterns (C#-Sprachreferenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/patterns
+  - title: 'switch expression (C#-Sprachreferenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/switch-expression
+  - title: 'Selection statements: if und switch (C#-Sprachreferenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/selection-statements
+  - title: 'Feature-Spezifikation: Recursive pattern matching (C# 8, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/proposals/csharp-8.0/patterns
+  - title: 'Feature-Spezifikation: List patterns (C# 11, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/proposals/csharp-11.0/list-patterns
+  - title: 'SwitchExpressionException (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.switchexpressionexception
+  - title: 'OpCodes-Klasse mit isinst, castclass und switch (System.Reflection.Emit, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.reflection.emit.opcodes
+  - title: 'ECMA-335 (CLI-Standard), Partition III: isinst, castclass, switch'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'DecisionDagBuilder.cs (dotnet/roslyn)'
+    url: https://github.com/dotnet/roslyn/blob/main/src/Compilers/CSharp/Portable/Binder/DecisionDagBuilder.cs
+  - title: 'SharpLab'
+    url: https://sharplab.io/
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './pattern-matching.steps';
+import castScript from './pattern-matching-cast.steps';
+import jumpScript from './pattern-matching-sprungtabelle.steps';
+import { sharplabCode, benchmarkCode } from './pattern-matching-verify';
+
+<Block n={1} title="Das Problem">
+
+Bevor es Muster gab, sah Code, der auf Typen und Werte reagiert, so aus:
+
+```csharp
+if (shape is Circle)
+{
+    var c = (Circle)shape;
+    return Math.PI * c.Radius * c.Radius;
+}
+else if (shape is Rect && ((Rect)shape).Width == ((Rect)shape).Height)
+{
+    return ((Rect)shape).Width * ((Rect)shape).Width;
+}
+else if (shape is Rect)
+{
+    var r = (Rect)shape;
+    return r.Width * r.Height;
+}
+```
+
+Das ist nicht nur lang. Es prüft denselben Typ mehrfach: einmal mit `is`, dann noch einmal bei jedem Cast. Die zweite und dritte Bedingung testen beide, ob `shape` ein `Rect` ist, und der Compiler hat keine Chance, das zu bemerken. Für ihn sind es drei voneinander unabhängige `if`-Anweisungen mit beliebigen booleschen Ausdrücken darin.
+
+Pattern Matching dreht das um. Mit `shape is Circle c`, Property-Mustern wie `{ Width: > 0 }` und dem `switch`-Ausdruck beschreibst du **was** du wissen willst, nicht **wie** es geprüft wird. Der Compiler sieht damit die ganze Entscheidung auf einmal: alle Arme, alle Tests, alle Typen. Er kann gleiche Tests zusammenlegen, überflüssige weglassen, dich warnen, wenn ein Fall fehlt, und mit einem Fehler abbrechen, wenn ein Arm nie erreicht werden kann.
+
+Im IL gibt es keine Instruktion für Muster. Alles, was du hier siehst, ist Lowering wie in der Lektion „foreach, using und lock“: Der Compiler übersetzt Muster in `isinst`, Vergleiche, Property-Aufrufe und Sprünge. Wie diese Instruktionen auf dem Evaluation Stack arbeiten, erklärt die Lektion „IL und der Evaluation Stack“. Spannend ist, **in welcher Reihenfolge** und **wie oft** sie vorkommen.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Drei Sätze tragen die Lektion:
+
+1. **Ein Typmuster ist ein `isinst` und ein Null-Vergleich.** `x is T t` bedeutet im Kern `t = x as T; t != null`. Eine Typprüfung, kein zusätzlicher Cast.
+2. **Ein switch über Muster wird zu einem Entscheidungsgraphen.** Der Compiler zerlegt alle Arme in einzelne Tests und baut daraus einen gerichteten azyklischen Graphen (DAG). Jeder Test kommt pro Pfad höchstens einmal vor, und jeder Pfad endet bei genau einem Arm.
+3. **Die Bedeutung ist „der erste passende Arm gewinnt“, die Ausführung ist es nicht.** Das Ergebnis ist immer dasselbe, als würdest du die Arme von oben nach unten prüfen. Welche Tests aber tatsächlich laufen, in welcher Reihenfolge und wie oft eine Property gelesen wird, legt der Compiler fest.
+
+<Callout kind="fehlannahme">
+  „Ein switch-Ausdruck prüft die Arme der Reihe nach von oben nach unten.“ So ist nur sein
+  Ergebnis definiert. Der erzeugte Code testet keine Arme, sondern einzelne Bedingungen, und
+  überspringt alles, was nach den bisherigen Antworten schon feststeht. Ein Integer-switch mit
+  dichten Fällen springt sogar ohne einen einzigen Vergleich direkt zum Ziel.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel berechnet Versandkosten für eine Bestellung. Zwei Arme fragen nach dem Land, einer nach dem Express-Versand, der letzte fängt den Rest. Schalte im Player auf „Gelowert“: Dort steht vereinfacht der Code, den der Compiler erzeugt. Die Knoten im Graphen sind die Tests, die Kanten ihre Antworten. Verfolge vier Eingaben und achte darauf, welche Properties jeweils gelesen werden.
+
+<StepPlayer script={script} />
+
+Drei Beobachtungen lohnen sich. Erstens gibt es im Graphen **keinen Knoten für Arm 2**. Seine einzige Bedingung, `Country == "DE"`, ist bereits Teil von Arm 1. Scheitert danach `Total >= 50`, steht Arm 2 schon fest. Zweitens wird `Country` **einmal** gelesen und in einer verborgenen Variable gehalten, auch wenn zwei Arme danach fragen. Drittens enden zwei Pfade im selben Knoten, beim Verwerfer `_`. Darin unterscheidet sich ein DAG von einem Entscheidungsbaum, in dem jeder Knoten genau einen Vorgänger hat.
+
+{/* TODO(verify): Roslyn caches each property evaluation (BoundDagPropertyEvaluation) once per path in a temp, and the shape of the lowered code (gotos, temp for Country) in SharpLab. */}
+
+Im Roslyn-Quellcode heißt die Klasse, die diesen Graphen baut, `DecisionDagBuilder`. Sie geht die Arme in ihrer Reihenfolge durch und hält an jedem Knoten fest, welche Arme dort noch möglich sind. Jeder Test teilt diese Menge in zwei: die Arme, die bei „ja“ übrig bleiben, und die bei „nein“. Ist ein Arm auf einem Pfad sicher erfüllt und kein früherer mehr möglich, endet der Pfad dort. Knoten mit gleichem Zustand werden zusammengelegt, so entstehen die gemeinsamen Knoten.
+
+</Block>
+
+<Block n={4} title="Typmuster und null im IL">
+
+Das einfachste Muster ist das Typmuster mit Variable. Der folgende Player vergleicht die alte Form „erst `is`, dann Cast“ mit `is Circle c`. Die Tabellen zeigen den Evaluation Stack, die Variablen und das Objekt auf dem Heap, die Fakten darunter zählen die Typprüfungen.
+
+<StepPlayer script={castScript} />
+
+`isinst` und `castclass` fragen beide die Runtime, ob der Typ des Objekts zum Zieltyp passt. Wie sie das beantworten, über die Kette der Basistypen oder die Interface-Map der MethodTable, zeigt die Lektion „MethodTable und EEClass“. Der Unterschied liegt nur im Misserfolg: `isinst` liefert null, `castclass` wirft eine `InvalidCastException`. Die alte Form zahlt die Prüfung also zweimal, die neue einmal. Ob der JIT die zweite Prüfung in der alten Form erkennt und streicht, hängt von Version und Situation ab, darauf verlassen solltest du dich nicht.
+
+{/* TODO(verify): Whether RyuJIT removes a castclass that is dominated by an isinst of the same type on the same local (assertion propagation), and since which version. */}
+
+### Werttypen: isinst und unbox.any
+
+Ist der Zieltyp ein Werttyp, funktioniert der Trick mit `as` nicht, denn ein `int` kann nicht null sein. Für `o is int i` mit `object o` erzeugt der Compiler deshalb zwei Schritte:
+
+```text
+ldarg.0
+isinst     [System.Runtime]System.Int32    // geboxter int oder null
+brfalse.s  NO_MATCH
+ldarg.0
+unbox.any  [System.Runtime]System.Int32    // Wert aus der Box kopieren
+stloc.0
+```
+
+`isinst` mit einem Werttyp prüft, ob das Objekt eine Box genau dieses Typs ist, und liefert den Verweis auf die Box oder null. `unbox.any` kopiert danach den Wert heraus. Geboxt wird hier nichts: Die Box gab es schon, bevor der Wert in einer `object`-Variable landete. Wann und warum sie entsteht, erklärt die Lektion „Boxing und Unboxing“.
+
+{/* TODO(verify): Exact Release IL for `o is int i` (isinst + brfalse + unbox.any, no second type check helper beyond unbox.any) in SharpLab. */}
+
+Anders bei `int? n` und dem Muster `n is int v`: Dort gibt es kein Objekt, der Compiler ruft `HasValue` auf und holt den Wert mit `GetValueOrDefault()`. Und in generischem Code mit `T value` und `value is int i` steht im IL ein `box !!T` vor dem `isinst`. Für Werttypen als `T` erzeugt der JIT eigenen Code, in dem er die Box und den Test meist ganz entfernt, weil der Typ dort feststeht.
+
+{/* TODO(verify): Nullable pattern lowering to get_HasValue/GetValueOrDefault, and generic `T is int` lowering to box !!T + isinst with the JIT folding it for value type instantiations. */}
+
+### is null ruft keinen Operator auf
+
+Eine Klasse kann `==` überladen. Dann ruft `x == null` diese Methode auf, und was sie zurückgibt, entscheidet allein ihr Autor. `x is null` dagegen ist ein Konstantenmuster, und für `null` gilt: Der Compiler vergleicht den Verweis direkt, im IL ein `ldarg` gefolgt von `brtrue` oder `brfalse`, ohne jeden Aufruf. Dasselbe gilt für `x is not null` und für das leere Property-Muster `x is { }`, das genau „nicht null“ bedeutet. Auch die Null-Prüfung am Anfang des Graphen im Durchspielen ist so ein Verweisvergleich, darum steht im gelowerten Code `(object)o != null`.
+
+Für Konstanten anderer Typen ruft der Compiler sehr wohl etwas auf, aber nie einen benutzerdefinierten Operator: Bei Zahlen ist es ein `ceq` oder ein bedingter Sprung, bei Strings `string.op_Equality`, bei `decimal` dessen eingebauter Vergleich. Benutzerdefinierte `==`-Operatoren spielen in Mustern grundsätzlich keine Rolle.
+
+{/* TODO(verify): String constant patterns call string.op_Equality (or string.Equals) in Roslyn; decimal constants use decimal.op_Equality. */}
+
+</Block>
+
+<Block n={5} title="Die anderen Muster im IL">
+
+Jedes Muster zerfällt im Graphen in ein paar Grundbausteine: Typtests, Null-Tests, Vergleiche mit Konstanten und **Auswertungen**, also das Lesen einer Property, eines Tuple-Elements oder das Aufrufen von `Deconstruct`. Die folgende Übersicht zeigt, was hinter den Mustern steht.
+
+| Muster                                | Seit  | Im erzeugten Code                                                          |
+| ------------------------------------- | ----- | -------------------------------------------------------------------------- |
+| `o is Circle c`                       | C# 7  | `isinst`, Ergebnis speichern, mit null vergleichen                         |
+| `x is 42`, `s is "DE"`                | C# 7  | `ceq` oder Sprung, bei Strings `string.op_Equality`                        |
+| `x is > 0 and < 10`                   | C# 9  | zwei Vergleiche mit bedingten Sprüngen, `and` als Verkettung               |
+| `c is 'a' or 'e' or 'i'`              | C# 9  | mehrere Vergleiche, bei vielen Konstanten auch ein switch                  |
+| `o is not null`                       | C# 9  | Verweisvergleich mit null                                                  |
+| `o is Order { Total: > 100 }`         | C# 8  | Typtest, Null-Test, Getter-Aufruf, Vergleich                               |
+| `o is { Address.City: "Berlin" }`     | C# 10 | wie verschachtelt geschrieben, inklusive Null-Test für `Address`           |
+| `p is Point(0, var y)`                | C# 8  | Null-Test, `Deconstruct(out x, out y)`, Vergleich von `x`                  |
+| `arr is [1, .., var last]`            | C# 11 | Null-Test, `Length` prüfen, Indexer `arr[0]` und `arr[arr.Length - 1]`     |
+
+{/* TODO(verify): C# version per row (relational/logical in C# 9, extended property patterns in C# 10, list patterns in C# 11) and the lowering of each row in SharpLab. */}
+
+### Relationale und logische Muster
+
+`and`, `or` und `not` sind keine Operatoren, die zur Laufzeit boolesche Werte verknüpfen. Sie beschreiben die Form des Graphen: `and` hängt den zweiten Test an den „ja“-Ausgang des ersten, `or` an den „nein“-Ausgang, `not` vertauscht die Ausgänge. Deshalb gibt es im IL auch kein `and` und kein `or`, nur bedingte Sprünge. Aus `x is >= 1 and <= 5 or 10` werden drei Vergleiche, und keiner davon wird ausgeführt, wenn ein früherer schon alles entschieden hat.
+
+Relationale Muster funktionieren nur mit Konstanten und den eingebauten numerischen Typen, `char` und Enums. Für Gleitkommazahlen gilt eine Feinheit: Das Konstantenmuster `d is double.NaN` passt auf NaN, obwohl `d == double.NaN` immer `false` ist. Der Compiler erzeugt dafür einen Aufruf von `double.IsNaN` statt eines Vergleichs.
+
+{/* TODO(verify): `is double.NaN` lowers to double.IsNaN and matches NaN (patterns language reference / Roslyn). */}
+
+### Property- und positionale Muster
+
+Ein Property-Muster ruft für jede genannte Property ihren Getter auf, bei Klassen nach einem Null-Test des Objekts. Ein positionales Muster ruft `Deconstruct` mit `out`-Parametern auf, bei Records die vom Compiler erzeugte Methode, bei Tupeln liest es direkt die Felder `Item1`, `Item2` und so weiter. Ist der Eingabetyp `object` und das Muster ein Tuple ohne Typangabe wie `o is (1, 2)`, prüft der Code auf das Interface `ITuple` und liest die Elemente über dessen Indexer.
+
+Wichtig für die Kosten: Jede Auswertung steht im Graphen als eigener Knoten, und der Compiler führt sie auf einem Pfad höchstens einmal aus. Nennen drei Arme `Total`, wird `Total` trotzdem nur einmal gelesen, wie im Durchspielen bei `Country`.
+
+### Listenmuster
+
+Listenmuster aus C# 11 funktionieren mit jedem Typ, der **zählbar** und **indizierbar** ist: eine Property `Length` oder `Count` und ein Indexer mit `int` oder `Index`. Arrays, `List<T>`, `string` und Spans erfüllen das. Aus `arr is [1, .., var last]` wird ungefähr:
+
+```csharp
+// vereinfacht: arr is [1, .., var last]
+if (arr != null)
+{
+    int length = arr.Length;
+    if (length >= 2 && arr[0] == 1)
+    {
+        int last = arr[length - 1];
+        // Muster passt
+    }
+}
+```
+
+Die Länge wird einmal gelesen und in einer verborgenen Variable gehalten. Die Spezifikation erlaubt dem Compiler außerdem anzunehmen, dass `Length` und `Count` nie negativ sind. Nur deshalb kann er beweisen, dass etwa `[]`, `[_]` und `[_, _, ..]` zusammen alle Fälle abdecken.
+
+Ein Slice-Muster wie `.. var rest` braucht zusätzlich einen Bereichsindexer oder eine Methode `Slice`. Beim Array ruft der Compiler dafür `RuntimeHelpers.GetSubArray` auf, und das legt ein **neues Array** an. Bei `ReadOnlySpan<T>` ist das Slice nur eine neue Sicht auf denselben Speicher, bei `string` ein `Substring` und damit wieder eine Allokation. Ein `..` ohne Variable erzeugt nie ein Slice, es überspringt nur Elemente.
+
+{/* TODO(verify): Slice pattern on arrays calls RuntimeHelpers.GetSubArray, on string Substring, on spans Slice (list patterns spec and SharpLab). */}
+
+</Block>
+
+<Block n={6} title="Vom Graphen zum IL: Sprungtabellen und Strings">
+
+Der DAG beschreibt, **was** getestet wird. Wie ein einzelner Knoten im IL aussieht, entscheidet der Compiler beim Erzeugen des Codes. Am deutlichsten wird das, wenn viele Arme denselben Wert mit verschiedenen Konstanten vergleichen.
+
+### Ganze Zahlen: die Instruktion switch
+
+Das IL hat eine eigene Instruktion für Mehrfachverzweigungen: `switch` mit einer Liste von Sprungzielen. Sie nimmt einen Wert vom Stack und springt zum Ziel mit diesem Index. Liegen die Konstanten dicht beieinander, nutzt der Compiler genau das.
+
+<StepPlayer script={jumpScript} />
+
+Sind die Konstanten dagegen weit verstreut, etwa 1, 1000 und 50000, wäre eine Tabelle mit 50000 Einträgen Verschwendung. Der Compiler teilt die Werte dann in dichte Gruppen. Jede Gruppe bekommt eine eigene Sprungtabelle, und zwischen den Gruppen sucht er mit Vergleichen binär, also mit Tests wie „kleiner als 1000?“. Ab welcher Dichte eine Tabelle entsteht, ist eine interne Heuristik des Compilers und kein Teil der Sprache.
+
+{/* TODO(verify): Roslyn SwitchIntegralJumpTableEmitter: density threshold for jump tables, minimum case count, binary search between buckets. */}
+
+### Strings: erst Hash oder Länge, dann Vergleich
+
+Für Strings gibt es keine Sprungtabelle. Bei wenigen Fällen erzeugt der Compiler einfach eine Kette von `string.op_Equality`-Aufrufen. Bei mehr Fällen berechnete er lange Zeit zuerst einen Hash des Strings mit einer Methode `ComputeStringHash`, die er selbst in die Assembly schreibt (in die verborgene Klasse `<PrivateImplementationDetails>`). Auf den Hash folgt ein Integer-switch, und erst im gefundenen Zweig ein echter Vergleich mit `op_Equality`, denn zwei verschiedene Strings können denselben Hash haben.
+
+Neuere Roslyn-Versionen wählen oft einen anderen Weg: Sie verzweigen zuerst über die **Länge** des Strings und danach über ein einzelnes Zeichen an einer geschickt gewählten Position. Damit bleibt meist nur noch ein Kandidat übrig, der mit `op_Equality` bestätigt wird. Das spart das Hashen des ganzen Strings. Welche Strategie gewählt wird, hängt von der Compilerversion und den Konstanten ab, SharpLab zeigt es dir für deinen konkreten Fall.
+
+{/* TODO(verify): Threshold for ComputeStringHash (more than 6 cases?), that ComputeStringHash is FNV-1a in <PrivateImplementationDetails>, and the Roslyn version (VS 17.x, 2023) that introduced length and character based dispatch for string switches. */}
+
+### Kein Arm passt
+
+Deckt ein `switch`-Ausdruck nicht alle Eingaben ab, warnt der Compiler (CS8509) und nennt ein Beispiel, das nicht abgedeckt ist. Er hängt dann einen letzten Pfad an, der eine Exception wirft: Unter .NET Core 3.0 und später ist das eine `SwitchExpressionException` mit dem unpassenden Wert, unter .NET Framework, wo es diesen Typ nicht gibt, eine `InvalidOperationException`. Die `switch`-Anweisung wirft nie, sie macht ohne passenden `case` einfach nach dem Block weiter.
+
+Umgekehrt ist ein Arm, der nie erreicht werden kann, weil frühere Arme alle seine Eingaben schon abdecken, ein **Fehler**, keine Warnung (CS8510 beim Ausdruck, CS8120 bei der Anweisung). Steht `Circle c` vor `Circle { Radius: 0 }`, lehnt der Compiler den zweiten Arm ab. Beides fällt direkt aus dem DAG: Ein Arm, zu dem kein Pfad führt, ist unerreichbar, und ein Pfad, der bei keinem Arm endet, ist eine Lücke.
+
+{/* TODO(verify): Diagnostic ids CS8509 (not exhaustive), CS8510 (subsumed arm in switch expression), CS8120 (unreachable case in switch statement), CS8524 (enum not exhaustive for unnamed values). */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Properties mit Seiteneffekten
+
+Die Spezifikation von C# 8 erlaubt dem Compiler ausdrücklich, Tests umzuordnen und Auswertungen wegzulassen, wenn ihr Ergebnis nichts mehr ändert. Sie setzt dabei voraus, dass Properties und `Deconstruct`-Methoden in Mustern keine Seiteneffekte haben, prüft das aber nicht. Ein Getter, der einen Zähler erhöht, einen Cache füllt oder bei jedem Aufruf einen anderen Wert liefert, verhält sich in einem Muster deshalb unvorhersehbar:
+
+```csharp
+// schlecht: der Getter von Next liest bei jedem Aufruf das nächste Zeichen
+var kind = reader switch
+{
+    { Next: 'a' } => "A",
+    { Next: 'b' } => "B",   // liest der Code Next ein zweites Mal? Nein.
+    _ => "?",
+};
+```
+
+Wer hier erwartet, dass jeder Arm sein eigenes Zeichen liest, irrt: `Next` wird einmal gelesen und mit beiden Konstanten verglichen. Ob und in welcher Reihenfolge Getter laufen, darf sich zudem zwischen Compilerversionen ändern. Muster gehören zu reinen Daten, Logik mit Seiteneffekten gehört davor.
+
+{/* TODO(verify): Wording of the C# 8 recursive patterns spec on order of evaluation and the assumption that properties/Deconstruct are side effect free. */}
+
+### when-Klauseln teilen nichts
+
+Eine `when`-Klausel ist für den Compiler ein undurchsichtiger boolescher Ausdruck. Er kann sie nicht mit anderen Tests zusammenlegen und nichts aus ihr für Vollständigkeit ableiten. Steht dieselbe Bedingung in zwei `when`-Klauseln, wird sie auch zweimal ausgewertet. Was sich als Muster ausdrücken lässt, etwa `{ Total: > 100 }` statt `when o.Total > 100`, gehört deshalb ins Muster.
+
+### Slices kosten Speicher
+
+`arr is [var first, .. var rest]` sieht harmlos aus, legt bei einem Array aber bei jedem Treffer ein neues Array für `rest` an. In einer Rekursion über eine Liste, wie man sie aus funktionalen Sprachen kennt, entsteht so pro Ebene eine Kopie, und aus linearer Arbeit wird quadratische. Mit `ReadOnlySpan<T>` als Eingabe ist dasselbe Muster kostenlos.
+
+### Enums sind nie vollständig
+
+Ein `switch` über ein Enum mit einem Arm für jeden benannten Wert gilt trotzdem nicht als vollständig, denn in einer Enum-Variable kann jeder Wert des zugrunde liegenden Typs stehen, etwa `(Color)42`. Der Compiler warnt, und ohne `_`-Arm wirft der Ausdruck in diesem Fall eine `SwitchExpressionException`.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Pattern Matching ist in fast allen Fällen mindestens so schnell wie der handgeschriebene Code, den es ersetzt, oft schneller, weil der Compiler Tests teilt, die du selbst doppelt geschrieben hättest. Einige Regeln helfen beim Lesen und Schreiben:
+
+| Situation                                      | Empfehlung                                                                       |
+| ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| `if (x is T) { var t = (T)x; }`                | durch `if (x is T t)` ersetzen, eine Typprüfung statt zwei                       |
+| Null-Prüfung bei Typen mit überladenem `==`    | `is null` und `is not null`, prüft garantiert den Verweis                        |
+| viele Fälle über `int`, `char` oder Enum       | dichte Konstanten nutzen, dann entsteht eine Sprungtabelle                       |
+| viele String-Konstanten                        | `switch` statt `if`-Kette, der Compiler wählt Hash oder Länge                     |
+| Bedingung in `when`                            | wenn möglich als Muster schreiben, damit sie geteilt werden kann                 |
+| Rekursion mit Listenmustern                    | `ReadOnlySpan<T>` statt Array, damit Slices nichts allozieren                     |
+
+Die Reihenfolge der Arme bestimmt die Bedeutung, nicht die Geschwindigkeit. Arme nach vermuteter Häufigkeit zu sortieren, bringt bei einem Integer-switch nichts, und bei einem Graphen über Properties kaum etwas, weil gemeinsame Tests ohnehin nur einmal laufen. Sortiere nach Lesbarkeit: spezielle Fälle zuerst, allgemeine danach. Der Compiler sagt dir mit einem Fehler, wenn du es falsch herum machst.
+
+Für Typtests gilt, was die Lektion „MethodTable und EEClass“ zeigt: Ein Test auf eine `sealed` Klasse ist ein einzelner Vergleich der MethodTable, ein Test auf ein Interface eine Suche. Eine Hierarchie mit versiegelten Blattklassen macht einen `switch` über Typen deshalb billiger.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Der Entscheidungsgraph ist reine Compilerarbeit, die Runtime sieht davon nur das Ergebnis: Typtests, Aufrufe und Sprünge. Was der JIT daraus macht, entscheidet über die tatsächlichen Kosten.
+
+- **isinst ohne Helfer.** Für `sealed` Klassen und exakte Typen ersetzt der JIT den Aufruf des Cast-Helfers durch einen direkten Vergleich der MethodTable im Maschinencode. Nur bei Basisklassen und Interfaces bleibt der Helfer, der die Kette oder die Interface-Map durchsucht.
+- **Typtests mit Profil.** Mit Dynamic PGO merkt sich der JIT, welcher Typ an einer Prüfstelle tatsächlich vorkommt, und prüft diesen Typ in der optimierten Fassung zuerst inline. Das funktioniert wie die Guarded Devirtualization, die die Lektion „Dynamic PGO“ beschreibt.
+- **Die Instruktion switch.** Der JIT übersetzt sie in eine Tabelle von Sprungadressen oder, bei wenigen Zielen, in Vergleiche. Neuere Versionen können kleine Fallgruppen auch in Bittests umwandeln.
+- **Box und Typtest in Generics.** Bei `value is int i` mit generischem `T` sieht der JIT für Werttypen den konkreten Typ und entfernt `box` und `isinst` ganz, der Test wird zur Konstante.
+
+<Callout kind="version">
+  Die Muster selbst kamen schrittweise: Typmuster in C# 7, Property- und positionale Muster sowie
+  der switch-Ausdruck in C# 8, relationale und logische Muster in C# 9, erweiterte
+  Property-Muster in C# 10 und Listenmuster in C# 11. `SwitchExpressionException` gibt es seit
+  .NET Core 3.0. Die Strategie für String-switches hängt von der Roslyn-Version ab, die
+  JIT-Optimierungen für Typtests von der .NET-Version.
+</Callout>
+
+{/* TODO(verify): JIT inline expansion of isinst/castclass for exact classes, PGO-driven cast expansion (.NET 8), switch to bit test conversion (which .NET version), and folding of box+isinst in shared vs specialized generics. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente: den erzeugten Code für Typmuster, `is null`, Integer- und String-switches und ein Listenmuster in SharpLab ansehen und die Allokation eines Slice-Musters messen.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein, stelle auf Release und die Ausgabe auf „IL“. In AreaOld findest du isinst und castclass, in AreaNew nur isinst. IsNullOperator ruft op_Equality auf, IsNullPattern nicht. Day enthält die Instruktion switch, Color je nach Compilerversion ComputeStringHash oder Abfragen von Length und einzelnen Zeichen, Rest einen Aufruf von GetSubArray. Schalte danach auf „C#“, um den gelowerten Code zu lesen."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'ArrayDiscard', allocated: 'keine' },
+    { method: 'ArraySlice', allocated: '64 B (neues int[9])' },
+    { method: 'SpanSlice', allocated: 'keine' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. ArraySlice kopiert neun Elemente in ein neues Array, SpanSlice zeigt nur auf einen Teil desselben Arrays."
+/>
+
+{/* TODO(verify): 64 B for int[9] on x64 (24 B overhead + 36 B data, rounded to 8) with BenchmarkDotNet MemoryDiagnoser; that the JIT does not remove the GetSubArray allocation via escape analysis on current .NET. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="pattern-matching"
+  questions={[
+    {
+      q: 'Wie viele Typprüfungen enthält das IL für if (o is Circle c) { ... }?',
+      options: ['Eine: isinst', 'Zwei: isinst und castclass', 'Keine, der Compiler kennt den Typ'],
+      correct: 0,
+      explanation:
+        'Das Typmuster wird zu o as Circle und einem Vergleich mit null. Das Ergebnis von isinst wird direkt in c gespeichert, ein castclass ist nicht nötig.',
+    },
+    {
+      q: 'Money überlädt == so, dass es immer true liefert. Was ergibt m is null für ein Money-Objekt m?',
+      options: ['true, weil der Operator aufgerufen wird', 'false, weil der Verweis verglichen wird'],
+      correct: 1,
+      explanation:
+        'is null vergleicht den Verweis direkt im IL und ruft keinen benutzerdefinierten Operator auf. m == null würde dagegen den überladenen Operator aufrufen.',
+    },
+    {
+      q: 'Zwei Arme eines switch-Ausdrucks enthalten beide { Country: "DE", ... }. Wie oft wird Country für eine Eingabe gelesen?',
+      options: ['Einmal', 'Zweimal, einmal pro Arm', 'Das hängt von der Reihenfolge der Arme ab'],
+      correct: 0,
+      explanation:
+        'Der Compiler baut einen Entscheidungsgraphen, in dem jede Auswertung pro Pfad höchstens einmal vorkommt. Das Ergebnis wird in einer verborgenen Variable gehalten.',
+    },
+    {
+      q: 'Ein switch über int mit den Fällen 1 bis 5. Welche Aussage trifft auf das IL zu?',
+      options: [
+        'Es vergleicht den Wert der Reihe nach mit 1, 2, 3, 4 und 5',
+        'Es zieht 1 ab und springt mit der Instruktion switch direkt zum Ziel',
+        'Es berechnet einen Hash des Werts',
+      ],
+      correct: 1,
+      explanation:
+        'Dichte Konstanten werden zur Sprungtabelle. switch interpretiert den Index ohne Vorzeichen, deshalb fängt eine einzige Bereichsprüfung zu kleine und zu große Werte ab.',
+    },
+    {
+      q: 'Was passiert, wenn kein Arm eines switch-Ausdrucks passt (auf .NET 8)?',
+      options: [
+        'Der Ausdruck liefert default',
+        'Es wird eine SwitchExpressionException geworfen',
+        'Der Compiler verhindert das immer mit einem Fehler',
+      ],
+      correct: 1,
+      explanation:
+        'Der Compiler warnt nur (CS8509) und hängt einen Pfad an, der eine SwitchExpressionException wirft. Unter .NET Framework ist es eine InvalidOperationException.',
+    },
+    {
+      q: 'Warum alloziert arr is [_, .. var rest] bei einem int[], aber nicht bei einem ReadOnlySpan<int>?',
+      options: [
+        'Beim Array kopiert GetSubArray die Elemente in ein neues Array, beim Span entsteht nur eine neue Sicht',
+        'Weil Arrays geboxt werden müssen',
+      ],
+      correct: 0,
+      explanation:
+        'Ein Slice-Muster mit Variable braucht einen Wert für rest. Für Arrays ist das ein neues Array, für Spans ein Slice auf denselben Speicher.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Muster gibt es im IL nicht. Der Compiler übersetzt sie in `isinst`, Vergleiche, Getter-Aufrufe, `Deconstruct` und Sprünge.
+- `x is T t` ist ein `isinst` plus Null-Vergleich, **eine** Typprüfung statt zwei wie bei `is` mit anschließendem Cast. Bei Werttypen folgt ein `unbox.any`.
+- `is null` und `is not null` vergleichen den **Verweis** und rufen nie einen überladenen `==`-Operator auf.
+- Ein `switch` über Muster wird zu einem **Entscheidungsgraphen (DAG)**: gemeinsame Tests laufen einmal, jede Property wird pro Pfad höchstens einmal gelesen, gemeinsame Ziele werden geteilt.
+- Die Bedeutung ist „erster passender Arm“, die Ausführung nicht. Lücken meldet der Compiler als Warnung, unerreichbare Arme als Fehler, und zur Laufzeit wirft ein unvollständiger Ausdruck `SwitchExpressionException`.
+- Dichte Integer-Konstanten werden zur IL-Instruktion `switch`, String-Konstanten zu Hash oder Längenprüfung mit abschließendem Vergleich.
+- Properties in Mustern dürfen keine Seiteneffekte haben, und Slices auf Arrays allozieren. Spans vermeiden das.
+
+</Block>

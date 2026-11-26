@@ -881,6 +881,69 @@
       "aliases": ["ReadOnlySequence<T>"],
       "definition": "Folge von Speicherabschnitten (Segmenten), die wie ein zusammenhängender Puffer gelesen werden kann, ohne sie zu kopieren. PipeReader liefert gelesene Daten in dieser Form.",
       "lesson": "pipelines"
+    },
+    {
+      "id": "evaluation-stack",
+      "term": "Evaluation Stack",
+      "aliases": ["Auswertungsstapel"],
+      "definition": "Gedachter Stapel, über den IL-Instruktionen ihre Operanden und Ergebnisse austauschen. Er ist ein Modell: Der JIT bildet ihn auf Register ab, mit dem Stack des Prozessors hat er nichts zu tun.",
+      "lesson": "il-grundlagen"
+    },
+    {
+      "id": "lowering",
+      "term": "Lowering",
+      "aliases": [],
+      "definition": "Umformung höherer Sprachfeatures (foreach, Lambdas, yield, async, Pattern Matching) in einfacheren C#-Code, bevor der Compiler IL erzeugt.",
+      "lesson": "lowering-schleifen"
+    },
+    {
+      "id": "closure",
+      "term": "Closure",
+      "aliases": ["Closures"],
+      "definition": "Lambda oder lokale Funktion, die Variablen der umgebenden Methode verwendet. Der Compiler verlegt diese Variablen dafür in eine Display-Klasse.",
+      "lesson": "lowering-closures"
+    },
+    {
+      "id": "display-klasse",
+      "term": "Display-Klasse",
+      "aliases": ["Display-Klassen", "Closure-Klasse"],
+      "definition": "Vom Compiler erzeugte Klasse, deren Felder die von Lambdas erfassten lokalen Variablen aufnehmen. Methode und Lambdas teilen sich dasselbe Objekt.",
+      "lesson": "lowering-closures"
+    },
+    {
+      "id": "delegate",
+      "term": "Delegate",
+      "aliases": ["Delegates"],
+      "definition": "Objekt, das auf eine Methode verweist, bei Instanzmethoden zusammen mit dem Zielobjekt. Lambdas werden zu Delegates, wenn sie einem Delegate-Typ zugewiesen werden.",
+      "lesson": "lowering-closures"
+    },
+    {
+      "id": "iterator",
+      "term": "Iterator",
+      "aliases": ["Iteratoren"],
+      "definition": "Methode mit yield return. Der Compiler macht daraus eine Zustandsmaschine, die erst beim Aufzählen und dann schrittweise ausgeführt wird.",
+      "lesson": "iteratoren"
+    },
+    {
+      "id": "verzoegerte-ausfuehrung",
+      "term": "Verzögerte Ausführung",
+      "aliases": ["Deferred Execution"],
+      "definition": "Code läuft nicht beim Aufruf, sondern erst, wenn das Ergebnis aufgezählt wird. Typisch für Iteratoren und viele LINQ-Operatoren.",
+      "lesson": "iteratoren"
+    },
+    {
+      "id": "enumerator",
+      "term": "Enumerator",
+      "aliases": ["Enumeratoren"],
+      "definition": "Objekt oder Struct mit MoveNext und Current, über das foreach eine Sammlung durchläuft.",
+      "lesson": "lowering-schleifen"
+    },
+    {
+      "id": "sprungtabelle",
+      "term": "Sprungtabelle",
+      "aliases": ["Sprungtabellen"],
+      "definition": "Die IL-Instruktion switch: ein Index wählt direkt ein Sprungziel aus einer Liste. Der Compiler nutzt sie für dichte Ganzzahl-Fälle in switch-Anweisungen.",
+      "lesson": "pattern-matching"
     }
   ]
 }

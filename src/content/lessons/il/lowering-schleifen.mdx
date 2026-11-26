@@ -1,0 +1,404 @@
+---
+id: lowering-schleifen
+title: foreach, using und lock
+summary: Wie der Compiler foreach, using und lock in gewöhnliche Schleifen und try/finally-Blöcke umschreibt, warum foreach über eine List nichts alloziert und wo Boxing und Interface-Aufrufe doch hineinrutschen.
+status: draft
+sources:
+  - title: 'Iteration statements: for, foreach, do und while (C#-Sprachreferenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/iteration-statements
+  - title: 'using statement (C#-Sprachreferenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/using
+  - title: 'lock statement (C#-Sprachreferenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/lock
+  - title: 'C#-Sprachspezifikation: Statements (foreach, using, lock)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/statements
+  - title: 'System.Threading.Lock (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.threading.lock
+  - title: 'Implement a DisposeAsync method (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/implementing-disposeasync
+  - title: 'List.cs mit List<T>.Enumerator (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Collections/Generic/List.cs
+  - title: 'SharpLab'
+    url: https://sharplab.io/
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './lowering-schleifen.steps';
+import auswahlScript from './lowering-schleifen-auswahl.steps';
+import interfaceScript from './lowering-schleifen-interface.steps';
+import versionScript from './lowering-schleifen-version.steps';
+import { sharplabCode, benchmarkCode } from './lowering-schleifen-verify';
+
+<Block n={1} title="Das Problem">
+
+`foreach`, `using` und `lock` gehören zu den ersten Schlüsselwörtern, die man in C# lernt. Sie sehen aus wie eigenständige Sprachkonstrukte, und viele Entwickler stellen sich vor, die Runtime hätte dafür eigene Mechanismen: eine besondere Schleife für Collections, eine eingebaute Aufräumlogik, eine Sperre im Befehlssatz.
+
+Nichts davon existiert. Im IL gibt es keine Instruktion für `foreach`, keine für `using` und keine für `lock`. Der C#-Compiler schreibt alle drei **vor** der Übersetzung in IL in einfacheren C#-Code um: in `while`- oder `for`-Schleifen, Methodenaufrufe und `try`/`finally`-Blöcke. Dieser Schritt heißt **Lowering**. Erst das Ergebnis wird zu IL, und nur das sieht die Runtime je.
+
+Das ist mehr als eine Kuriosität. Ob eine Schleife alloziert, ob Methoden direkt oder über ein Interface aufgerufen werden, ob ein Struct geboxt wird: All das entscheidet sich beim Lowering, und zwar anhand des **statischen** Typs, den der Compiler sieht. Zwei Zeilen, die im Quelltext gleich aussehen, können deshalb sehr unterschiedlichen Code erzeugen. Wer wissen will, was eine Schleife kostet, muss wissen, was der Compiler aus ihr macht.
+
+In dieser Lektion schaust du dir den gelowerten Code für alle drei Konstrukte an. Die Grundlagen von IL und dem Evaluation Stack setzt sie voraus, sie stehen in der Lektion „IL und der Evaluation Stack“.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Drei Sätze tragen die ganze Lektion:
+
+1. **foreach ist ein Muster, kein Interface.** Der Compiler sucht beim Typ des Ausdrucks eine Methode `GetEnumerator()`, deren Ergebnis `MoveNext()` und `Current` hat. Er ruft genau diese Methoden auf, mit genau den Typen, die sie zurückgeben. Nur wenn es kein solches Muster gibt, weicht er auf `IEnumerable<T>` aus. Arrays, Strings und Spans bekommen gar keinen Enumerator, sondern eine Index-Schleife.
+2. **using und lock sind try/finally.** Beide erzeugen einen `try`-Block um deinen Code und einen `finally`-Block, der aufräumt: `Dispose()` beziehungsweise `Monitor.Exit()`. Das Aufräumen passiert dadurch auch dann, wenn eine Exception fliegt.
+3. **Der statische Typ entscheidet.** Was der Compiler erzeugt, hängt vom Typ der Variable ab, nicht vom Objekt, das zur Laufzeit darin steckt. Eine `List<int>` hinter einer Variable vom Typ `IEnumerable<int>` wird wie irgendeine Sequenz behandelt.
+
+<Callout kind="fehlannahme">
+  „foreach ist langsamer als for, weil es immer einen Enumerator auf dem Heap anlegt.“ Über ein
+  Array erzeugt der Compiler eine gewöhnliche `for`-Schleife, über eine `List<T>` einen
+  Struct-Enumerator im Stack-Frame. In beiden Fällen gibt es keine Allokation. Teuer wird `foreach`
+  erst, wenn der Compiler nur ein Interface sieht.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel summiert eine `List<int>` mit zwei Elementen. Schalte im Player auf den Tab „Gelowert“: Dort steht der Code, den der Compiler tatsächlich übersetzt, und jeder Schritt markiert die Zeile, die gerade läuft. Achte darauf, wo der Enumerator liegt und was sich auf dem Heap tut, nämlich nichts.
+
+<StepPlayer script={script} />
+
+Der gelowerte Code hat immer dieselbe Form: Enumerator holen, `try`, `while (e.MoveNext())`, im Rumpf `Current` in die Schleifenvariable kopieren, im `finally` `Dispose()` aufrufen. Der `finally`-Block existiert, weil ein Enumerator Ressourcen halten kann, etwa eine offene Datei. Er muss auch dann aufgeräumt werden, wenn der Rumpf eine Exception wirft oder die Schleife mit `break` oder `return` verlassen wird.
+
+Interessant ist der Typ der Variable `e`. Er lautet `List<int>.Enumerator`, nicht `IEnumerator<int>`. `List<T>` hat zwei Methoden namens `GetEnumerator`: eine öffentliche, die das Struct zurückgibt, und eine explizite Implementierung von `IEnumerable<T>.GetEnumerator()`, die ein Interface zurückgibt. Weil der Compiler zuerst nach dem öffentlichen Muster sucht, gewinnt die Struct-Variante. Diese Konstruktion ist Absicht: Die Klassen der Basisbibliothek liefern Struct-Enumeratoren genau dafür, dass `foreach` ohne Allokation auskommt. `Dictionary<TKey, TValue>`, `HashSet<T>` und `Queue<T>` machen es genauso.
+
+{/* TODO(verify): Dictionary<TKey,TValue>, HashSet<T> and Queue<T> expose public struct Enumerator types in current .NET. */}
+
+Im Tab „IL“ siehst du den Unterschied zwischen dem Muster und einem Interface-Aufruf. `MoveNext` und `get_Current` werden mit `call` auf die Adresse der lokalen Variable (`ldloca`) aufgerufen. Nur `Dispose` geht über `callvirt` auf `IDisposable`, aber mit dem Präfix `constrained.`. Das sagt der Runtime: Wenn der Typ ein Werttyp ist, der die Methode selbst implementiert, ruf sie direkt auf dem Wert an dieser Adresse auf, ohne Box. Dasselbe Präfix erzeugt der Compiler für Methodenaufrufe auf generischen Typparametern, die Lektion „Boxing und Unboxing“ beschreibt es als constrained-Aufruf.
+
+{/* TODO(verify): IL shape of the List<T> foreach in SharpLab (Release): call for MoveNext/get_Current, constrained. callvirt IDisposable::Dispose in the finally. */}
+
+</Block>
+
+<Block n={4} title="Wie der Compiler die Variante wählt">
+
+Für einen Ausdruck in `foreach` prüft der Compiler mehrere Möglichkeiten nacheinander. Der folgende Graph spielt sechs Fälle durch, achte jeweils auf die Fakten zum statischen Typ.
+
+<StepPlayer script={auswahlScript} />
+
+### Arrays, Strings und Spans
+
+Für eindimensionale Arrays schreibt der Compiler eine Schleife über den Index:
+
+```csharp
+// foreach (int n in numbers) { Console.WriteLine(n); }
+int[] tmp = numbers;
+for (int i = 0; i < tmp.Length; i++)
+{
+    int n = tmp[i];
+    Console.WriteLine(n);
+}
+```
+
+Die Kopie in `tmp` ist kein Zufall. Wird `numbers` während der Schleife neu zugewiesen, etwa weil es ein Feld ist, läuft die Schleife unbeirrt über das alte Array weiter. Außerdem erleichtert die Form `i < tmp.Length` dem JIT, die Grenzprüfungen beim Zugriff `tmp[i]` zu entfernen, wie die Lektion „Bounds-Check-Elimination“ zeigt. Eine Versionsprüfung gibt es bei Arrays nicht: Wer im Rumpf ein Element überschreibt, sieht beim nächsten Durchlauf schlicht den neuen Wert.
+
+Strings werden genauso behandelt, über `Length` und den Indexer `s[i]`. Dabei bekommst du UTF-16-Codeeinheiten (`char`), keine vollständigen Unicode-Zeichen. Für `Span<T>` und `ReadOnlySpan<T>` erzeugt der Compiler ebenfalls eine Index-Schleife, obwohl beide Typen auch ein passendes `GetEnumerator` hätten. Weil der Indexer einer Span eine Referenz liefert, ist sogar `foreach (ref int x in span)` erlaubt, damit änderst du die Elemente direkt.
+
+Mehrdimensionale Arrays werden zu verschachtelten Schleifen über `GetLowerBound` und `GetUpperBound` je Dimension.
+
+{/* TODO(verify): Roslyn lowers foreach over Span<T>/ReadOnlySpan<T> to an index loop (not the pattern Enumerator); multidimensional arrays to nested loops with GetLowerBound/GetUpperBound; ref foreach over Span<T> (C# 7.3). */}
+
+### Das Muster
+
+Hat der Typ eine zugängliche Instanzmethode `GetEnumerator()` ohne Parameter, und hat deren Rückgabetyp eine Methode `bool MoveNext()` und eine Eigenschaft `Current`, nimmt der Compiler diese. Ein Interface muss dabei niemand implementieren. Seit C# 9 darf `GetEnumerator` auch eine Erweiterungsmethode sein, damit lassen sich fremde Typen nachträglich aufzählbar machen.
+
+Für das `finally` gelten drei Regeln. Implementiert der Enumerator `IDisposable`, wird `Dispose()` aufgerufen, bei einem Struct über den constrained-Aufruf ohne Box. Ist der Enumerator ein Struct oder eine versiegelte Klasse ohne `IDisposable`, fällt der `finally`-Block ganz weg. Bei einer nicht versiegelten Klasse ohne `IDisposable` prüft der Compiler zur Laufzeit mit `e as IDisposable`, weil eine abgeleitete Klasse es implementieren könnte.
+
+{/* TODO(verify): Exact lookup order between instance GetEnumerator, interfaces and extension GetEnumerator (C# 9); the three finally rules (spec "The foreach statement"). */}
+
+### Die Interfaces als letzter Ausweg
+
+Erst wenn kein Muster gefunden wird, prüft der Compiler, ob der Typ `IEnumerable<T>` oder das nicht-generische `IEnumerable` implementiert. Das ist der Weg für Variablen, die bereits als Interface deklariert sind, und für alte Collection-Typen ohne eigenes Muster. Beim nicht-generischen `IEnumerable` liefert `Current` ein `object`. Der Compiler fügt dann einen Cast in den Typ der Schleifenvariable ein, bei Werttypen also ein Unboxing pro Element.
+
+</Block>
+
+<Block n={5} title="Über ein Interface: Box und virtuelle Aufrufe">
+
+Methoden, die `IEnumerable<T>` als Parameter nehmen, sind gutes Design: Sie akzeptieren Listen, Arrays, LINQ-Abfragen und Iteratoren gleichermaßen. Der Preis ist, dass der Compiler beim Übersetzen der Methode nicht weiß, welcher Typ hereinkommt. Er muss den Interface-Weg nehmen. Das Beispiel übergibt dieselbe Liste wie oben, diesmal an eine Methode mit Interface-Parameter.
+
+<StepPlayer script={interfaceScript} />
+
+Drei Dinge haben sich gegenüber dem ersten Player geändert:
+
+- **Die Box.** `List<T>` liefert über das Interface dasselbe Struct, das aber nur als Heap-Objekt hinter einem Interface-Verweis stehen kann. Es entsteht eine Allokation pro Schleife, hier also eine pro Aufruf von `Sum`. Bei einem Array über `IEnumerable<T>` ist es ein eigenes Enumerator-Objekt der Runtime, ebenfalls auf dem Heap.
+- **Die Aufrufe.** `MoveNext` und `Current` gehen über `callvirt` an ein Interface. Die Runtime muss zur Laufzeit die Implementierung suchen, wie die Lektion „Virtuelle Aufrufe und Interface-Dispatch“ zeigt. Ohne Optimierungen des JIT kann er diese Methoden nicht inlinen, obwohl ihr Rumpf winzig ist.
+- **Die Null-Prüfung.** Weil ein Interface-Verweis `null` sein könnte, steht im `finally` ein `if (e != null)`.
+
+{/* TODO(verify): Since .NET 8 List<T>'s explicit IEnumerable<T>.GetEnumerator returns a cached empty enumerator for Count == 0 and boxes only otherwise; arrays via IEnumerable<T> use SZGenericArrayEnumerator<T> with a cached instance for empty arrays. */}
+
+Ein Sonderfall verdient Aufmerksamkeit: Hat eine Klasse ein öffentliches `GetEnumerator`, das selbst schon `IEnumerator<T>` zurückgibt, nimmt der Compiler zwar das Muster, die Aufrufe von `MoveNext` und `Current` sind aber trotzdem Interface-Aufrufe. Der Vorteil des Musters entsteht erst durch einen konkreten Rückgabetyp, am besten ein Struct.
+
+</Block>
+
+<Block n={6} title="using und lock: dasselbe Gerüst">
+
+### using
+
+Eine `using`-Anweisung wird zu einem `try`/`finally`, das `Dispose()` aufruft. Für eine Klasse sieht das so aus:
+
+```csharp
+// using (var reader = new StreamReader(path)) { Use(reader); }
+{
+    StreamReader reader = new StreamReader(path);
+    try
+    {
+        Use(reader);
+    }
+    finally
+    {
+        if (reader != null)
+            ((IDisposable)reader).Dispose();
+    }
+}
+```
+
+Drei Details stecken darin. Die Variable wird **vor** dem `try` initialisiert: Wirft schon der Konstruktor, gibt es nichts aufzuräumen, und `Dispose` läuft nicht. Die **Null-Prüfung** erlaubt `using (null)` oder eine Fabrikmethode, die `null` liefert, ohne `NullReferenceException`. Und die äußeren Klammern begrenzen den Gültigkeitsbereich: Nach dem Block ist `reader` nicht mehr ansprechbar, du kannst also kein bereits freigegebenes Objekt versehentlich weiterverwenden.
+
+Ist die Ressource ein **Struct**, entfällt die Null-Prüfung, und der Cast auf `IDisposable` wird wie beim Enumerator als constrained-Aufruf übersetzt. Die Sprachspezifikation verlangt ausdrücklich, dass dabei nicht geboxt wird. Eine `ref struct` braucht gar kein Interface, für sie genügt seit C# 8 eine passende öffentliche Methode `Dispose()`.
+
+{/* TODO(verify): Spec wording that the conversion to IDisposable for a value type resource must not box; pattern-based Dispose for ref structs since C# 8. */}
+
+Seit C# 8 gibt es außerdem **using-Deklarationen** ohne eigenen Block: `using var reader = new StreamReader(path);`. Gelowert wird das genauso, nur reicht der `try`-Block bis zum Ende des umgebenden Blocks, meist also bis zum Ende der Methode. Mehrere Deklarationen werden zu verschachtelten `try`/`finally` und in umgekehrter Reihenfolge freigegeben, die zuletzt deklarierte Ressource zuerst.
+
+`await using` funktioniert nach demselben Schema mit `IAsyncDisposable`: Im `finally` steht `await reader.DisposeAsync()`. Der `finally`-Block wird damit Teil der async State Machine, wie sie die Lektion „Die async State Machine“ beschreibt. Für `await foreach` gilt das Gleiche: `GetAsyncEnumerator`, `await MoveNextAsync()` und im `finally` `await DisposeAsync()`.
+
+### lock
+
+Bei `lock` dokumentiert Microsoft das Lowering direkt. Für ein gewöhnliches Objekt entsteht:
+
+```csharp
+// lock (_gate) { _count++; }
+object lockObj = _gate;
+bool lockTaken = false;
+try
+{
+    Monitor.Enter(lockObj, ref lockTaken);
+    _count++;
+}
+finally
+{
+    if (lockTaken)
+        Monitor.Exit(lockObj);
+}
+```
+
+Auch hier zählt jedes Detail. Der Ausdruck wird **einmal** ausgewertet und in einer verborgenen Variable gehalten. Wird `_gate` im Rumpf neu zugewiesen, gibt `Exit` trotzdem das Objekt frei, das gesperrt wurde. Das Flag `lockTaken` setzt `Monitor.Enter` erst, wenn die Sperre wirklich erworben ist. Fliegt zwischen dem Betreten des `try` und dem Erwerb eine Exception, ruft das `finally` deshalb nicht `Exit` für eine Sperre auf, die der Thread nie hatte. Ältere Compiler erzeugten `Monitor.Enter(obj)` vor dem `try`, was unter .NET Framework mit `Thread.Abort` im ungünstigsten Moment eine Sperre für immer halten konnte.
+
+{/* TODO(verify): The pre C# 4 expansion (Monitor.Enter before try) and the Thread.Abort window as the reason for the lockTaken overload. */}
+
+Was `Monitor.Enter` selbst tut, ist Sache der Runtime: Sie nutzt einen Thin Lock im Objekt-Header und weicht bei Konflikten auf einen Sync Block aus. Die Lektion „Objekt-Header und Sync Block“ zeigt das im Detail, und die Lektion „Locks von innen“ geht auf Spinning und Warten ein.
+
+Seit .NET 9 und C# 13 gibt es einen eigenen Typ für Sperren: `System.Threading.Lock`. Ist der Ausdruck in `lock` statisch vom Typ `Lock`, erzeugt der Compiler etwas ganz anderes:
+
+```csharp
+// private readonly Lock _lock = new();
+// lock (_lock) { _count++; }
+using (Lock.Scope scope = _lock.EnterScope())
+{
+    _count++;
+}
+```
+
+`EnterScope()` erwirbt die Sperre und liefert ein `ref struct` vom Typ `Lock.Scope`, dessen `Dispose()` sie wieder freigibt. Das `using` wird dann wie oben zu `try`/`finally`. `Monitor` und der Objekt-Header sind daran nicht beteiligt. Wichtig: Diese Variante gilt nur, wenn der **statische** Typ `Lock` ist. Castest du das Objekt vorher auf `object`, sperrt der Compiler es wieder mit `Monitor` und warnt dich davor.
+
+{/* TODO(verify): Exact expansion for System.Threading.Lock (using of x.EnterScope()) per lock statement docs; compiler warning (CS9216?) when a Lock is converted to object and locked; that Lock does not use the object header. */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Die Collection ändert sich während der Schleife
+
+Das klassische Problem bei `foreach`: Im Rumpf wird die Liste verändert, die gerade durchlaufen wird.
+
+<StepPlayer script={versionScript} />
+
+Die Prüfung steckt nicht im Compiler, sondern im Enumerator von `List<T>`. Vereinfacht sieht sein `MoveNext` so aus:
+
+```csharp
+public bool MoveNext()
+{
+    List<T> localList = _list;
+    if (_version == localList._version && ((uint)_index < (uint)localList._size))
+    {
+        _current = localList._items[_index];
+        _index++;
+        return true;
+    }
+    return MoveNextRare();   // prüft die Version erneut und wirft bei Abweichung
+}
+```
+
+Die Prüfung ist bewusst billig, ein Vergleich zweier `int`-Felder pro Element. Sie ist **kein Schutz gegen Nebenläufigkeit**: Ändert ein anderer Thread die Liste ohne Sperre, kann alles Mögliche passieren, auch ohne Exception. Wer beim Durchlaufen entfernen will, nimmt eine `for`-Schleife rückwärts über den Index oder `RemoveAll`.
+
+### Der veränderliche Struct-Enumerator
+
+Ein Struct-Enumerator ist ein veränderlicher Wert. Wer ihn selbst in einer Variable hält und kopiert, etwa durch Übergabe an eine Methode oder Speichern in einem `readonly`-Feld, ruft `MoveNext` auf einer Kopie auf. Beim `readonly`-Feld erzeugt der Compiler für jeden Aufruf eine neue Kopie, und die Schleife kommt nie voran. In `foreach` passiert das nicht, weil der Compiler den Enumerator in einer eigenen lokalen Variable hält.
+
+### Die Lebensdauer von using-Deklarationen
+
+`using var` gibt die Ressource erst am Ende des umgebenden Blocks frei. In einer langen Methode hält eine Datei oder eine Datenbankverbindung damit länger offen als nötig. Wird die Ressource nur in einem Teil gebraucht, ist ein `using`-Block mit Klammern die bessere Wahl.
+
+### Sperren mit Seiteneffekten
+
+`lock` auf einen Werttyp lehnt der Compiler ab. Mit einem Cast auf `object` lässt sich das umgehen, dann wird aber bei jedem `lock` eine neue Box gesperrt, und kein Thread schließt je einen anderen aus. Ebenso riskant sind `lock (this)` und `lock` auf einen String-Literal: Fremder Code kann dasselbe Objekt sperren, bei internierten Strings sogar Code in einer ganz anderen Bibliothek. Und ein `await` im Rumpf eines `lock` ist ein Compilerfehler, weil `Monitor` an den Thread gebunden ist, die Fortsetzung aber auf einem anderen laufen kann.
+
+{/* TODO(verify): Compiler errors CS0185 (lock on value type) and CS1996 (await in lock body). */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die Kosten einer Schleife hängen fast nur davon ab, welche Variante der Compiler gewählt hat:
+
+| Statischer Typ des Ausdrucks         | Gelowert zu                    | Allokation pro Schleife | Aufrufe pro Element          |
+| ------------------------------------ | ------------------------------ | ----------------------- | ---------------------------- |
+| `T[]`, `string`, `Span<T>`           | `for` über Index               | keine                   | keine                        |
+| `List<T>`, `Dictionary<K, V>` usw.   | Struct-Enumerator im Frame     | keine                   | direkt, inlinebar            |
+| Klasse mit Klassen-Enumerator        | Enumerator-Objekt              | ein Objekt              | direkt oder virtuell         |
+| `IEnumerable<T>`, `IList<T>` usw.    | Interface-Enumerator           | meist ein Objekt        | zwei Interface-Aufrufe       |
+| nicht-generisches `IEnumerable`      | Interface-Enumerator mit Cast  | ein Objekt              | Interface-Aufrufe, Unboxing  |
+
+{/* TODO(verify): Allocation per row with BenchmarkDotNet MemoryDiagnoser on .NET 8 and .NET 10 (escape analysis may remove some boxes). */}
+
+Daraus folgen einige Faustregeln. In heißen Pfaden lohnt es sich, Parameter so konkret wie sinnvoll zu typisieren: Eine private Hilfsmethode darf ruhig `List<T>` oder `ReadOnlySpan<T>` nehmen. Öffentliche APIs mit `IEnumerable<T>` sind trotzdem richtig, solange sie nicht millionenfach pro Sekunde laufen. Und wer eigene Collections baut, gibt ihnen wie die BCL ein öffentliches `GetEnumerator`, das ein Struct liefert, und implementiert die Interfaces explizit.
+
+`for` statt `foreach` lohnt sich dagegen fast nie: Über Arrays und Spans erzeugt der Compiler ohnehin die `for`-Schleife, über eine `List<T>` ist der Struct-Enumerator nach dem Inlining kaum teurer. Ein Unterschied bleibt die Versionsprüfung, die du mit `CollectionsMarshal.AsSpan(list)` umgehen kannst, wenn du sicher bist, dass sich die Liste nicht ändert.
+
+Für Sperren gilt: Neuer Code auf .NET 9 oder später nimmt ein `private readonly Lock _lock = new();` statt eines `object`. Das macht die Absicht sichtbar und verhindert, dass jemand dasselbe Objekt für etwas anderes benutzt.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Das Lowering ist reine Compilerarbeit. Was die Runtime danach daraus macht, hat sich über die Versionen aber deutlich verbessert, vor allem für den teuren Interface-Weg.
+
+- **Inlining des Struct-Enumerators.** Weil `MoveNext` und `Current` beim Muster direkte Aufrufe auf einem bekannten Struct sind, kann der JIT sie inlinen. Danach liegen die Felder des Enumerators oft in Registern, und der Maschinencode ähnelt einer handgeschriebenen Schleife.
+- **Guarded Devirtualization.** Mit Dynamic PGO beobachtet der JIT in der instrumentierten Stufe, welcher Enumerator-Typ hinter einem Interface-Aufruf tatsächlich auftaucht. In der optimierten Fassung prüft er diesen Typ und ruft die Methode bei Treffer direkt und inline auf. Die Lektionen „Dynamic PGO“ und „Devirtualisierung“ erklären den Mechanismus.
+- **Stack-Allokation von Objekten.** Neuere Versionen können Objekte, die eine Methode nachweislich nicht verlassen, auf dem Stack anlegen. In Kombination mit Devirtualisierung kann so auch der geboxte Enumerator verschwinden. Wie weit das reicht, zeigt die Lektion „Escape Analysis“.
+
+<Callout kind="version">
+  Dynamic PGO ist seit .NET 8 standardmäßig aktiv. Die Stack-Allokation von Enumeratoren hinter
+  Interfaces ist eine neuere Entwicklung und greift nur in bestimmten Mustern. Der Typ
+  `System.Threading.Lock` und seine Sonderbehandlung in `lock` setzen .NET 9 und C# 13 voraus. Die
+  Struktur des gelowerten Codes selbst ist dagegen seit vielen C#-Versionen stabil.
+</Callout>
+
+{/* TODO(verify): .NET version (10?) in which the JIT can stack allocate or remove enumerator allocations for foreach over IEnumerable<T> (arrays, List<T>), per "Performance Improvements in .NET 10". */}
+
+Die Regel aus der Lektion „Boxing und Unboxing“ gilt deshalb auch hier: Der gelowerte Code und das IL zeigen, was der Compiler erzeugt. Ob zur Laufzeit wirklich alloziert wird, zeigt erst die Messung.
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente: den gelowerten Code der drei Schleifenvarianten und der beiden `lock`-Varianten in SharpLab ansehen und die Allokationen mit BenchmarkDotNet messen.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „C#“ (Release). SumArray wird zu einer for-Schleife, SumList hält einen List<int>.Enumerator in einer lokalen Variable, SumSeq einen IEnumerator<int> mit Null-Prüfung im finally. Bei WithMonitor siehst du Monitor.Enter mit lockTaken, bei WithLock den Aufruf von EnterScope. Schalte danach auf „IL“ und suche das Präfix constrained."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'ArrayFor', allocated: 'keine' },
+    { method: 'ArrayForeach', allocated: 'keine' },
+    { method: 'ListForeach', allocated: 'keine' },
+    { method: 'EnumerableForeach', allocated: '40 B (geboxter Enumerator)' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. Auf neueren .NET-Versionen kann der JIT die Box in EnumerableForeach entfernen, dann steht dort ebenfalls keine Allokation."
+/>
+
+{/* TODO(verify): Expected allocations on x64 (40 B for the boxed List<int>.Enumerator) and on which .NET version EnumerableForeach drops to zero. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="lowering-schleifen"
+  questions={[
+    {
+      q: 'Was erzeugt der Compiler für foreach (int x in array) mit int[] array?',
+      options: [
+        'Einen Aufruf von array.GetEnumerator() und eine while-Schleife',
+        'Eine for-Schleife über den Index',
+        'Eine eigene IL-Instruktion für foreach',
+      ],
+      correct: 1,
+      explanation:
+        'Für eindimensionale Arrays (und string, Span<T>) erzeugt der Compiler eine Index-Schleife über Length. Es gibt keinen Enumerator und keine Allokation.',
+    },
+    {
+      q: 'Alloziert foreach über eine Variable vom Typ List<int>?',
+      options: ['Ja, einen Enumerator pro Schleife', 'Nein'],
+      correct: 1,
+      explanation:
+        'Das öffentliche GetEnumerator von List<T> liefert das Struct List<T>.Enumerator. Es liegt als lokale Variable im Frame.',
+    },
+    {
+      q: 'Dieselbe Liste wird als IEnumerable<int> übergeben und dort mit foreach durchlaufen. Was ändert sich?',
+      options: [
+        'Nichts, zur Laufzeit ist es ja eine List',
+        'Der Enumerator wird geboxt, MoveNext und Current werden Interface-Aufrufe',
+      ],
+      correct: 1,
+      explanation:
+        'Das Lowering richtet sich nach dem statischen Typ. Über das Interface bleibt nur IEnumerable<T>.GetEnumerator, das das Struct als Interface und damit als Box zurückgibt.',
+    },
+    {
+      q: 'Warum boxt ((IDisposable)e).Dispose() im finally eines Struct-Enumerators nicht?',
+      options: [
+        'Weil der Compiler einen constrained-Aufruf erzeugt, der direkt auf dem Wert arbeitet',
+        'Weil Dispose bei Structs nie aufgerufen wird',
+      ],
+      correct: 0,
+      explanation:
+        'Das Präfix constrained. vor callvirt sagt der Runtime, dass die Methode direkt auf dem Werttyp an der angegebenen Adresse aufgerufen wird. Die Spezifikation verlangt, dass dabei nicht geboxt wird.',
+    },
+    {
+      q: 'Wofür ist das Flag lockTaken im gelowerten lock?',
+      options: [
+        'Damit Monitor.Exit nur aufgerufen wird, wenn die Sperre wirklich erworben wurde',
+        'Damit derselbe Thread die Sperre nicht zweimal erwerben kann',
+      ],
+      correct: 0,
+      explanation:
+        'Monitor.Enter setzt das Flag erst nach dem Erwerb. Fliegt vorher eine Exception, überspringt das finally den Aufruf von Exit.',
+    },
+    {
+      q: 'Im Rumpf einer foreach-Schleife über eine List<int> wird list.Add(7) aufgerufen. Was passiert?',
+      options: [
+        'Das neue Element wird mitgezählt',
+        'Der nächste MoveNext wirft eine InvalidOperationException',
+        'Die Schleife endet still',
+      ],
+      correct: 1,
+      explanation:
+        'Add erhöht _version. Der Enumerator vergleicht beim nächsten MoveNext seine Kopie mit dem aktuellen Wert und wirft bei Abweichung.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- `foreach`, `using` und `lock` gibt es im IL nicht. Der Compiler **lowert** sie zu Schleifen, Methodenaufrufen und `try`/`finally`.
+- `foreach` über **Arrays, Strings und Spans** wird zur `for`-Schleife über den Index, ohne Enumerator und ohne Allokation.
+- Sonst sucht der Compiler zuerst das **Muster** `GetEnumerator`, `MoveNext`, `Current`. Liefert es ein Struct wie bei `List<T>`, liegt der Enumerator im Frame, und alle Aufrufe sind direkt.
+- Über **`IEnumerable<T>`** wird ein Struct-Enumerator geboxt, und `MoveNext` und `Current` werden Interface-Aufrufe. Entscheidend ist immer der **statische** Typ.
+- `using` wird zu `try`/`finally` mit `Dispose()`, mit Null-Prüfung bei Klassen und ohne Box bei Structs. Using-Deklarationen leben bis zum Ende des Blocks.
+- `lock` wird zu `Monitor.Enter(obj, ref lockTaken)` und `Monitor.Exit` im `finally`, auf einem `System.Threading.Lock` ab .NET 9 zu `EnterScope()` mit `using`.
+- Die Versionsprüfung von `List<T>` steckt im Enumerator. Sie meldet Änderungen während der Schleife, schützt aber nicht vor Nebenläufigkeit.
+
+</Block>

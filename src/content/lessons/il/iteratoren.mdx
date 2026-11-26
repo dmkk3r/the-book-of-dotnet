@@ -1,0 +1,370 @@
+---
+id: iteratoren
+title: yield und Iteratoren
+summary: Wie der Compiler eine Methode mit yield return in eine State Machine verwandelt, warum dabei bis zum ersten MoveNext nichts passiert und was das für Argumentprüfung, finally-Blöcke und Kosten bedeutet.
+status: draft
+sources:
+  - title: 'yield statement (C#-Sprachreferenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/yield
+  - title: 'Iterators (C#-Dokumentation, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/iterators
+  - title: 'C#-Sprachspezifikation: Classes, Abschnitt Iterators'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/classes
+  - title: 'Generate and consume async streams (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/asynchronous-programming/generate-consume-asynchronous-stream
+  - title: 'IteratorRewriter im Roslyn-Quellcode (dotnet/roslyn)'
+    url: https://github.com/dotnet/roslyn/tree/main/src/Compilers/CSharp/Portable/Lowering/IteratorRewriter
+  - title: 'SharpLab'
+    url: https://sharplab.io/
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './iteratoren.steps';
+import zustaendeScript from './iteratoren-zustaende.steps';
+import ablaufScript from './iteratoren-ablauf.steps';
+import finallyScript from './iteratoren-finally.steps';
+import { sharplabCode, benchmarkCode } from './iteratoren-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine Sequenz Element für Element zu liefern, ist eine der häufigsten Aufgaben überhaupt: Zeilen einer Datei, Knoten eines Baums, Ergebnisse einer Berechnung. Oft will man dabei nicht alles vorab in eine Liste packen. Die Datei könnte riesig sein, die Sequenz unendlich, oder der Aufrufer braucht vielleicht nur die ersten drei Elemente.
+
+`foreach` arbeitet mit einem Enumerator: einem Objekt mit `MoveNext()` und `Current`, das sich merkt, wo es gerade steht. Vor C# 2 musstest du so ein Objekt von Hand schreiben. Für eine Baumtraversierung bedeutete das eine Klasse mit einem eigenen Stack, einem Zustandsfeld und einem `MoveNext`, das bei jedem Aufruf herausfinden muss, wo es beim letzten Mal aufgehört hat. Die eigentliche Logik, die in einer rekursiven Methode fünf Zeilen hätte, verschwindet in Verwaltungscode.
+
+**Iteratoren** drehen das um. Du schreibst eine gewöhnliche Methode mit Schleifen und lokalen Variablen und markierst mit `yield return` jede Stelle, an der ein Element herauskommt. Den Enumerator mit Zustandsfeld und `MoveNext` erzeugt der Compiler.
+
+Der Komfort hat eine Kehrseite: Der Code, den du schreibst, sieht aus wie eine Methode, verhält sich aber nicht wie eine. Er läuft nicht, wenn du ihn aufrufst. Er pausiert mitten in einer Schleife. Ein `finally` läuft vielleicht erst viel später oder gar nicht von selbst. All das versteht man erst, wenn man sieht, was der Compiler daraus macht. Wie `foreach` selbst gelowert wird, steht in der Lektion „foreach, using und lock“.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Vier Sätze genügen:
+
+1. **Ein Iterator ist ein Objekt, keine laufende Methode.** Der Compiler macht aus der Methode eine Klasse. Dein Rumpf landet in deren Methode `MoveNext`, lokale Variablen und Parameter werden zu Feldern.
+2. **Beim Aufruf passiert nichts.** Die Methode mit dem ursprünglichen Namen legt nur das Objekt an und speichert die Argumente. Kein Befehl deines Rumpfs läuft.
+3. **Jeder MoveNext läuft bis zum nächsten yield.** Ein Feld für den Zustand merkt sich, hinter welchem `yield return` es weitergeht. `MoveNext` springt dorthin, läuft bis zum nächsten `yield return`, legt den Wert in `Current` ab und kehrt zurück.
+4. **Der Aufrufer zieht.** Zwischen zwei Aufrufen von `MoveNext` läuft nichts. Alles passiert auf dem Thread des Aufrufers, in dem Tempo, in dem er Elemente abholt.
+
+Das ist dasselbe Grundprinzip wie bei async, nur einfacher: eine Methode, zerlegt in Abschnitte, mit einem Zustandsfeld als Sprungmarke. Die Lektion „Die async State Machine“ zeigt die jüngere Schwester, und vieles dort wirst du hier wiedererkennen.
+
+<Callout kind="fehlannahme">
+  „yield return gibt einen Wert zurück und lässt den Rest der Methode im Hintergrund weiterlaufen.“
+  Es gibt keinen Hintergrund. Nach `yield return` ist die Methode angehalten, ihr Zustand liegt
+  reglos in einem Heap-Objekt. Weiter geht es erst, wenn jemand `MoveNext` aufruft, und zwar auf
+  dessen Thread.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ist ein kleiner Zahlengenerator mit zwei Elementen. Im Tab „Gelowert“ siehst du die drei Teile, die der Compiler erzeugt: den Kickoff (die Methode mit dem ursprünglichen Namen), `GetEnumerator` und `MoveNext`. Achte darauf, wann zum ersten Mal Code aus deinem Rumpf läuft und wo die Schleifenvariable `i` lebt.
+
+<StepPlayer script={script} />
+
+Drei Beobachtungen tragen den Rest der Lektion.
+
+Erstens ist der Kickoff leer. `Range(10, 2)` kehrt sofort zurück, und wäre `count` negativ oder `start` ungültig, würde das niemand bemerken, bis die Aufzählung beginnt.
+
+Zweitens ist `i` kein Slot im Stack-Frame mehr, sondern das Feld `<i>5__2` im Iterator-Objekt. Der Frame von `MoveNext` verschwindet bei jedem `yield return`, also muss alles, was einen Abschnitt überlebt, im Objekt stehen. Die spitzen Klammern im Namen sind Absicht: In C# sind sie in Bezeichnern verboten, im IL erlaubt. So kann kein Name des Compilers mit einem deiner Namen kollidieren.
+
+Drittens ist `MoveNext` im Kern eine Verzweigung über den Zustand. Bei einem Iterator mit mehreren `yield return` erzeugt der Compiler dafür ein `switch`, das jeden Zustand an die Stelle hinter dem passenden `yield` schickt.
+
+{/* TODO(verify): Hoisting rules: in Release only locals that live across a yield become fields, in Debug all locals; naming scheme <name>5__N. */}
+
+</Block>
+
+<Block n={4} title="Die generierte Klasse und ihre Zustände">
+
+Für eine Iterator-Methode, die `IEnumerable<T>` zurückgibt, erzeugt der Compiler eine versiegelte, verschachtelte Klasse. Sie implementiert gleich fünf Interfaces: `IEnumerable<T>`, `IEnumerable`, `IEnumerator<T>`, `IEnumerator` und `IDisposable`. Ein einziges Objekt ist also Sequenz und Enumerator zugleich. Seine Felder:
+
+- `<>1__state`: der Zustand, ein `int`.
+- `<>2__current`: der zuletzt gelieferte Wert, den `Current` zurückgibt.
+- `<>l__initialThreadId`: die ID des Threads, der das Objekt erzeugt hat.
+- `<>3__start`, `<>3__count`: die Argumente, wie sie beim Aufruf übergeben wurden.
+- `start`, `count`: die Arbeitskopien der Parameter, mit denen `MoveNext` rechnet.
+- ein Feld für jede gehobene lokale Variable, bei Instanzmethoden außerdem `<>4__this` für das Objekt, auf dem die Methode aufgerufen wurde.
+
+Warum zwei Kopien der Parameter? Ein Parameter ist im Rumpf eine gewöhnliche Variable, die dein Code verändern darf. Würde `MoveNext` direkt mit den gespeicherten Argumenten rechnen, sähe eine zweite Aufzählung die veränderten Werte. Mit getrennten Feldern bekommt jeder Enumerator in `GetEnumerator` frische Kopien der Originalargumente.
+
+Den Ablauf als Zustandsautomat zeigt der folgende Graph. Er spielt mehrere Aufrufe auf derselben Sequenz durch, darunter einen vorzeitigen Abbruch.
+
+<StepPlayer script={zustaendeScript} />
+
+| Zustand     | Bedeutung                                                                    |
+| ----------- | ---------------------------------------------------------------------------- |
+| -2          | Objekt ist nur Sequenz, noch kein Enumerator ausgegeben                      |
+| 0           | Enumerator ausgegeben, `MoveNext` noch nie aufgerufen                        |
+| -1          | Code läuft gerade, oder der Iterator ist beendet                             |
+| 1, 2, 3 ... | angehalten hinter dem ersten, zweiten, dritten `yield return`                |
+| -3, -4 ...  | Code läuft gerade innerhalb eines `try` mit `finally` (eine Nummer je Block) |
+
+{/* TODO(verify): The full table of state values in Roslyn (StateMachineState): -2, 0, -1, 1..n, -3 and below for finally blocks; whether newer Roslyn sets the state to -2 in Dispose. */}
+
+### Der Trick mit der Thread-ID
+
+Das Objekt ist zunächst nur eine Sequenz. Erst `GetEnumerator` liefert einen Enumerator, und das Interface erlaubt, `GetEnumerator` beliebig oft aufzurufen, auch von mehreren Threads. Am einfachsten wäre es, jedes Mal ein neues Objekt anzulegen. Das kostet aber für den bei Weitem häufigsten Fall, `foreach (var x in Iterator(...))`, eine zweite Allokation.
+
+Deshalb prüft `GetEnumerator`, ob der Zustand noch -2 ist **und** ob der aufrufende Thread derselbe ist, der das Objekt erzeugt hat. Nur dann verwandelt sich das Objekt selbst in den Enumerator. Die Thread-Prüfung verhindert, dass zwei Threads, die dieselbe Sequenz gleichzeitig aufzählen, sich ein Objekt teilen: Der Zustand -2 wird zwar nicht atomar geändert, aber ein fremder Thread kommt nie in diesen Zweig. Jede weitere Aufzählung bekommt eine neue Instanz im Zustand 0.
+
+{/* TODO(verify): Exact GetEnumerator condition in Roslyn output (state == -2 && initialThreadId == Environment.CurrentManagedThreadId) and that the thread id is captured in the constructor. */}
+
+Gibt die Iterator-Methode direkt `IEnumerator<T>` statt `IEnumerable<T>` zurück, entfällt dieser Teil. Die Klasse hat dann kein `GetEnumerator`, keine Thread-ID und keine doppelten Parameter, sie startet im Zustand 0.
+
+### Immer eine Klasse
+
+Anders als die async State Machine, die im Release-Build ein Struct ist, erzeugt der Compiler für Iteratoren immer eine **Klasse**. Ein Struct brächte nichts: Das Objekt wird als `IEnumerable<T>` zurückgegeben und müsste dafür ohnehin geboxt werden. Der async-Builder kann sein Struct auf dem Stack lassen, solange nichts wartet. Beim Iterator gibt es diesen Fall nicht: Das Objekt muss die Rückkehr des Kickoffs immer überleben, denn erst danach beginnt die Aufzählung.
+
+</Block>
+
+<Block n={5} title="Abwechselnd auf einem Thread">
+
+Das mentale Bild „Aufrufer zieht, Iterator liefert“ wird am deutlichsten, wenn beide etwas ausgeben. Die Zeitleiste hat genau eine Spur, denn es gibt nur einen Thread.
+
+<StepPlayer script={ablaufScript} />
+
+Diese strikte Abwechslung heißt **verzögerte Ausführung** (Deferred Execution) und ist die Grundlage von LINQ to Objects. Hängst du `Where`, `Select` und `Take` aneinander, entsteht eine Kette von Iteratoren, von denen jeder seinen Vorgänger zieht. Fordert der Aufrufer ein Element an, wandert die Anfrage durch die Kette nach hinten, und genau ein Element wandert nach vorn. `Take(3)` auf einer unendlichen Sequenz funktioniert deshalb: Nach drei Elementen fragt niemand mehr.
+
+```csharp
+static IEnumerable<int> Naturals()
+{
+    for (int i = 0; ; i++)
+        yield return i;        // unendlich, aber harmlos
+}
+
+foreach (int n in Naturals().Where(n => n % 7 == 0).Take(3))
+    Console.WriteLine(n);      // 0, 7, 14
+```
+
+Die Kehrseite: Zwischen dem Erzeugen der Sequenz und dem Aufzählen kann sich die Welt ändern. Der Iterator sieht die Daten so, wie sie beim jeweiligen `MoveNext` sind, nicht wie beim Aufruf. Wer einen festen Stand braucht, materialisiert die Sequenz mit `ToList()` oder `ToArray()`. Die Iteratoren in LINQ sind übrigens nicht mit `yield` geschrieben, sondern von Hand optimiert, wie die Lektion „LINQ-Iteratoren“ zeigt.
+
+</Block>
+
+<Block n={6} title="finally und Dispose">
+
+Ein Iterator darf `try`/`finally` und `using` enthalten, und das ist oft der eigentliche Zweck: eine Datei öffnen, Zeilen liefern, Datei schließen. Damit entsteht ein Problem, das gewöhnliche Methoden nicht haben. Ein `finally` läuft, wenn der Code den `try`-Block verlässt. Ein Iterator kann aber **mitten im `try`** anhalten und nie fortgesetzt werden, etwa weil der Aufrufer nach dem ersten Treffer `break` sagt.
+
+Der Compiler löst das mit `Dispose()`. Das `foreach` des Aufrufers ruft es in seinem eigenen `finally` auf, und der Iterator führt dann alle `finally`-Blöcke aus, die den Punkt umschließen, an dem er angehalten ist.
+
+<StepPlayer script={finallyScript} />
+
+Im gelowerten Code siehst du die drei Bausteine. Der Inhalt deines `finally` wandert in eine eigene Methode `<>m__Finally1`. Sie wird von drei Stellen aus aufgerufen: am normalen Ende des `try` in `MoveNext`, aus `Dispose` bei vorzeitigem Abbruch und über einen `fault`-Handler, wenn `MoveNext` eine Exception wirft. Ein `fault`-Block ist ein IL-Konstrukt, das nur im Fehlerfall läuft. C# kennt ihn nicht, der Compiler darf ihn aber erzeugen. Der Zustand -3 sagt `Dispose`, dass gerade Code im `try` läuft, der Zustand 1, dass der Iterator im `try` angehalten ist.
+
+{/* TODO(verify): fault handler in Roslyn iterator MoveNext when finally blocks exist (SharpLab shows it as "fault"); Dispose wraps the finally call in try { } finally { }. */}
+
+Daraus ergeben sich die Regeln, die der Compiler für `yield` durchsetzt:
+
+- `yield return` darf in einem `try` mit `finally` stehen, aber **nicht** in einem `try` mit `catch` und nicht in einem `finally`. Ein `catch` müsste Exceptions fangen, die in späteren Abschnitten auftreten, also in einem anderen Aufruf von `MoveNext`, und das lässt sich mit der Zerlegung nicht sauber abbilden.
+- `yield break` ist überall erlaubt, auch in einem `try` mit `catch`.
+- Iteratoren dürfen keine `ref`-, `out`- oder `in`-Parameter haben, denn Parameter werden zu Feldern eines Heap-Objekts, und ein Feld kann keine Referenz auf einen Stack-Slot halten.
+
+{/* TODO(verify): yield rules and error codes (CS1626 yield in try with catch, CS1625 yield in finally, CS1623 ref/out parameters); C# 13 relaxations for ref locals and unsafe code in iterators as long as they do not cross a yield. */}
+
+<Callout kind="hinweis">
+  Ein `finally` im Iterator ist nur so zuverlässig wie der Aufrufer. `foreach` ruft immer `Dispose`
+  auf, LINQ-Operatoren ebenfalls. Wer aber selbst `GetEnumerator` und `MoveNext` aufruft, muss den
+  Enumerator mit `using` umschließen. Sonst läuft das `finally` bei einem Abbruch nie.
+</Callout>
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Die Argumentprüfung kommt zu spät
+
+Die häufigste Falle folgt direkt aus dem leeren Kickoff. Eine Prüfung am Anfang des Rumpfs ist Teil von `MoveNext`:
+
+```csharp
+static IEnumerable<string> ReadLines(string path)
+{
+    ArgumentNullException.ThrowIfNull(path);   // läuft erst beim ersten MoveNext
+    foreach (string line in File.ReadLines(path))
+        yield return line;
+}
+
+var lines = ReadLines(null!);   // keine Exception
+// ... viel später, an ganz anderer Stelle:
+foreach (var l in lines) { }    // ArgumentNullException hier
+```
+
+Der Stacktrace zeigt dann auf die Schleife, nicht auf den fehlerhaften Aufruf, und zwischen beiden können Methoden, Klassen oder sogar Threads liegen. Die Lösung ist eine Trennung in zwei Methoden: eine gewöhnliche, die sofort prüft, und einen Iterator, der die Arbeit macht. Eine lokale Funktion hält beides zusammen:
+
+```csharp
+static IEnumerable<string> ReadLines(string path)
+{
+    ArgumentNullException.ThrowIfNull(path);   // läuft beim Aufruf
+    return Core(path);
+
+    static IEnumerable<string> Core(string path)
+    {
+        foreach (string line in File.ReadLines(path))
+            yield return line;
+    }
+}
+```
+
+Die äußere Methode enthält kein `yield`, ist also kein Iterator und wird nicht umgeschrieben. Die Lektion „Die async State Machine“ beschreibt dasselbe Muster für async-Methoden, dort landet die Exception im Task.
+
+### Mehrfache Aufzählung führt den Code mehrfach aus
+
+Eine Iterator-Sequenz ist keine Collection, sondern ein Rezept. Jedes `foreach`, jedes `Count()`, jedes `Any()` erzeugt einen neuen Enumerator und führt den Rumpf von vorn aus. Liest der Iterator eine Datei oder fragt eine Datenbank ab, passiert das mehrfach. Wirft er Zufallszahlen aus, bekommt jede Aufzählung andere. Wer eine Sequenz mehrfach braucht, materialisiert sie einmal.
+
+### Exceptions am falschen Ort
+
+Weil der Rumpf in `MoveNext` läuft, tritt jede Exception dort auf, wo aufgezählt wird. Ein `try`/`catch` um den Aufruf der Iterator-Methode fängt nichts. Und eine Sequenz, die erst in einer anderen Schicht aufgezählt wird, etwa beim Serialisieren einer Antwort, wirft auch erst dort.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die Kosten eines Iterators sind gut vorhersagbar:
+
+| Vorgang                                  | Kosten                                                         |
+| ---------------------------------------- | -------------------------------------------------------------- |
+| Aufruf der Iterator-Methode              | eine Allokation (das Iterator-Objekt)                          |
+| erstes `GetEnumerator` auf gleichem Thread | keine weitere Allokation                                     |
+| jede weitere Aufzählung                  | eine weitere Allokation                                        |
+| pro Element über `foreach`               | zwei Interface-Aufrufe (`MoveNext`, `Current`)                 |
+| `try`/`finally` im Rumpf                 | zusätzlicher Code in `MoveNext` und `Dispose`, kaum Laufzeit   |
+
+{/* TODO(verify): Allocation counts and object size per row with BenchmarkDotNet MemoryDiagnoser (x64). */}
+
+Für die allermeisten Anwendungen ist das vernachlässigbar, und die Lesbarkeit eines Iterators ist den Preis wert. In heißen Pfaden mit sehr vielen kleinen Elementen kann der Unterschied zu einer Schleife über ein Array oder eine Span aber deutlich sein: Der Compiler kann den Iterator nicht wie einen Struct-Enumerator behandeln, weil er nur über Interfaces angesprochen wird. Ist eine Sequenz ohnehin klein und vollständig bekannt, ist ein Array oder eine Liste oft schlicht billiger.
+
+Iteratoren sind dagegen ideal, wenn die Sequenz groß, teuer oder unendlich ist, wenn der Aufrufer früh abbrechen könnte oder wenn Ressourcen sauber mit `using` verwaltet werden sollen. Gerade die Kombination aus verzögerter Ausführung und `Dispose` macht Code möglich, der Dateien zeilenweise verarbeitet, ohne je die ganze Datei im Speicher zu halten.
+
+Für asynchrone Quellen gibt es seit C# 8 die **async Iteratoren**: eine Methode mit `async`, Rückgabetyp `IAsyncEnumerable<T>` und `yield return`, aufgezählt mit `await foreach`. Der Compiler kombiniert dabei beide State Machines: `MoveNextAsync` liefert ein `ValueTask<bool>`, und innerhalb eines Abschnitts darf `await` stehen. Das generierte Objekt implementiert dafür selbst `IValueTaskSource<bool>`, damit nicht pro Element ein Task entsteht. Die Lektionen „Channels und Async Streams“ und „ValueTask und IValueTaskSource“ gehen darauf ein.
+
+{/* TODO(verify): The async iterator class implements IValueTaskSource<bool> (and IValueTaskSource) and uses ManualResetValueTaskSourceCore<bool>. */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Für die Runtime ist ein Iterator nichts Besonderes. Sie sieht eine gewöhnliche Klasse mit Feldern und Methoden. Es gibt keine Unterstützung für Unterbrechungen, keine Koroutinen im JIT, keinen eigenen Stack. Alles, was „anhalten“ und „fortsetzen“ heißt, ist ein `return` aus `MoveNext` und ein späterer erneuter Aufruf, der anhand eines `int`-Felds an die richtige Stelle springt.
+
+Das macht Iteratoren portabel und durchschaubar, begrenzt aber auch die Optimierung. Der JIT sieht Interface-Aufrufe auf ein Objekt, das in einer anderen Methode erzeugt wurde. Mit Dynamic PGO kann er für einen häufig beobachteten Iterator-Typ einen geschützten direkten Aufruf einsetzen und `MoveNext` dann sogar inlinen, wie die Lektion „Devirtualisierung“ beschreibt. Ob das Iterator-Objekt selbst auf den Stack wandern kann, hängt davon ab, ob der JIT nach dem Inlining beweisen kann, dass es die Methode nicht verlässt. Die Lektion „Escape Analysis“ zeigt, wann das gelingt.
+
+<Callout kind="version">
+  Iteratoren gibt es seit C# 2, ihr Lowering hat sich seitdem im Kern nicht verändert. Async
+  Iteratoren mit `IAsyncEnumerable<T>` kamen mit C# 8 und .NET Core 3.0. Mit C# 13 dürfen
+  Iteratoren `ref`-Lokale und `unsafe`-Code enthalten, solange diese kein `yield` überspannen. Die
+  Optimierungen des JIT (Dynamic PGO, Stack-Allokation) hängen von der .NET-Version ab.
+</Callout>
+
+{/* TODO(verify): C# 13 "ref and unsafe in iterators and async methods" rules; whether .NET 9/10 escape analysis can stack allocate an iterator object after inlining the kickoff. */}
+
+Der Vergleich mit async lohnt sich noch einmal im Ganzen. Beide Features zerlegen eine Methode an ihren Unterbrechungspunkten, heben lokale Variablen in Felder und nutzen ein Zustandsfeld als Sprungmarke. Der Unterschied liegt darin, **wer** `MoveNext` aufruft. Beim Iterator ist es der Aufrufer, synchron und auf seinem Thread, wann immer er ein Element will. Bei async ist es die Fortsetzung eines Awaiters, wenn die erwartete Operation fertig ist, oft auf einem anderen Thread.
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente: die generierte Klasse in SharpLab ansehen und die Allokationen mit BenchmarkDotNet messen.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „C#“. Zu Range findest du eine Klasse <Range>d__0 mit <>1__state, <>2__current, <>l__initialThreadId und den doppelten Parameterfeldern. In Lines steht die Prüfung von path in MoveNext, in LinesChecked dagegen in der Methode selbst. Bei Lines siehst du außerdem <>m__Finally1 und den Zustand -3."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'Loop', allocated: 'keine' },
+    { method: 'Iterator', allocated: 'ein Iterator-Objekt' },
+    { method: 'IteratorTwice', allocated: 'zwei Iterator-Objekte' },
+  ]}
+  note="Werte für 64-Bit-Prozesse im Release-Build. IteratorTwice zählt dieselbe Sequenz zweimal auf: Die erste Aufzählung verwendet das ursprüngliche Objekt, die zweite bekommt eine neue Instanz."
+/>
+
+{/* TODO(verify): Exact byte counts for Iterator and IteratorTwice on x64 and whether a newer JIT removes the allocation in Iterator. */}
+
+Ein schneller Test ohne Werkzeuge: Rufe eine Iterator-Methode mit `null` als Argument auf, ohne das Ergebnis aufzuzählen. Es passiert nichts. Hänge `.ToList()` an, und die Exception fliegt.
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+{/* TODO(verify): The last question assumes that Dispose does not reset the state to -2 (which would let a second GetEnumerator on the same thread reuse the object). */}
+
+<Quiz
+  client:visible
+  lessonId="iteratoren"
+  questions={[
+    {
+      q: 'Eine Iterator-Methode beginnt mit einer Ausgabe auf der Konsole. Wann erscheint sie?',
+      options: [
+        'Beim Aufruf der Methode',
+        'Beim ersten MoveNext, also wenn die Aufzählung beginnt',
+        'Beim ersten Zugriff auf Current',
+      ],
+      correct: 1,
+      explanation:
+        'Der Kickoff legt nur das Iterator-Objekt an. Der gesamte Rumpf steckt in MoveNext und läuft erst beim ersten Aufruf.',
+    },
+    {
+      q: 'Auf welchem Thread läuft der Code nach einem yield return weiter?',
+      options: [
+        'Auf einem ThreadPool-Thread im Hintergrund',
+        'Auf dem Thread, der als Nächstes MoveNext aufruft',
+      ],
+      correct: 1,
+      explanation:
+        'Zwischen zwei MoveNext-Aufrufen läuft nichts. Der Code wird fortgesetzt, wenn der Aufrufer das nächste Element anfordert, auf dessen Thread.',
+    },
+    {
+      q: 'Wo lebt eine lokale Variable eines Iterators, die über ein yield hinweg gebraucht wird?',
+      options: [
+        'Im Stack-Frame von MoveNext',
+        'Als Feld im Iterator-Objekt auf dem Heap',
+      ],
+      correct: 1,
+      explanation:
+        'Der Frame von MoveNext verschwindet bei jedem yield return. Alles, was den Abschnitt überleben muss, hebt der Compiler in ein Feld.',
+    },
+    {
+      q: 'Wie sorgst du dafür, dass eine Argumentprüfung in einem Iterator sofort beim Aufruf wirft?',
+      options: [
+        'Die Prüfung als erste Zeile vor das erste yield schreiben',
+        'Prüfen in einer gewöhnlichen Methode und den Iterator in eine lokale Funktion auslagern',
+      ],
+      correct: 1,
+      explanation:
+        'Alles in einer Methode mit yield wird Teil von MoveNext. Nur eine Methode ohne yield läuft beim Aufruf, sie prüft und gibt dann den eigentlichen Iterator zurück.',
+    },
+    {
+      q: 'foreach bricht mit break ab, während der Iterator in einem try mit finally angehalten ist. Was passiert mit dem finally?',
+      options: [
+        'Es läuft nie',
+        'Es läuft, weil foreach Dispose aufruft und Dispose die offenen finally-Blöcke ausführt',
+        'Es läuft erst, wenn der GC das Iterator-Objekt einsammelt',
+      ],
+      correct: 1,
+      explanation:
+        'Das finally von foreach ruft Dispose. Der Iterator erkennt am Zustand, in welchem try er steht, und führt den ausgelagerten finally-Code aus.',
+    },
+    {
+      q: 'var seq = Range(0, 3); Danach wird seq zweimal mit foreach durchlaufen. Wie viele Iterator-Objekte entstehen?',
+      options: ['Eins', 'Zwei'],
+      correct: 1,
+      explanation:
+        'Das erste GetEnumerator verwendet das Objekt selbst (Zustand -2, gleicher Thread). Das zweite findet den Zustand verändert vor und legt eine neue Instanz an.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Eine Methode mit `yield` wird zu einer **Klasse**, die Sequenz und Enumerator zugleich ist. Dein Rumpf landet in `MoveNext`, lokale Variablen und Parameter werden zu Feldern.
+- Beim Aufruf läuft **nichts** von deinem Code. Erst jeder `MoveNext` führt einen Abschnitt bis zum nächsten `yield return` aus.
+- Das Feld `<>1__state` ist die Sprungmarke: -2 und 0 vor dem Start, -1 während des Laufs und am Ende, positive Werte für die angehaltenen Stellen.
+- Alles läuft **auf dem Thread des Aufrufers**, abwechselnd mit ihm. Zwischen zwei `MoveNext` passiert nichts.
+- `GetEnumerator` gibt beim ersten Aufruf auf dem erzeugenden Thread das Objekt selbst zurück, sonst eine neue Instanz. Jede Aufzählung führt den Rumpf von vorn aus.
+- `finally`-Blöcke laufen bei vorzeitigem Abbruch über `Dispose`. `foreach` ruft es zuverlässig auf, manuelle Aufzählung braucht `using`.
+- Argumentprüfungen gehören in eine gewöhnliche Methode, die den eigentlichen Iterator als lokale Funktion zurückgibt.
+
+</Block>
