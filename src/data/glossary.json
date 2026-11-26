@@ -1042,6 +1042,62 @@
       "aliases": [],
       "definition": "Der Teil des Prozessspeichers, der gerade im physischen Arbeitsspeicher liegt. Gängiges Maß für den Speicherbedarf einer laufenden App.",
       "lesson": "start-vs-durchsatz"
+    },
+    {
+      "id": "aufrufkonvention",
+      "term": "Aufrufkonvention",
+      "aliases": ["Calling Convention", "Aufrufkonventionen"],
+      "definition": "Regeln, wie Argumente und Rückgabewerte zwischen Aufrufer und aufgerufener Methode übergeben werden: welche Register, welche Stack-Plätze, wer welche Register sichert. Sie hängt von Plattform und Prozessor ab.",
+      "lesson": "calling-conventions"
+    },
+    {
+      "id": "shadow-space",
+      "term": "Shadow Space",
+      "aliases": [],
+      "definition": "32 Byte, die der Aufrufer unter Windows x64 vor jedem Aufruf auf dem Stack reserviert, damit die aufgerufene Methode ihre vier Registerargumente dort ablegen kann.",
+      "lesson": "calling-conventions"
+    },
+    {
+      "id": "unwind-info",
+      "term": "Unwind-Info",
+      "aliases": [],
+      "definition": "Vom JIT erzeugte Beschreibung, wie ein Stack-Frame aufgebaut ist. Damit kann die Runtime von einer Methode zu ihrem Aufrufer zurückgehen, auch ohne Framepointer.",
+      "lesson": "stack-walking"
+    },
+    {
+      "id": "funclet",
+      "term": "Funclet",
+      "aliases": ["Funclets"],
+      "definition": "Auf 64-Bit-Plattformen werden catch-, filter- und finally-Blöcke als eigene kleine Funktionen übersetzt, die die Runtime beim Exception Handling aufruft.",
+      "lesson": "exception-handling"
+    },
+    {
+      "id": "gc-info",
+      "term": "GC-Info",
+      "aliases": [],
+      "definition": "Vom JIT erzeugte Tabelle pro Methode: An welchen Code-Stellen welche Register und Stack-Plätze lebende Objektverweise enthalten. Der GC findet so die Roots in laufenden Methoden.",
+      "lesson": "safe-points"
+    },
+    {
+      "id": "kooperativer-modus",
+      "term": "Kooperativer Modus",
+      "aliases": ["präemptiver Modus"],
+      "definition": "Zustand eines Threads, der verwalteten Code ausführt: Der GC muss warten, bis er einen Safe Point erreicht. Im präemptiven Modus (etwa während eines P/Invoke) darf der GC dagegen sofort laufen.",
+      "lesson": "suspension"
+    },
+    {
+      "id": "exception-filter",
+      "term": "Exception-Filter",
+      "aliases": ["Exception-Filtern", "when-Klausel"],
+      "definition": "Bedingung an einem catch-Block (catch … when). Sie wird im ersten Durchlauf ausgewertet, bevor ein finally-Block läuft und bevor der Stack abgewickelt wird.",
+      "lesson": "exception-handling"
+    },
+    {
+      "id": "first-chance-exception",
+      "term": "First-Chance-Exception",
+      "aliases": ["First-Chance-Exceptions"],
+      "definition": "Benachrichtigung über jede geworfene Exception, noch bevor ein Handler gesucht wird, unabhängig davon, ob sie später gefangen wird (AppDomain.FirstChanceException).",
+      "lesson": "exception-handling"
     }
   ]
 }

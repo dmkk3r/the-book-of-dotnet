@@ -1,0 +1,283 @@
+---
+id: calling-conventions
+title: Calling Conventions und Frames
+summary: Wo Argumente, this und Rückgabewerte bei einem Methodenaufruf wirklich landen, wie sich Windows x64, System V und ARM64 unterscheiden, wie ein Stack-Frame aufgebaut ist und warum viele Methoden gar keinen eigenen Frame haben.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Book of the Runtime: CLR ABI (clr-abi.md)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/clr-abi.md
+  - title: 'x64-Aufrufkonvention (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
+  - title: 'x64-Softwarekonventionen: Register und Stack (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions
+  - title: 'x64-Prolog und -Epilog (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog
+  - title: 'x64-Ausnahmebehandlung und Unwind-Daten (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64
+  - title: 'Übersicht über ARM64-ABI-Konventionen (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/arm64-windows-abi-conventions
+  - title: 'System V Application Binary Interface, AMD64 Supplement'
+    url: https://gitlab.com/x86-psABIs/x86-64-ABI
+  - title: 'Book of the Runtime: Stackwalking'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/stackwalking.md
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './calling-conventions.steps';
+import abiScript from './calling-conventions-abi.steps';
+import framesScript from './calling-conventions-frames.steps';
+import { sharplabCode, benchmarkCode } from './calling-conventions-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein Methodenaufruf ist in C# so selbstverständlich, dass man ihn kaum als Vorgang wahrnimmt. Für die Maschine ist er ein Vertrag zwischen zwei Codestücken, die sich nicht kennen. Der Aufrufer wurde vielleicht von einem anderen JIT-Lauf übersetzt als die aufgerufene Methode, vielleicht sogar von einem C-Compiler. Trotzdem muss die aufgerufene Methode wissen, wo ihr erstes Argument liegt, wo sie das Ergebnis ablegen soll, welche Register sie frei verwenden darf und wie sie zum Aufrufer zurückfindet.
+
+Diesen Vertrag nennt man **Aufrufkonvention** (Calling Convention). Sie ist keine Erfindung von .NET, sondern gehört zur Plattform: Windows x64, Linux und macOS auf x64 (System V) und ARM64 haben jeweils ihre eigene. Der JIT hält sich an sie, damit verwalteter Code mit nativem Code zusammenarbeiten kann, und ergänzt sie um ein paar verwaltete Besonderheiten.
+
+In „JIT-Assembler lesen“ hast du die Argumentregister schon kennengelernt. Diese Lektion geht eine Ebene tiefer: Was passiert mit Argumenten, die nicht in Register passen? Wo liegen `this`, ein großes Struct als Rückgabewert oder der versteckte generische Kontext? Wie sieht ein Stack-Frame aus, und woher weiß später ein Stack Walker, wo ein Frame endet, wenn es gar keinen Framepointer gibt?
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Vier Sätze tragen den Rest der Lektion:
+
+1. **Register zuerst, Stack als Überlauf.** Auf allen 64-Bit-Plattformen kommen die ersten Argumente in Registern an. Der Stack nimmt nur auf, was nicht mehr hineinpasst oder zu groß ist.
+2. **Ein Frame ist ein Abschnitt des Stacks, den eine Methode verwaltet.** Darin liegen die Rücksprungadresse, gesicherte Register, Locals, die nicht in Register passen, und der Platz für Argumente an weitere Aufrufe. Der **Prolog** baut ihn auf, der **Epilog** baut ihn ab.
+3. **Nicht jede Methode hat einen Frame.** Eingebettete Methoden verschmelzen mit dem Aufrufer, kleine Blattmethoden kommen ohne Prolog aus. Ihr „Frame“ ist höchstens die Rücksprungadresse.
+4. **Die Unwind-Info beschreibt jeden Frame.** Weil es nicht immer einen Framepointer gibt, legt der JIT zu jeder Methode Daten ab, aus denen sich rekonstruieren lässt, wie der Prolog den Stack verändert hat. Davon leben Stack Walks, Exceptions und der GC.
+
+<Callout kind="fehlannahme">
+  „Beim Aufruf werden alle Argumente auf den Stack gelegt.“ Das war bei 32-Bit-x86 weitgehend so.
+  Auf x64 und ARM64 landen die ersten vier bis acht Argumente in Registern. Viele Aufrufe berühren
+  den Speicher für ihre Argumente überhaupt nicht.
+</Callout>
+
+<Legend items={['stack', 'heap', 'ref']} />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ruft eine Methode mit fünf `int`-Argumenten unter Windows x64 auf. Damit jeder Wert sichtbar im Speicher landet, zeigt der Tab „Assembler“ unoptimierten Code im Stil von Tier 0. Achte darauf, wer welchen Teil des Stacks beschreibt: Der Aufrufer legt das fünfte Argument in seinem eigenen Frame ab, der Aufgerufene liest es von dort.
+
+<StepPlayer script={script} />
+
+{/* TODO(verify): Tier 0 listing for Sum5 on Windows x64 (.NET 8+): frame size, homing of rcx, rdx, r8, r9 into the caller's shadow space, offsets [rbp+0x10] to [rbp+0x30]. */}
+
+Drei Dinge sind typisch für Windows x64. Erstens der **Shadow Space**: Der Aufrufer muss immer 32 Byte für die vier Registerargumente reservieren, auch wenn die Methode weniger Argumente hat. Der Aufgerufene darf diesen Platz frei nutzen, etwa um die Register dort abzulegen. Zweitens die **Ausrichtung**: Vor jedem `call` muss `rsp` ein Vielfaches von 16 sein. Weil `call` 8 Byte Rücksprungadresse ablegt, ist `rsp` beim Eintritt in eine Methode immer um 8 verschoben, und der Prolog gleicht das aus. Drittens die feste Aufteilung der Register in **flüchtige** (`rax`, `rcx`, `rdx`, `r8` bis `r11`, `xmm0` bis `xmm5`), die der Aufgerufene ohne Rückfrage überschreiben darf, und **nicht flüchtige** (`rbx`, `rbp`, `rdi`, `rsi`, `r12` bis `r15`, `xmm6` bis `xmm15`), die er im Prolog sichern muss, bevor er sie benutzt.
+
+</Block>
+
+<Block n={4} title="Drei Plattformen, drei Konventionen">
+
+Für einen einfachen statischen Aufruf mit Ganzzahlen unterscheiden sich die Plattformen nur in den Registernamen. Interessant wird es, sobald Gleitkommazahlen, Structs und versteckte Argumente ins Spiel kommen. Das folgende Beispiel ruft eine Instanzmethode auf, die ein 24 Byte großes Struct als Argument bekommt und eines zurückgibt.
+
+<StepPlayer script={abiScript} />
+
+Die wichtigsten Unterschiede in Kurzform:
+
+| Regel | Windows x64 | System V x64 | ARM64 |
+| --- | --- | --- | --- |
+| Ganzzahlregister für Argumente | `rcx`, `rdx`, `r8`, `r9` | `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` | `x0` bis `x7` |
+| Gleitkommaregister | `xmm0` bis `xmm3`, nach Position | `xmm0` bis `xmm7`, eigener Zähler | `v0` bis `v7`, eigener Zähler |
+| Shadow Space | 32 Byte, immer | keiner | keiner |
+| Structs als Argument | nur 1, 2, 4, 8 Byte im Register, sonst Zeiger auf Kopie | bis 16 Byte in bis zu zwei Registern, sonst Kopie auf dem Stack | bis 16 Byte in Registern, HFA in bis zu vier Gleitkommaregistern, sonst Zeiger auf Kopie |
+| Rücksprungadresse | auf dem Stack (`call`) | auf dem Stack (`call`) | im Register `lr` (`bl`) |
+
+{/* TODO(verify): System V classification of managed structs up to 16 bytes into two eightbytes in CoreCLR (including mixed int and double fields); ARM64 HFA rule for managed structs; that structs with explicit layout are always passed on the stack on System V (clr-abi.md says so). */}
+
+Der letzte Punkt verdient einen zweiten Blick. Auf ARM64 legt der Aufrufbefehl `bl` die Rücksprungadresse nicht auf den Stack, sondern in das Link-Register `lr` (`x30`). Eine Methode, die selbst etwas aufruft, muss `lr` deshalb im Prolog sichern, zusammen mit dem Framepointer `fp` (`x29`) als Paar. Eine Blattmethode muss das nicht und berührt den Stack womöglich nie.
+
+Die Regeln für Structs erklären, warum ein großes Struct als Argument teuer sein kann: Unter Windows kopiert der Aufrufer es in seinen Frame und übergibt einen Zeiger, unter System V kopiert er es in den Argumentbereich. Wie groß ein Struct wirklich ist, zeigt „Struct-Layout und Padding“. Warum ein Struct überhaupt kopiert wird, erklärt „Wert- und Referenztypen“.
+
+</Block>
+
+<Block n={5} title="Versteckte Argumente">
+
+Die Runtime übergibt bei manchen Aufrufen mehr, als im Quelltext steht. Die Reihenfolge legt das CLR-ABI fest: zuerst `this`, dann der Rückgabepuffer, dann der generische Kontext oder ein Varargs-Cookie, erst danach die Argumente aus dem Quelltext.
+
+**`this`** ist bei Instanzmethoden immer das erste Argument, also `rcx`, `rdi` oder `x0`. Eine Instanzmethode ist auf Maschinenebene eine statische Methode mit einem zusätzlichen ersten Parameter. Deshalb siehst du in Listings so oft Zugriffe wie `[rcx+0x08]`: ein Feld des Objekts, auf das `this` zeigt.
+
+Der **Rückgabepuffer** entsteht, wenn ein Rückgabewert nicht in die Rückgaberegister passt. Der Aufrufer reserviert Speicher, übergibt dessen Adresse, und der Aufgerufene schreibt das Ergebnis direkt hinein. Auf x64 gibt die Methode die Adresse zusätzlich in `rax` zurück. ARM64 hat dafür ein eigenes Register: `x8`, das nicht zu den Argumentregistern zählt. Das BOTR hält außerdem fest, dass der Puffer seit .NET 10 immer vom Aufrufer auf dem Stack angelegt werden muss und nicht etwa direkt in ein Heap-Objekt zeigen darf.
+
+{/* TODO(verify): .NET 10 rule "return buffers must always be allocated on the stack by the caller" (clr-abi.md) and its motivation (no GC write barriers needed when writing into the buffer). */}
+
+Der **generische Kontext** betrifft geteilten generischen Code. Für Referenztypen erzeugt der JIT nur einmal Code, etwa für `List<__Canon>`, wie „Generics zur Laufzeit“ zeigt. Dieser Code muss aber wissen, für welches `T` er gerade läuft. Bei Instanzmethoden einer generischen Klasse steckt das in der MethodTable von `this`. Bei generischen Methoden und statischen Methoden generischer Klassen gibt es kein `this`, also übergibt der Aufrufer einen versteckten Zeiger auf die Instanziierung. Auf x64 steht er hinter `this` und Rückgabepuffer, auf ARM64 hinter `this` und vor den eigentlichen Argumenten.
+
+{/* TODO(verify): Which shared generic methods take the instantiation argument (generic methods: MethodDesc; static methods and methods on generic structs: MethodTable) per BOTR shared-generics.md. */}
+
+Ganz selten begegnet dir der **Varargs-Cookie**: Er beschreibt die Argumente einer Methode mit `__arglist`. Laut CLR-ABI werden verwaltete Varargs nur unter Windows unterstützt. In normalem C# kommt das praktisch nicht vor.
+
+</Block>
+
+<Block n={6} title="Frames, Framepointer und Unwind-Info">
+
+Im Durchspielen hatte `Sum5` einen klassischen Frame mit `rbp` als **Framepointer**: Er zeigt auf eine feste Stelle im Frame, und alle Locals und Argumente liegen in festem Abstand dazu. Das ist bequem, kostet aber ein Register und zwei Befehle. Optimierter Code verzichtet unter Windows x64 oft darauf und adressiert alles über `rsp`. Sieh dir dieselbe Rechnung voll optimiert an:
+
+<StepPlayer script={framesScript} />
+
+Ohne Framepointer gibt es keine verkettete Liste gesicherter `rbp`-Werte, an der man sich durch den Stack hangeln könnte. Trotzdem muss die Runtime jederzeit wissen, wo der Frame einer Methode beginnt und wo der Aufrufer weitermacht. Die Antwort ist die **Unwind-Info**: Zu jeder Methode legt der JIT eine kompakte Beschreibung des Prologs ab, etwa „an Offset 1 wurde `rbx` gesichert, an Offset 5 wurde `rsp` um 40 verringert“. Wer sie rückwärts anwendet, bekommt aus `rsp` und der aktuellen Position im Code die Rücksprungadresse und die gesicherten Register des Aufrufers, ohne dass der Code selbst dafür etwas tun muss. Unter Windows x64 ist das Format durch das Betriebssystem festgelegt, und das BOTR sagt ausdrücklich, dass dort immer über diese Unwind-Codes entwirrt wird.
+
+Die anderen Plattformen sind großzügiger mit Framepointern. Laut CLR-ABI legt der JIT auf allen Plattformen außer Windows x64 meist eine **Frame-Kette** an, also `rbp` beziehungsweise das Paar `fp` und `lr` auf ARM64. Das hilft nativen Werkzeugen wie `perf`, die sich an Framepointern entlang hangeln. Und einige Methoden brauchen einen Framepointer immer, etwa wenn sie ein Inlined P/Invoke enthalten oder mit `stackalloc` einer variablen Größe den Stackzeiger zur Laufzeit verschieben (siehe „stackalloc“).
+
+{/* TODO(verify): That CoreCLR uses Windows-style unwind codes for managed code on Unix as well (own unwinder), while Native AOT on Unix emits DWARF CFI; that localloc forces an rbp frame in RyuJIT (compLocallocUsed). */}
+
+Locals, die nicht in Register passen oder deren Adresse genommen wird, bekommen einen festen Platz im Frame. Dazu kommen **Spills**: Hat der Registerallokator mehr lebende Werte als Register, lagert er einige vorübergehend in den Frame aus. Wo im Frame Verweise liegen, die der GC kennen muss, beschreibt eine eigene Tabelle, die „GC-Info und Safe Points“ erklärt. Wie die Runtime mit Unwind-Info durch alle Frames eines Threads läuft, zeigt „Stack Walking“.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+**„Mein Struct wird per Referenz übergeben, weil es groß ist.“** Nur halb richtig. Unter Windows x64 übergibt die Konvention zwar einen Zeiger, aber auf eine **Kopie**, die der Aufrufer vorher anlegt. Semantisch bleibt es eine Wertübergabe: Änderungen im Aufgerufenen erreichen das Original nicht. Teuer ist das Kopieren, nicht der Zeiger. Wer große Structs ohne Kopie übergeben will, nimmt `in` oder `ref readonly`.
+
+**„Ein `double` an vierter Stelle landet in `xmm0`.“** Nicht unter Windows. Dort zählen Positionen, nicht Typen: Das vierte Argument bekommt `xmm3` oder `r9`, je nach Typ, und die anderen Register dieser Position bleiben ungenutzt. Unter System V und ARM64 zählen Ganzzahl- und Gleitkommaregister getrennt. Wer Listings von verschiedenen Plattformen vergleicht, sieht deshalb verschiedene Register für dasselbe Argument.
+
+**„Im Debugger stehen die Argumente auf dem Stack, also liegen sie dort.“** Debug-Builds und Tier 0 legen Registerargumente gern im Frame ab, damit der Debugger sie findet. Voll optimierter Code hält sie oft nur in Registern, und nach ihrer letzten Verwendung sind sie weg. Deshalb zeigt der Debugger in Release-Builds manchmal „Wert nicht verfügbar“.
+
+{/* TODO(verify): Debugger message wording for optimized-away values in Visual Studio. */}
+
+**„Jede Methode hat einen eigenen Frame.“** Das stimmt nicht. Eingebettete Methoden haben keinen, siehe „Inlining“. Und Methoden, deren letzter Aufruf als **Tail Call** übersetzt wurde, haben ihren Frame schon vor dem Ende geräumt. Beides verändert, was ein Stack Trace zeigt.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die Aufrufkonvention erklärt einige Ratschläge, die sonst nach Aberglauben klingen:
+
+- **Kleine Structs sind billig zu übergeben.** Ein Struct mit 8 Byte passt auf allen drei Plattformen in ein Register. Bei 16 Byte bleiben System V und ARM64 noch in Registern, Windows dagegen kopiert. Ab etwa 24 Byte kopieren alle, außer bei HFAs auf ARM64.
+- **`in` lohnt sich erst bei größeren Structs.** Für ein 8-Byte-Struct ist `in` eher schädlich: Statt den Wert im Register zu übergeben, muss der Aufrufer ihn in den Speicher legen und eine Adresse übergeben. Miss, bevor du `in` flächendeckend einsetzt.
+- **Viele Argumente kosten wenig, solange sie in Register passen.** Ab dem fünften Argument (Windows) oder siebten (System V) geht es über den Stack. Das ist kein Drama, aber in heißen Pfaden messbar.
+- **Plattformvergleiche brauchen eigene Messungen.** Ein Benchmark auf einem Windows-Laptop sagt wenig über Struct-Kosten auf einem ARM64-Server.
+
+{/* TODO(verify): Relative cost of in for small structs (8 B) versus by value on .NET 8+ x64; the JIT may optimize away copies for readonly structs passed by in in some cases. */}
+
+Wenn du Assembler liest, hilft die Konvention bei der Orientierung. Am Anfang einer Methode stehen die Argumente in den Argumentregistern, nach einem `call` sind alle flüchtigen Register ungültig, und was über einen Aufruf hinweg leben muss, liegt in einem nicht flüchtigen Register oder im Frame. Ein `push rbx` im Prolog sagt dir: Diese Methode braucht einen Wert über einen Aufruf hinweg.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+**Tail Calls.** Ist der letzte Schritt einer Methode ein Aufruf, kann der JIT den eigenen Frame vorher abbauen und mit einem Sprung statt eines `call` weitermachen. Das spart Stack und ist bei tiefer Rekursion entscheidend. Der JIT macht das in optimiertem Code **opportunistisch** als „Fast Tail Call“, wenn die Argumente des Ziels in den Argumentbereich passen, den der eigene Aufrufer bereitgestellt hat, und nichts anderes dagegen spricht. Garantiert ist es in C# nie. IL kennt dafür ein ausdrückliches Präfix `tail.`, das C# nie erzeugt, F# dagegen schon. Ist ein solcher Aufruf nicht als schneller Sprung möglich, nutzt die Runtime einen langsameren Weg über Hilfsfunktionen, damit der Stack trotzdem nicht wächst.
+
+{/* TODO(verify): Conditions for fast tail calls on x64 and ARM64 (callee stack arg area <= caller incoming arg area, no address-exposed locals, no pinned locals, not in try regions); the portable tailcall-via-helpers mechanism introduced in .NET 5 for explicit tail. calls. */}
+
+**Red Zone.** System V erlaubt Blattfunktionen, die 128 Byte unterhalb von `rsp` als Arbeitsbereich zu nutzen, ohne `rsp` zu verschieben. Nach unserem Stand verwendet der .NET-JIT diese Zone nicht. Für dich bedeutet das: Auch unter Linux siehst du in Blattmethoden kein Arbeiten unterhalb von `rsp`.
+
+{/* TODO(verify): Whether RyuJIT or Native AOT ever use the System V red zone (believed: no). */}
+
+**Verwaltete Zusätze zur Plattform-ABI.** Die Runtime nutzt die Plattformkonvention, legt aber eigene Regeln darüber: die Reihenfolge der versteckten Argumente, den Rückgabepuffer auf dem Stack, Frame-Ketten auf Unix und ARM64, die Pflicht zu `rbp` bei Methoden mit Inlined P/Invoke. Ein Aufruf von nativem Code aus folgt dagegen exakt der Plattform-ABI, weil der C-Compiler auf der anderen Seite die Zusätze nicht kennt.
+
+<Callout kind="version">
+  Das CLR-ABI ändert sich zwischen den Versionen in Details. Seit .NET 10 muss der Rückgabepuffer
+  im Stack des Aufrufers liegen, und das BOTR nennt für .NET 12 eine ähnliche Regel für die Kopien
+  großer Struct-Argumente. Ältere Versionen erlaubten mehr Fälle. Die allgemeinen Prinzipien dieser
+  Lektion gelten für alle 64-Bit-Versionen von .NET Core.
+</Callout>
+
+{/* TODO(verify): clr-abi.md statement "since .NET 12, implicit-byref argument storage must be outside the GC heap" and what older versions allowed. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente: die Registerbelegung in SharpLab ablesen und die Kosten großer Struct-Argumente messen.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „JIT Asm“ (Release, x64). Suche in Caller den Aufruf von Move: this in rcx, die Adresse des Rückgabepuffers in rdx, in r8 die Adresse einer Kopie von o, 1.5 in xmm3 und 7 bei [rsp+0x20]. In Caller2 siehst du das fünfte Argument von Sum5 auf dem Stack und Small als einzelnes 8-Byte-Register. Prüfe, ob Sum5 einen Prolog hat."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  note="Lass den Benchmark auf Windows x64 und, wenn möglich, auf Linux oder ARM64 laufen. Mit dem DisassemblyDiagnoser siehst du, wo der Aufrufer die 64 Byte kopiert und wo nur eine Adresse übergeben wird."
+/>
+
+{/* TODO(verify): SharpLab x64 uses the Windows ABI; exact listing for Caller and Caller2 on .NET 8+. */}
+
+Für einen Plattformvergleich ohne zweite Maschine: `DOTNET_JitDisasm` gibt den Code der aktuellen Plattform aus. Auf einem Mac mit Apple Silicon siehst du ARM64, in einem Linux-Container auf x64 die System-V-Konvention.
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="calling-conventions"
+  questions={[
+    {
+      q: 'Eine statische Methode mit fünf int-Argumenten wird unter Windows x64 aufgerufen. Wie viele Argumente landen im Speicher, wenn der Aufgerufene optimiert ist?',
+      options: ['Alle fünf', 'Eines', 'Keines'],
+      correct: 1,
+      explanation:
+        'Die ersten vier kommen in rcx, rdx, r8 und r9 an. Nur das fünfte schreibt der Aufrufer in seinen Frame, hinter die 32 Byte Shadow Space.',
+    },
+    {
+      q: 'Wozu dient der Shadow Space unter Windows x64?',
+      options: [
+        'Er enthält eine Kopie aller Argumente, die der Aufrufer dort ablegt',
+        'Er ist reservierter Platz im Frame des Aufrufers, in dem der Aufgerufene die vier Registerargumente ablegen darf',
+        'Er schützt den Stack vor Überläufen',
+      ],
+      correct: 1,
+      explanation:
+        'Der Aufrufer reserviert die 32 Byte immer, schreibt aber nichts hinein. Unoptimierter Code nutzt sie, um rcx bis r9 zu sichern.',
+    },
+    {
+      q: 'Eine Methode gibt ein Struct mit drei double-Feldern zurück. Wo liegt das Ergebnis auf ARM64?',
+      options: [
+        'In einem Rückgabepuffer, dessen Adresse in x8 übergeben wurde',
+        'In d0, d1 und d2, weil das Struct ein HFA ist',
+      ],
+      correct: 1,
+      explanation:
+        'Structs aus bis zu vier gleichen Gleitkommafeldern (HFA) kommen auf ARM64 in Gleitkommaregistern zurück. Auf x64 bräuchte dasselbe Struct einen Rückgabepuffer.',
+    },
+    {
+      q: 'Warum braucht geteilter generischer Code einer generischen Methode manchmal ein verstecktes Argument?',
+      options: [
+        'Weil es kein this gibt, aus dem er die konkrete Instanziierung ablesen könnte',
+        'Weil generische Methoden immer geboxt werden',
+      ],
+      correct: 0,
+      explanation:
+        'Code für __Canon läuft für alle Referenztypen. Welches T gerade gemeint ist, liefert bei Instanzmethoden die MethodTable von this, sonst ein versteckter Kontextparameter.',
+    },
+    {
+      q: 'Eine optimierte Methode hat unter Windows x64 keinen Framepointer. Wie findet die Runtime trotzdem den Aufrufer?',
+      options: [
+        'Gar nicht, solche Methoden fehlen im Stack Walk',
+        'Über die Unwind-Info, die beschreibt, wie der Prolog den Stack verändert hat',
+        'Sie sucht im Stack nach etwas, das wie eine Rücksprungadresse aussieht',
+      ],
+      correct: 1,
+      explanation:
+        'Der JIT legt zu jeder Methode Unwind-Codes ab. Rückwärts angewandt ergeben sie die Rücksprungadresse und die gesicherten Register des Aufrufers.',
+    },
+    {
+      q: 'Ein 64-Byte-Struct wird unter Windows x64 per Wert übergeben. Was passiert?',
+      options: [
+        'Die 64 Byte werden auf acht Register verteilt',
+        'Der Aufrufer legt eine Kopie an und übergibt deren Adresse',
+        'Der Aufgerufene bekommt die Adresse des Originals und darf es verändern',
+      ],
+      correct: 1,
+      explanation:
+        'Structs, die nicht 1, 2, 4 oder 8 Byte groß sind, gehen unter Windows als Zeiger auf eine Kopie. Die Semantik bleibt eine Wertübergabe, nur die Kopie kostet.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Eine **Aufrufkonvention** legt fest, wo Argumente und Rückgabewert liegen, welche Register der Aufgerufene erhalten muss und wie der Stack ausgerichtet ist. Sie gehört zur Plattform, .NET ergänzt sie.
+- Auf x64 und ARM64 kommen die ersten Argumente in **Registern** an: Windows `rcx`, `rdx`, `r8`, `r9` plus 32 Byte Shadow Space, System V sechs Ganzzahlregister, ARM64 `x0` bis `x7`.
+- **Versteckte Argumente** in fester Reihenfolge: `this`, Rückgabepuffer (ARM64 in `x8`), generischer Kontext für geteilten Code, selten ein Varargs-Cookie.
+- **Structs** gehen je nach Plattform in Registern, als Kopie auf dem Stack oder als Zeiger auf eine Kopie. Semantisch ist es immer eine Wertübergabe.
+- Ein **Frame** besteht aus Rücksprungadresse, gesicherten Registern, Locals, Spills und dem Bereich für ausgehende Argumente. Prolog und Epilog bauen ihn auf und ab.
+- Viele Methoden haben **keinen eigenen Frame**: eingebettete Methoden gar keinen, Blattmethoden nur die Rücksprungadresse. Tail Calls räumen ihren Frame vor dem Sprung.
+- Ohne Framepointer beschreibt die **Unwind-Info**, wie der Aufrufer zu finden ist. Darauf bauen Stack Walking, Exceptions und der GC auf.
+
+</Block>

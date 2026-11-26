@@ -1,0 +1,321 @@
+---
+id: exception-kosten
+title: Was Exceptions kosten
+summary: Warum ein try-Block fast nichts kostet, eine geworfene Exception dagegen viel, wovon der Preis abhängt, was .NET 9 daran geändert hat und mit welchen Mustern du Exceptions aus heißen Pfaden heraushältst.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Best practices for exceptions (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/exceptions/best-practices-for-exceptions
+  - title: 'Framework Design Guidelines: Exceptions and Performance (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/design-guidelines/exceptions-and-performance
+  - title: 'Book of the Runtime: What Every (Runtime) Dev Needs to Know About Exceptions'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/exceptions.md
+  - title: 'JIT-Design: Finally Optimizations (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/finally-optimizations.md
+  - title: "What's new in the .NET 9 runtime: Exception handling (Microsoft Learn)"
+    url: https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-9/runtime
+  - title: 'Performance Improvements in .NET 9 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-9/
+  - title: 'Performance Improvements in .NET 10 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-10/
+  - title: 'DoesNotReturnAttribute (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.codeanalysis.doesnotreturnattribute
+  - title: 'Well-known EventCounters in .NET (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/diagnostics/available-counters
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './exception-kosten.steps';
+import helperScript from './exception-kosten-throwhelper.steps';
+import decisionScript from './exception-kosten-entscheidung.steps';
+import { benchmarkCode } from './exception-kosten-verify';
+
+<Block n={1} title="Das Problem">
+
+Über die Kosten von Exceptions kursieren zwei Behauptungen, die beide nur halb stimmen. Die eine lautet „Exceptions sind langsam“, und daraus folgt bei manchen die Angst vor jedem `try`-Block. Die andere lautet „Auf modernen Rechnern ist das egal“, und daraus folgen Programme, die jede ungültige Eingabe als Exception melden und sich wundern, warum ein Import mit vielen fehlerhaften Zeilen plötzlich ein Vielfaches der Zeit braucht.
+
+Um vernünftig zu entscheiden, brauchst du ein genaueres Bild:
+
+- Was kostet ein `try`-Block, wenn nichts geworfen wird?
+- Was genau passiert bei einem Wurf, und welcher Teil davon ist teuer?
+- Wovon hängt der Preis ab: von der Exception, von der Tiefe des Stacks, von der .NET-Version?
+- Und welche Muster halten Exceptions aus heißem Code heraus, ohne die Fehlerbehandlung zu verschlechtern?
+
+Diese Lektion baut auf „Exception Handling in zwei Durchläufen“ auf. Dort steht, was die Runtime bei einem Wurf tut. Hier geht es darum, was das kostet.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir drei Sätze:
+
+1. **Bereithalten ist fast gratis.** Ein `try`-Block erzeugt auf 64-Bit-Plattformen keinen Befehl, der beim Betreten oder Verlassen läuft. Er existiert nur als Eintrag in einer Tabelle, die erst gelesen wird, wenn jemand wirft. Man nennt das ein **tabellenbasiertes** oder „zero-cost“ Modell.
+2. **Werfen ist teuer, und zwar pro Frame.** Ein Wurf alloziert ein Objekt, wechselt in die Runtime und läuft zweimal über alle Frames zwischen Wurfpunkt und Handler. Jeder dieser Frames muss nachgeschlagen, untersucht und abgewickelt werden.
+3. **Der Preis ist der Grund, Exceptions selten zu halten, nicht der Grund, sie zu meiden.** Für echte Ausnahmen ist der Preis egal. Für Dinge, die im normalen Betrieb ständig passieren, gibt es bessere Werkzeuge.
+
+<Callout kind="fehlannahme">
+  „try/catch macht Code langsam, auch wenn nichts geworfen wird.“ Auf dem normalen Weg kostet ein
+  try-Block praktisch nichts, es gibt keinen Code, der ihn betritt. Die messbaren Nebenwirkungen
+  liegen woanders: Er kann einzelne Optimierungen des JIT einschränken. Das ist selten und klein
+  im Vergleich zu dem, was ein einziger Wurf kostet.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel summiert Zahlen aus Textzeilen und überspringt ungültige mit einem `catch`. Die erste Zeile ist gültig, die zweite nicht. Der Player zeigt, welche Arbeit bei der gültigen Zeile anfällt und welche bei der ungültigen.
+
+<StepPlayer script={script} />
+
+Bei der gültigen Zeile tut die Ausnahmebehandlung schlicht nichts. Bei der ungültigen kommen fünf Stufen hinzu, von denen zwei mit der Zahl der Frames wachsen. Absolute Zeiten hängen stark von Hardware, Version und Stacktiefe ab. Die Größenordnung lässt sich trotzdem merken: Ein gefangener Wurf kostet um ein Vielfaches mehr als der Parse-Vorgang selbst, typischerweise im Bereich von Mikrosekunden statt Nanosekunden.
+
+{/* TODO(verify): Order of magnitude "microseconds per caught exception" on .NET 8 and .NET 9 x64 (Performance Improvements in .NET 9 shows throw/catch benchmarks); compare with int.TryParse in the nanosecond range. */}
+
+</Block>
+
+<Block n={4} title="Warum try fast nichts kostet">
+
+Ein `try`-Block wird im IL zu Einträgen in der Klauseltabelle der Methode, und der JIT macht daraus eine Tabelle für den Maschinencode. Der normale Weg durch einen `try`-Block sieht im Assembler aus wie derselbe Code ohne `try`. Das ist auf allen 64-Bit-Plattformen so. Auf 32-Bit-Windows (x86) arbeitete die Runtime lange mit einem anderen Verfahren, das beim Betreten eines Bereichs tatsächlich Arbeit verursachte.
+
+{/* TODO(verify): x86 Windows historically registered EH frames on entry (SEH chain via fs:[0]) at method level, not per try; status of x86 after the .NET 9/10 EH and funclet changes. */}
+
+### finally auf dem normalen Weg
+
+Ein `finally` muss auch ohne Exception laufen. Auf 64-Bit-Plattformen ist es ein Funclet, und der normale Weg würde ihn per Aufruf erreichen. Der JIT optimiert das aber in den häufigsten Fällen weg: Er kann ein leeres `finally` samt `try` ganz entfernen und den Rumpf eines `finally` auf den normalen Weg **kopieren**, sodass dort kein Aufruf mehr steht. Nur der Weg über eine Exception benutzt dann noch den Funclet. Die Design-Notiz „Finally Optimizations“ im Runtime-Repository beschreibt beides. Für `using`, `lock` und `foreach`, die alle ein `finally` erzeugen (siehe „foreach, using und lock“), heißt das: Auf dem normalen Weg kostet das Aufräumen kaum mehr als der Aufruf von `Dispose` oder `Monitor.Exit` selbst.
+
+{/* TODO(verify): Finally cloning and empty try/finally removal in RyuJIT (fgCloneFinally, fgRemoveEmptyFinally, fgRemoveEmptyTry) since .NET Core 2.0; conditions under which cloning is skipped (e.g. large finally, finally with EH inside). */}
+
+### Wo EH den JIT doch bremst
+
+Ganz ohne Einfluss ist ein `try` nicht, nur liegt der Einfluss bei den Optimierungen, nicht bei zusätzlichen Befehlen:
+
+- **Variablen, die in einem Handler weiterleben.** Ein `catch` oder `finally` kann eine lokale Variable lesen, die im `try` verändert wurde. Weil eine Exception an fast jeder Stelle im `try` entstehen kann, muss der Wert dann zu jedem Zeitpunkt im Stack-Frame stehen. Lange hielt der JIT solche Variablen deshalb gar nicht in Registern. Neuere Versionen halten sie in Registern und schreiben jede Änderung zusätzlich in den Frame.
+- **Inlining.** Methoden mit `try`, `catch` oder `finally` wurden lange nicht eingebettet. Laut .NET-Blog hat .NET 10 diese Einschränkung gelockert. Mehr dazu in „Inlining“.
+- **Optimierungen über Bereichsgrenzen hinweg.** Code darf nicht beliebig über die Grenze eines geschützten Bereichs verschoben werden, weil sich sonst ändert, welcher Handler zuständig ist. Das schränkt einige Umformungen ein, etwa das Herausziehen von Ausdrücken aus Schleifen, die ein `try` enthalten.
+
+{/* TODO(verify): EH write-thru (enregistering EH-live locals with write-through to the stack home) enabled by default since .NET 6 (EnableEHWriteThru); .NET 10 inlining of methods with EH; examples of loop optimizations restricted by EH regions in current RyuJIT. */}
+
+Praktisch folgt daraus: Ein `try` gehört dahin, wo du wirklich etwas behandeln kannst, nicht um jede einzelne Zeile in einer engen Schleife. Ein `try` **um** die Schleife statt **in** der Schleife ist im heißen Code oft die bessere Form, wenn die Semantik es zulässt.
+
+</Block>
+
+<Block n={5} title="Wovon der Preis eines Wurfs abhängt">
+
+Die fünf Stufen aus dem Player haben sehr unterschiedliche Kostenprofile. Die Allokation und die Übergabe an die Runtime kosten pro Wurf ungefähr gleich viel, egal wo geworfen wird. Durchlauf 1 und Durchlauf 2 dagegen arbeiten **pro Frame** zwischen Wurfpunkt und Handler, und zwar jeder für sich.
+
+Für jeden dieser Frames muss die Runtime die Methode zur Codeadresse finden, die Unwind-Info lesen und den Aufrufer berechnen, die Klauseln prüfen und in Durchlauf 1 einen Eintrag an den Stack-Trace hängen. Wie der Walker das macht, beschreibt „Stack Walking“. Eine Exception, die zwanzig Ebenen nach oben fliegt, kostet deshalb spürbar mehr als eine, die in der direkt aufrufenden Methode gefangen wird.
+
+{/* TODO(verify): Roughly linear growth of throw/catch cost with the number of frames between throw and catch, measured with the Depth1/Depth20 benchmark. */}
+
+### async vervielfacht Würfe
+
+Bei async-Code kommt ein Effekt hinzu, den man leicht übersieht. Eine async-Methode fängt jede Exception in ihrer State Machine und legt sie im Task ab. Die Methode, die diesen Task mit `await` erwartet, wirft sie über `ExceptionDispatchInfo` **erneut**. Fliegt eine Exception durch zehn verschachtelte async-Methoden, wird sie also zehnmal geworfen und zehnmal gefangen, jedes Mal mit eigenem Weg über den Stack. Die Grundlagen dazu stehen in „Die async State Machine“.
+
+{/* TODO(verify): One throw/catch per async level when an exception propagates through awaited async methods (AsyncTaskMethodBuilder.SetException, TaskAwaiter.ThrowForNonSuccess with ExceptionDispatchInfo.Throw); whether runtime async (.NET 10/11 preview) changes this. */}
+
+### Was sonst noch dazukommt
+
+- **Ein angehängter Debugger.** Er bekommt jede First-Chance-Exception gemeldet, und der Prozess hält dafür kurz an. Unter dem Debugger sind Würfe deshalb erheblich langsamer als ohne. Messungen mit angehängtem Debugger sagen über die Produktion nichts aus.
+- **Diagnose-Ereignisse.** `FirstChanceException`-Handler laufen bei jedem Wurf. Eine Trace-Sitzung, die Exception-Ereignisse aufzeichnet, oder ein APM-Agent, der jede Exception protokolliert, machen jeden Wurf teurer.
+- **Kalter Code.** Wurf-Pfade laufen selten, ihr Code und die Daten der Runtime dafür liegen oft nicht im Cache. Der erste Wurf eines Typs kann zusätzlich Typladen und das Laden von Ressourcentexten auslösen.
+- **`ToString()` einer Exception.** Erst beim Formatieren wird aus den Trace-Daten Text. Mit Zeilennummern liest die Runtime dafür die PDB-Datei. Ein Logger, der jede gefangene Exception vollständig formatiert, bezahlt das bei jedem Wurf.
+
+{/* TODO(verify): Stack trace text is built lazily from captured frame data when StackTrace/ToString is called; PDB reading only then. */}
+
+</Block>
+
+<Block n={6} title="Heiße Pfade klein halten: das ThrowHelper-Muster">
+
+Kosten entstehen nicht nur beim Werfen. Auch Code, der **nie** wirft, kann durch Wurf-Code langsamer werden, weil er die Methode größer macht. Der folgende Vergleich zeigt zwei Varianten derselben Methode: einmal mit dem Wurf im Rumpf, einmal mit einem ausgelagerten Helfer.
+
+<StepPlayer script={helperScript} />
+
+{/* TODO(verify): The assembly in the player is an illustration (see comment in exception-kosten-throwhelper.steps.ts). Check with DOTNET_JitDisasm whether Get really saves an extra register in its prolog. */}
+
+Das Muster hat drei Bausteine:
+
+- **Eine eigene Methode, die nur wirft.** Der JIT erkennt am IL, dass sie nie zurückkehrt, und bettet sie deshalb nicht ein. Der Aufruf bleibt ein schmaler `call` am Ende der Methode.
+- **`[DoesNotReturn]`** aus `System.Diagnostics.CodeAnalysis`. Das Attribut sagt dem C#-Compiler, dass nach dem Aufruf nichts mehr kommt. Die Null-Analyse weiß dann zum Beispiel, dass ein Wert hinter der Prüfung nicht `null` sein kann. Für den JIT ist es nicht nötig.
+- **`[StackTraceHidden]`**, damit der Stack-Trace in der Methode beginnt, die den Fehler wirklich gemeldet hat, und nicht im Helfer.
+
+{/* TODO(verify): The JIT does not read DoesNotReturnAttribute; noreturn detection is based on the callee IL (inline observation CALLEE_DOES_NOT_RETURN) and marks the call block as BBJ_THROW / rarely run. */}
+
+Viele dieser Helfer musst du nicht mehr selbst schreiben. Die Basisbibliothek bietet sie inzwischen als statische Methoden der Exception-Typen an, etwa `ArgumentNullException.ThrowIfNull`, `ArgumentException.ThrowIfNullOrEmpty`, `ArgumentOutOfRangeException.ThrowIfNegative` und `ObjectDisposedException.ThrowIf`. Sie sind genau nach diesem Muster gebaut.
+
+{/* TODO(verify): Versions: ArgumentNullException.ThrowIfNull (.NET 6), ArgumentException.ThrowIfNullOrEmpty and ObjectDisposedException.ThrowIf (.NET 7), ArgumentOutOfRangeException.ThrowIfNegative and friends (.NET 8). */}
+
+Wichtig ist die Größenordnung: Das Muster lohnt sich in kleinen, sehr häufig aufgerufenen Methoden wie Indexern, Properties und Prüfmethoden in Bibliotheken. In gewöhnlichem Anwendungscode, der ohnehin auf Datenbank oder Netzwerk wartet, ist der Unterschied nicht messbar. Dort zählt Lesbarkeit mehr.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+**Exceptions als Kontrollfluss.** Der klassische Fall ist `int.Parse` in einem `try` innerhalb einer Schleife über Benutzereingaben, Dateizeilen oder Nachrichten. Solange die Daten sauber sind, fällt nichts auf. Kommt eine Lieferung mit vielen kaputten Zeilen, wird aus jeder Zeile ein Wurf, und die Laufzeit springt um Größenordnungen. Dasselbe gilt für `Dictionary`-Zugriffe mit `catch (KeyNotFoundException)` und für Konvertierungen, die „probeweise“ versucht werden.
+
+**Massenhafte Abbrüche.** `OperationCanceledException` ist eine gewöhnliche Exception. Wer bei jedem Timeout oder jeder abgebrochenen Anfrage Tausende Tasks abbricht, bezahlt für jeden einzelnen Abbruch und, wie oben gezeigt, für jede async-Ebene. Bei sehr vielen Abbrüchen lohnt sich ein Blick darauf, ob `CancellationToken.IsCancellationRequested` an geeigneter Stelle früher abbrechen kann.
+
+**First-Chance-Rauschen.** Gefangene Exceptions sind nicht unsichtbar. Debugger, APM-Werkzeuge und `dotnet-counters` sehen jeden Wurf. Eine Anwendung, die tausende Exceptions pro Sekunde wirft und fängt, funktioniert vielleicht korrekt, macht aber die Diagnose mühsam und verschwendet Rechenzeit. Eine hohe Exception-Rate im Zähler ist fast immer ein Hinweis auf Exceptions als Kontrollfluss.
+
+**Falsch messen.** Ein Benchmark im Debug-Build oder mit angehängtem Debugger überschätzt die Kosten eines Wurfs deutlich. Ein Benchmark ohne Aufwärmen misst Tier-0-Code und das erstmalige Laden von Ressourcen. Mit BenchmarkDotNet im Release-Build ohne Debugger misst du das, was in Produktion passiert.
+
+**Die Gegenrichtung übertreiben.** Wer aus Angst vor Kosten überall Fehlercodes zurückgibt und keine Exceptions mehr wirft, verliert, was Exceptions gut können: Sie lassen sich nicht ignorieren, tragen Kontext und einen Stack-Trace und laufen ohne Zutun bis zu der Ebene, die entscheiden kann. Für echte Fehler ist das genau richtig.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die Framework Design Guidelines von Microsoft fassen die Regel knapp: Exceptions nicht für den normalen Kontrollfluss verwenden. Für Operationen, die in häufigen Szenarien scheitern können, nennen sie zwei Muster. Das **Tester-Doer-Muster** prüft vorher, ob die Operation gelingen kann, etwa mit `if (collection.Count > 0)`. Das **Try-Parse-Muster** verbindet Prüfen und Ausführen in einer Methode, die ein `bool` zurückgibt und das Ergebnis über einen `out`-Parameter liefert. Die folgende Entscheidungshilfe spielt typische Fälle durch:
+
+<StepPlayer script={decisionScript} />
+
+Daraus ergeben sich ein paar Faustregeln:
+
+- **Programmierfehler werfen.** Falsche Argumente und ungültige Zustände sind Fehler im Code, nicht im Betrieb. Sie sollen laut scheitern, Kosten spielen keine Rolle.
+- **Erwartbare, häufige Fehlschläge als Rückgabewert.** `TryParse`, `TryGetValue`, `TryDequeue` und eigene `Try`-Methoden. Wer mehr Information als ein `bool` braucht, kann einen eigenen Ergebnis-Typ zurückgeben, der Erfolg oder Fehler mit Begründung trägt.
+- **Seltene, schwerwiegende Fehler werfen.** Netzwerk, Dateisystem, Datenbank: Dort ist der Wurf billig im Vergleich zur Operation selbst.
+- **Beides anbieten, wenn du eine Bibliothek baust.** Der Aufrufer weiß besser als du, ob ein Fehler bei ihm häufig ist.
+
+### Exceptions im Betrieb messen
+
+Wie viele Exceptions eine laufende Anwendung wirft, zeigt `dotnet-counters` ohne Codeänderung. Die Runtime veröffentlicht einen Zähler für die Anzahl geworfener Exceptions, in dem jeder Wurf auftaucht, auch gefangene. Steigt er unter Last stark an, lohnt sich ein Blick, wer da wirft. Für die Suche nach der Quelle eignet sich `dotnet-trace` mit Exception-Ereignissen oder vorübergehend ein `FirstChanceException`-Handler, der Typ und Ort protokolliert.
+
+```bash
+dotnet-counters monitor --process-id 1234 --counters System.Runtime
+```
+
+{/* TODO(verify): Counter names: "exception-count" (EventCounters, System.Runtime) and "dotnet.exceptions" (System.Runtime meter, .NET 9+); default output of dotnet-counters monitor on .NET 9. */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Der JIT behandelt Wurf-Code von sich aus als kalt. Blöcke, die mit einem Wurf enden, gelten als selten ausgeführt und landen am Ende der Methode, damit der heiße Pfad zusammenhängend bleibt. Methoden, die nur werfen, bettet er nicht ein. Das ThrowHelper-Muster hilft ihm dabei, indem es den Wurf-Code aus der Methode herausnimmt, statt ihn nur nach hinten zu schieben.
+
+{/* TODO(verify): Throw blocks marked run-rarely and moved to the end of the method layout in RyuJIT (fgMoveColdBlocks or block layout in .NET 9/10). */}
+
+Die größte Änderung der letzten Jahre betrifft die Runtime. Bis .NET 8 stützte sich CoreCLR beim Werfen auf die Ausnahmebehandlung des Betriebssystems: unter Windows Structured Exception Handling, unter Linux und macOS eine Nachbildung davon. Ein Wurf durchlief dabei viel nativen Code und mehrere Übergänge. Seit .NET 9 verwendet CoreCLR eine Implementierung, die von Native AOT übernommen wurde und Suche und Abwicklung größtenteils in verwaltetem Code erledigt. Die Dokumentation zu .NET 9 nennt für Microbenchmarks eine mehrfache Beschleunigung, und der Artikel über die Leistungsverbesserungen in .NET 9 zeigt Wurf-und-Fang-Benchmarks mit deutlich kürzeren Zeiten als unter .NET 8.
+
+<Callout kind="version">
+  .NET 9: neue Ausnahmebehandlung in CoreCLR, standardmäßig aktiv, mit einer Laufzeiteinstellung
+  zurück auf die alte Implementierung umschaltbar. .NET 10: Laut .NET-Blog kann der JIT nun auch
+  Methoden mit Ausnahmebehandlung einbetten. Beides ändert die Kosten, nicht die Semantik. Ein
+  Wurf bleibt auch mit .NET 9 um Größenordnungen teurer als ein `TryParse`.
+</Callout>
+
+{/* TODO(verify): "2 to 4 times faster" (or similar) in What's new in .NET 9 runtime for the new EH; benchmark figures in Performance Improvements in .NET 9; switch System.Runtime.LegacyExceptionHandling / DOTNET_LegacyExceptionHandling; .NET 10 inlining of methods with EH. */}
+
+Bemerkenswert ist, was sich **nicht** geändert hat: Die Arbeit pro Frame bleibt, denn das Zwei-Durchläufe-Modell ist vom Standard vorgegeben. Die Allokation bleibt. Und die Regel, Exceptions für Ausnahmen zu reservieren, gilt unverändert. .NET 9 macht seltene Würfe billiger, nicht häufige Würfe vernünftig.
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Der Benchmark vergleicht vier Dinge: `TryParse` gegen `Parse` mit `catch` bei ungültiger Eingabe, `Parse` mit und ohne umgebendes `try` bei gültiger Eingabe und einen Wurf über eine gegen zwanzig Ebenen. Mit zwei Jobs für .NET 8 und .NET 9 siehst du zusätzlich die Wirkung der neuen Implementierung.
+
+<VerifyCard
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'TryParseBad', allocated: 'keine' },
+    { method: 'ParseCatchBad', allocated: 'Exception-Objekt und Trace-Daten' },
+    { method: 'ParseInTryGood', allocated: 'keine' },
+    { method: 'ParseGood', allocated: 'keine' },
+    { method: 'Depth1', allocated: 'Exception-Objekt und Trace-Daten' },
+    { method: 'Depth20', allocated: 'mehr Trace-Daten als Depth1' },
+  ]}
+  note="Erwartung: ParseInTryGood und ParseGood liegen praktisch gleichauf, das try kostet nichts. ParseCatchBad ist um Größenordnungen langsamer als TryParseBad. Depth20 ist deutlich langsamer als Depth1. Unter .NET 9 sind alle werfenden Varianten schneller als unter .NET 8, bleiben aber weit hinter TryParseBad. Release-Build, kein Debugger."
+/>
+
+{/* TODO(verify): All expectations in the VerifyCard, including that the stack trace data allocation grows with depth. */}
+
+Für die Exception-Rate einer laufenden Anwendung starte sie, wirf in einer Schleife ein paar tausend Exceptions und beobachte den Zähler mit `dotnet-counters monitor`. Ersetze dann `Parse` durch `TryParse` und sieh zu, wie der Zähler auf null fällt.
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="exception-kosten"
+  questions={[
+    {
+      q: 'Was kostet ein try/catch auf x64, wenn keine Exception geworfen wird?',
+      options: [
+        'Einen Aufruf in die Runtime beim Betreten und Verlassen',
+        'Praktisch nichts, der Bereich steht nur in einer Tabelle',
+        'Eine Allokation für den Handler',
+      ],
+      correct: 1,
+      explanation:
+        'Das Modell ist tabellenbasiert. Es gibt keinen Code, der einen try-Block betritt. Nebenwirkungen gibt es nur bei einzelnen Optimierungen des JIT.',
+    },
+    {
+      q: 'Eine Exception wird zwanzig Ebenen über ihrem Wurfpunkt gefangen statt in der direkt aufrufenden Methode. Was ändert sich?',
+      options: [
+        'Nichts, der Preis eines Wurfs ist fest',
+        'Der Wurf wird teurer, weil beide Durchläufe jeden Frame dazwischen bearbeiten',
+        'Der Wurf wird billiger, weil weniger Handler geprüft werden',
+      ],
+      correct: 1,
+      explanation:
+        'Durchlauf 1 und Durchlauf 2 arbeiten pro Frame: nachschlagen, Klauseln prüfen, abwickeln, Trace erweitern.',
+    },
+    {
+      q: 'Eine Exception fliegt durch zehn verschachtelte async-Methoden. Wie oft wird geworfen?',
+      options: ['Einmal', 'Etwa zehnmal, einmal pro await-Ebene', 'Gar nicht, Tasks werfen nicht'],
+      correct: 1,
+      explanation:
+        'Jede async-Methode fängt die Exception und legt sie im Task ab. Das await der nächsten Ebene wirft sie über ExceptionDispatchInfo erneut.',
+    },
+    {
+      q: 'Wozu dient das ThrowHelper-Muster?',
+      options: [
+        'Damit Exceptions schneller geworfen werden',
+        'Damit der Wurf-Code nicht im Rumpf der heißen Methode steht und diese klein und einbettbar bleibt',
+        'Damit Exceptions nicht im Stack-Trace erscheinen',
+      ],
+      correct: 1,
+      explanation:
+        'Der Wurf selbst wird nicht billiger. Aber die aufrufende Methode bleibt klein, und der kalte Code liegt in einer eigenen Methode, die der JIT nie einbettet.',
+    },
+    {
+      q: 'Was bewirkt [DoesNotReturn] an einer Throw-Helper-Methode?',
+      options: [
+        'Der JIT bettet die Methode deshalb nicht ein',
+        'Der C#-Compiler weiß, dass nach dem Aufruf nichts mehr kommt, etwa für die Null-Analyse',
+        'Die Runtime überspringt den zweiten Durchlauf',
+      ],
+      correct: 1,
+      explanation:
+        'Das Attribut ist für die Flussanalyse des Compilers gedacht. Dass die Methode nie zurückkehrt, erkennt der JIT selbst am IL.',
+    },
+    {
+      q: 'Ein Import liest Millionen Zeilen, von denen viele ungültig sein können. Was ist die beste Wahl?',
+      options: [
+        'int.Parse mit try/catch pro Zeile',
+        'int.TryParse pro Zeile',
+        'int.Parse mit einem try/catch um die ganze Schleife',
+      ],
+      correct: 1,
+      explanation:
+        'Ungültige Zeilen gehören hier zum normalen Betrieb und kommen massenhaft vor. TryParse meldet sie ohne Wurf. Ein try um die Schleife würde beim ersten Fehler den ganzen Import abbrechen.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Ein **try-Block kostet praktisch nichts**, solange nicht geworfen wird: Das Modell ist tabellenbasiert, `finally` auf dem normalen Weg kopiert der JIT meist direkt in den Code.
+- Ein **Wurf ist teuer**: Allokation, Übergang in die Runtime, Benachrichtigungen und zwei Durchläufe über alle Frames zwischen Wurf und Handler.
+- Der Preis **wächst mit der Stacktiefe**, und bei async-Code wird pro `await`-Ebene **erneut geworfen**. Debugger und Diagnose-Werkzeuge machen jeden Wurf zusätzlich teurer.
+- Das **ThrowHelper-Muster** hält Wurf-Code aus kleinen, heißen Methoden heraus. `[DoesNotReturn]` ist für den C#-Compiler, `[StackTraceHidden]` für saubere Traces.
+- **Programmierfehler und seltene Fehler werfen, häufige erwartbare Fehlschläge als Rückgabewert melden**: Try-Muster, Tester-Doer oder ein Ergebnis-Typ.
+- **.NET 9** hat das Werfen durch eine neue, von Native AOT übernommene Implementierung deutlich beschleunigt. Das Modell und die Regel, Exceptions selten zu halten, bleiben.
+- Die **Exception-Rate** einer Anwendung zeigt `dotnet-counters`. Eine hohe Rate deutet fast immer auf Exceptions als Kontrollfluss.
+
+</Block>

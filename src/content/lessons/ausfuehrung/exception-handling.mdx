@@ -1,0 +1,348 @@
+---
+id: exception-handling
+title: Exception Handling in zwei Durchläufen
+summary: Wie die Runtime nach einem throw erst den passenden Handler sucht, ohne etwas abzuräumen, und erst danach finally-Blöcke ausführt und den catch betritt. Mit Klauseltabelle, Exception-Filtern, Funclets, throw gegen throw ex und unbehandelten Exceptions.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'ECMA-335 (CLI-Standard), Partition I 12.4.2 und Partition II 19: Exception Handling'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'Book of the Runtime: What Every (Runtime) Dev Needs to Know About Exceptions'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/exceptions.md
+  - title: 'Book of the Runtime: CLR ABI (clr-abi.md), Abschnitt zu Funclets'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/clr-abi.md
+  - title: 'Anweisungen zur Ausnahmebehandlung: throw, try-catch, try-finally (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/exception-handling-statements
+  - title: 'Best practices for exceptions (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/exceptions/best-practices-for-exceptions
+  - title: 'ExceptionDispatchInfo-Klasse (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.exceptionservices.exceptiondispatchinfo
+  - title: 'AppDomain.UnhandledException (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.appdomain.unhandledexception
+  - title: 'AppDomain.FirstChanceException (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.appdomain.firstchanceexception
+  - title: "What's new in the .NET 9 runtime: Exception handling (Microsoft Learn)"
+    url: https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-9/runtime
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './exception-handling.steps';
+import clauseScript from './exception-handling-klauseln.steps';
+import dispatchScript from './exception-handling-dispatch.steps';
+import { orderCode } from './exception-handling-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein `throw` sieht aus wie ein Sprung: Hier geht etwas schief, dort im `catch` geht es weiter. Zwischen diesen beiden Stellen können aber beliebig viele Methoden liegen, jede mit eigenen `try`-Blöcken, eigenen `finally`-Blöcken und eigenen Bedingungen, unter denen sie eine Exception fangen wollen. Die Runtime muss aus all dem eine eindeutige Abfolge machen.
+
+Dabei stellen sich Fragen, die man im Alltag selten bewusst stellt:
+
+- Wer entscheidet, welcher `catch` zuständig ist, und wann fällt diese Entscheidung?
+- Wann laufen die `finally`-Blöcke der Methoden dazwischen: bevor die Runtime den Handler kennt oder danach?
+- Was ist eine Exception-Bedingung wie `catch (IOException e) when (e.HResult == 32)` für die Runtime, und in welchem Zustand ist der Stack, während sie ausgewertet wird?
+- Was passiert, wenn niemand die Exception fängt?
+
+Die Antwort auf die zweite Frage überrascht viele, und sie ist im Programm sichtbar. Wer einen Exception-Filter schreibt, der etwas ausgibt oder einen Zustand liest, sieht ein Verhalten, das mit der Vorstellung „die Exception wandert Frame für Frame nach oben und räumt dabei auf“ nicht zusammenpasst. Diese Lektion zeigt das Modell, nach dem .NET wirklich arbeitet: **zwei Durchläufe** über den Stack.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir vier Sätze:
+
+1. **Jede Methode beschreibt ihre Handler in einer Tabelle.** Im IL gibt es keine Instruktion, die einen `try`-Block betritt. Stattdessen hängt am Methodenrumpf eine Liste von Klauseln: welcher IL-Bereich geschützt ist, wo der Handler liegt und ob er `catch`, `filter`, `finally` oder `fault` ist.
+2. **Durchlauf 1 sucht, ohne etwas zu verändern.** Die Runtime geht vom Wurfpunkt aus Frame für Frame nach oben und prüft die `catch`-Klauseln: Passt der Typ, oder liefert der Filter `true`? Dabei führt sie Filter aus, aber kein einziges `finally`. Alle Frames bleiben, wo sie sind.
+3. **Durchlauf 2 wickelt ab.** Erst wenn der Handler feststeht, geht die Runtime denselben Weg noch einmal, führt die `finally`- und `fault`-Blöcke von innen nach außen aus und betritt dann den `catch`.
+4. **Ohne Treffer gibt es keinen gewöhnlichen zweiten Durchlauf.** Findet Durchlauf 1 keinen Handler, ist die Exception unbehandelt, und der Prozess endet.
+
+Dieses Modell stammt nicht aus C#, sondern aus dem CLI-Standard: ECMA-335 beschreibt genau diese Suche nach einem Handler, „dessen Filter die Exception behandeln will“, und danach den Weg zurück, auf dem „finally- und fault-Handler“ aufgerufen werden. Es ähnelt dem Structured Exception Handling von Windows, das ebenfalls in zwei Phasen arbeitet.
+
+<Callout kind="fehlannahme">
+  „Eine Exception räumt beim Aufsteigen jeden Frame sofort ab, also laufen alle inneren
+  finally-Blöcke, bevor ein äußerer Filter ausgewertet wird.“ Es ist umgekehrt: Filter laufen im
+  ersten Durchlauf, während alle inneren Frames noch unverändert auf dem Stack liegen. Die
+  finally-Blöcke folgen erst im zweiten Durchlauf.
+</Callout>
+
+<Legend items={['stack', 'heap', 'ref']} />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel hat drei Ebenen: `Main` ruft `A`, `A` ruft `B`, und `B` wirft eine `InvalidOperationException`. `B` und `A` haben je ein `finally`, `A` zusätzlich ein `catch` für einen anderen Typ, und `Main` fängt mit einem Filter, der eine Zeile ausgibt. Bevor du den Player startest: In welcher Reihenfolge erscheinen die vier Zeilen auf der Konsole?
+
+<StepPlayer script={script} />
+
+Die Ausgabe lautet „Filter in Main“, „Finally in B“, „Finally in A“, „Catch in Main“. Der Filter des äußersten Frames läuft also **vor** dem `finally` des innersten. Das ist kein Sonderfall und keine Optimierung, sondern die direkte Folge der zwei Durchläufe. Achte im Player auch auf den Stack-Trace im Exception-Objekt: Er wächst, während Durchlauf 1 nach oben wandert, und endet beim fangenden Frame.
+
+{/* TODO(verify): Output order in a current .NET (8, 9, 10) on x64 and ARM64, Windows and Linux. Expected to be identical on all, because the order is defined by ECMA-335. */}
+
+</Block>
+
+<Block n={4} title="Die Klauseltabelle im IL">
+
+Woher weiß die Runtime, welcher Handler zu welcher Stelle gehört? Aus einer Tabelle, die der Compiler hinter das IL jeder Methode schreibt, die überhaupt Ausnahmebehandlung enthält. Wo genau sie im Methodenrumpf liegt, beschreibt „Aufbau einer Assembly“: Methoden mit Ausnahmebehandlung brauchen dort immer den Fat Header, dessen Flag `MoreSects` kündigt einen Zusatzabschnitt an, und dieser enthält die Klauseln.
+
+Jede Klausel hat dieselben Felder: eine Art, den Anfang und die Länge des geschützten Bereichs, den Anfang und die Länge des Handlers und je nach Art ein Typ-Token oder den Anfang eines Filterblocks. Vier Arten gibt es:
+
+| Art       | Wann läuft der Handler?                     | Typischer Ursprung in C#                       |
+| --------- | ------------------------------------------- | ---------------------------------------------- |
+| `catch`   | Exception passt zum Typ                     | `catch (IOException)`                          |
+| `filter`  | Filterblock liefert 1                       | `catch (...) when (...)`                       |
+| `finally` | immer beim Verlassen des Bereichs           | `finally`, `using`, `lock`, `foreach`          |
+| `fault`   | nur beim Verlassen durch eine Exception     | kein C#-Konstrukt, aber vom Compiler erzeugt   |
+
+{/* TODO(verify): MoreSects flag (CorILMethod_MoreSects, 0x8) in the fat method header, ECMA-335 II.25.4.4. Clause format in ECMA-335 II.25.4.6 (flags COR_ILEXCEPTION_CLAUSE_EXCEPTION = 0, FILTER = 1, FINALLY = 2, FAULT = 4; small and fat format). */}
+
+Wichtig ist eine Regel aus dem Standard: Jede Klausel verbindet **genau einen** geschützten Bereich mit **genau einem** Handler. Ein C#-`try` mit drei `catch`-Blöcken wird zu drei Klauseln mit demselben geschützten Bereich. Und ein `try` mit `catch` und `finally` wird zu zwei ineinander geschachtelten Bereichen.
+
+<StepPlayer script={clauseScript} />
+
+{/* TODO(verify): IL and offsets in the table are hand-assembled (see comment in exception-handling-klauseln.steps.ts). */}
+
+Drei Dinge zeigt die Tabelle, die man im C#-Code nicht sieht:
+
+- **Ein Filter ist Code, kein Ausdruck in Metadaten.** Der Compiler übersetzt `when (...)` in einen eigenen IL-Block, der mit `endfilter` endet. Die Typprüfung aus `catch (Exception)` steckt mit `isinst` in diesem Block, denn eine Filterklausel hat kein Typ-Token.
+- **Die Reihenfolge der Klauseln zählt.** Innere Klauseln stehen vor äußeren, und für denselben Bereich gilt die Reihenfolge der `catch`-Blöcke im Quelltext. Durchlauf 1 nimmt die erste Klausel, die passt.
+- **`finally` auf dem normalen Weg braucht keine Exception.** Verlässt der Code einen geschützten Bereich mit `leave`, führt die Runtime die `finally`-Blöcke der verlassenen Bereiche aus. Das ist derselbe Handler, den im Fehlerfall Durchlauf 2 aufruft.
+
+Den Handler `fault` kennt C# nicht als Schlüsselwort, er ist aber gültiges IL und kommt vor: Der Compiler erzeugt ihn etwa in Iteratoren, damit Aufräumcode nur im Fehlerfall läuft, wie in „yield und Iteratoren“ gezeigt. Die `finally`-Blöcke, die hinter `using`, `lock` und `foreach` stecken, beschreibt „foreach, using und lock“.
+
+{/* TODO(verify): ECMA-335 ordering rule for clauses (nested before enclosing) and that the first matching clause in table order wins. */}
+
+</Block>
+
+<Block n={5} title="Die Entscheidung in jedem Frame">
+
+In Durchlauf 1 läuft für jeden Frame dieselbe kleine Entscheidung ab. Sie verbindet zwei Dinge, die du schon kennst: die Klauseltabelle der Methode und den virtuellen Unwind aus „Stack Walking“, mit dem die Runtime vom Frame zum Aufrufer kommt, ohne den Stack anzufassen.
+
+<StepPlayer script={dispatchScript} />
+
+### Filter laufen auf einem unberührten Stack
+
+Weil Durchlauf 1 nichts abräumt, sieht ein Filter die Welt genau so, wie sie im Moment des Wurfs war. Alle Frames dazwischen existieren noch, ihre lokalen Variablen haben ihre Werte, gehaltene Locks sind noch gehalten. Ein Debugger, der in einem Filter anhält, zeigt den vollständigen Stack bis zum Wurfpunkt. Das macht Filter zum richtigen Ort für Diagnose, wie der Abschnitt „In der Praxis“ zeigt.
+
+Der Preis: Ein Filter läuft in einem Zustand, in dem die inneren Methoden noch nicht aufgeräumt haben. Wer im Filter Zustand verändert oder auf Ressourcen zugreift, die ein inneres `finally` erst noch freigeben wird, bekommt Überraschungen. Filter sollten deshalb kurz sein und nur lesen. Wirft ein Filter selbst eine Exception, gilt das als „kein Treffer“: Die neue Exception wird verschluckt, und die Suche geht weiter.
+
+{/* TODO(verify): Exception thrown inside a filter is swallowed and treated as the filter returning false (ECMA-335 Partition I 12.4.2.x and CoreCLR behaviour). */}
+
+### Funclets und der Weg zurück
+
+Auf 64-Bit-Plattformen übersetzt der JIT jeden Handler und jeden Filter als **Funclet**: ein eigenes kleines Codestück mit eigenem Frame, das die Runtime per Aufruf startet. Wie der Stack Walker Funclets ihrer Elternmethode zuordnet, steht in „Stack Walking“. Für die Ausnahmebehandlung zählt, wer sie wann aufruft:
+
+- In Durchlauf 1 ruft die Runtime **Filter-Funclets** auf. Sie geben 0 oder 1 zurück.
+- In Durchlauf 2 ruft sie **finally- und fault-Funclets** auf, einen nach dem anderen, von innen nach außen.
+- Zum Schluss ruft sie den **catch-Funclet** auf. Er gibt laut CLR-ABI die Adresse zurück, an der die Elternmethode nach dem `catch` weitermacht. Erst dann setzt die Runtime Stackzeiger und Register auf diese Stelle, und die abgewickelten Frames sind physisch verschwunden.
+
+Funclets greifen auf die lokalen Variablen ihrer Elternmethode über deren Framepointer zu, den die Runtime ihnen mitgibt. Deshalb können Handler mit denselben Variablen arbeiten wie der `try`-Block, obwohl sie technisch eigene kleine Funktionen sind. Wie Frames und Framepointer aufgebaut sind, erklärt „Calling Conventions und Frames“.
+
+{/* TODO(verify): Funclets on x64 and ARM64 (and on x86 since the .NET 9/10 EH work); catch funclet returns the continuation address per clr-abi.md; frames are cut back only after the catch funclet returns. */}
+
+</Block>
+
+<Block n={6} title="Stack-Traces: throw;, throw ex; und ExceptionDispatchInfo">
+
+Der Stack-Trace einer Exception ist kein Foto, das beim `new` entsteht. Das Objekt ist zunächst gewöhnlich, sein Trace leer. Die Runtime füllt ihn erst beim Werfen, Frame für Frame, während die Exception nach oben wandert, und er reicht bis zu dem Frame, der sie fängt. Daraus folgen drei Varianten, eine gefangene Exception weiterzugeben, die sich im Ergebnis deutlich unterscheiden.
+
+**`throw;`** ohne Argument ist im IL die Instruktion `rethrow`. Sie darf nur in einem `catch`-Block stehen und wirft dieselbe Exception weiter, **ohne** den bisherigen Trace zu verwerfen. Der Trace enthält weiterhin den ursprünglichen Wurfpunkt.
+
+**`throw ex;`** ist im IL ein gewöhnliches `throw` mit einem Objekt, das zufällig schon einmal geworfen wurde. Für die Runtime ist das ein neuer Wurf, und der Trace beginnt **neu** an dieser Stelle. Die Information, wo der Fehler wirklich entstand, ist verloren. Das ist fast nie gewollt, Analyzer warnen davor.
+
+{/* TODO(verify): Analyzer rule for "throw ex" (CA2200: Rethrow to preserve stack details). */}
+
+**`ExceptionDispatchInfo`** löst ein Problem, das `throw;` nicht lösen kann: eine Exception an einer ganz anderen Stelle erneut zu werfen, etwa auf einem anderen Thread oder nachdem der `catch`-Block längst verlassen ist. `ExceptionDispatchInfo.Capture(ex)` hält die Exception mit ihrem bisherigen Trace fest, `Throw()` wirft sie später erneut. Der Trace enthält dann den alten Teil, eine Trennzeile und den neuen Teil.
+
+```csharp
+ExceptionDispatchInfo? saved = null;
+try { Fail(); }
+catch (Exception e) { saved = ExceptionDispatchInfo.Capture(e); }
+
+// später, an anderer Stelle:
+saved?.Throw();   // Trace: Fail ... --- End of stack trace from previous location --- ...
+```
+
+{/* TODO(verify): Exact separator text "--- End of stack trace from previous location ---" in .NET 8+. */}
+
+Genau diesen Mechanismus benutzt `await`: Eine async-Methode fängt jede Exception in ihrer State Machine und legt sie im Task ab. Wer den Task erwartet, bekommt sie über `ExceptionDispatchInfo` erneut geworfen, mit dem ursprünglichen Trace. Die Grundlagen dazu stehen in „Die async State Machine“.
+
+{/* TODO(verify): That TaskAwaiter.GetResult rethrows via ExceptionDispatchInfo (Task stores exceptions in TaskExceptionHolder as ExceptionDispatchInfo). */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+**Filter mit Nebenwirkungen.** Ein Filter läuft, bevor innere `finally`-Blöcke aufgeräumt haben. Liest er einen Zustand, den ein inneres `finally` zurücksetzen würde, sieht er den alten Wert. Hält eine innere Methode einen Lock, ist er während des Filters noch gehalten. Ein Filter, der auf einen anderen Thread wartet, der denselben Lock braucht, kann so einen Deadlock erzeugen.
+
+**`throw ex;` statt `throw;`.** Der häufigste Grund für Stack-Traces, die in einem `catch` beginnen und die eigentliche Ursache verschweigen. Wer die Exception anreichern will, wirft eine neue und gibt die alte als `InnerException` mit.
+
+**Unbehandelte Exceptions räumen nicht zuverlässig auf.** Die C#-Referenz sagt ausdrücklich: Bei einer behandelten Exception läuft das `finally` garantiert, bei einer unbehandelten hängt es davon ab, wie das Abwickeln ausgelöst wird. Weil Durchlauf 1 keinen Handler findet, gibt es keinen normalen Durchlauf 2. Verlass dich also nicht darauf, dass ein `finally` beim Absturz eine Datei schließt oder einen Puffer schreibt.
+
+{/* TODO(verify): Current CoreCLR behaviour: finally blocks on the faulting thread do not run for unhandled exceptions (no second pass before process termination) on all platforms in .NET 8+. */}
+
+**Exceptions über native Grenzen hinweg.** Eine verwaltete Exception darf nicht durch native Frames laufen. Wird verwalteter Code aus nativem Code aufgerufen, etwa als Callback über einen Funktionszeiger, muss er alle Exceptions selbst fangen und in einen Fehlercode übersetzen. Bei Methoden mit `[UnmanagedCallersOnly]` beendet eine entkommene Exception den Prozess. Umgekehrt werden Fehler aus nativem Code nicht automatisch zu gewöhnlichen, fangbaren Exceptions. Die Details beschreiben „P/Invoke und Marshalling“ und „Funktionszeiger und Callbacks“.
+
+{/* TODO(verify): Exceptions escaping [UnmanagedCallersOnly] methods terminate the process; propagation of managed exceptions through native frames is unsupported on non-Windows and not supported with the .NET 9 managed EH on Windows either; native SEH exceptions (e.g. access violations in native code) are not catchable as normal managed exceptions in .NET Core. */}
+
+**Exceptions in Filtern.** Weil eine Exception im Filter verschluckt wird, kann ein fehlerhafter Filter einen Handler stillschweigend abschalten. Ein `NullReferenceException` im Filter führt nicht zu einer Fehlermeldung, sondern dazu, dass ein weiter außen liegender Handler fängt oder gar keiner.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+**Filter für Diagnose nutzen.** Weil ein Filter auf dem unberührten Stack läuft, eignet er sich für Logging, ohne die Exception zu fangen:
+
+```csharp
+try
+{
+    Process(order);
+}
+catch (Exception ex) when (LogAndContinue(ex))
+{
+    // wird nie erreicht
+}
+
+static bool LogAndContinue(Exception ex)
+{
+    logger.LogError(ex, "Fehler bei der Verarbeitung");
+    return false;   // nicht fangen: Suche geht weiter, Stack bleibt erhalten
+}
+```
+
+Der Filter protokolliert, liefert `false`, und Durchlauf 1 sucht weiter. Für einen Debugger oder einen Crash-Dump sieht es so aus, als hätte es diesen Handler nie gegeben, und der Stack zeigt noch den originalen Wurfpunkt. Mit `catch` und `throw;` wäre an dieser Stelle schon abgewickelt worden.
+
+**Bedingungen in den Filter, nicht in den catch.** `catch (HttpRequestException e) when (e.StatusCode == HttpStatusCode.NotFound)` ist besser als ein `catch`, der prüft und bei Nichtgefallen mit `throw;` weiterwirft. Der Filter entscheidet, bevor irgendetwas abgewickelt ist, und es gibt nur einen Wurf statt zwei.
+
+**Unbehandelte Exceptions melden, nicht retten.** `AppDomain.CurrentDomain.UnhandledException` wird ausgelöst, wenn eine Exception keinen Handler findet. Das Ereignis eignet sich, um noch etwas zu protokollieren. Verhindern kann es das Prozessende nicht. Das gilt für jeden Thread, auch für Threads des ThreadPools.
+
+**First-Chance-Exceptions zur Fehlersuche.** `AppDomain.CurrentDomain.FirstChanceException` meldet laut Dokumentation jede Exception, bevor die Runtime nach einem Handler sucht, also auch solche, die später gefangen werden. Das hilft, Exceptions zu finden, die irgendwo still geschluckt werden. Der Handler läuft bei jedem Wurf, muss also schnell sein und darf selbst nichts werfen.
+
+**`ExceptionDispatchInfo` statt `throw ex;`**, wenn eine Exception aufbewahrt und später weitergegeben werden muss.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Der JIT übersetzt die IL-Klauseln in eine eigene Tabelle für den Maschinencode: Welche nativen Bereiche sind geschützt, wo beginnen die Funclets, welcher Typ oder Filter gehört dazu. Diese Tabelle übergibt er zusammen mit Unwind-Info und GC-Info an die Runtime. Ein Bereich im Maschinencode kostet dadurch nichts, solange niemand wirft: Es gibt keinen Code, der einen `try`-Block betritt oder verlässt. Was das für die Leistung bedeutet, zeigt „Was Exceptions kosten“.
+
+{/* TODO(verify): The JIT reports native EH clauses via ICorJitInfo::setEHinfo; there is no code on try entry and exit on 64-bit platforms. */}
+
+Auf der Seite der Runtime hat sich mit .NET 9 viel geändert. Früher stützte sich CoreCLR auf die Ausnahmebehandlung des Betriebssystems: unter Windows auf Structured Exception Handling, unter Linux und macOS auf eine Nachbildung davon. Jeder Wurf durchlief dabei viel nativen Code und mehrere Übergänge zwischen Runtime und Betriebssystem. Seit .NET 9 verwendet CoreCLR eine neue Implementierung, die von Native AOT übernommen wurde und große Teile der Suche und des Abwickelns in verwaltetem Code erledigt. Das Zwei-Durchläufe-Modell ist dabei unverändert geblieben, denn es ist vom Standard vorgegeben. Geändert haben sich Geschwindigkeit und interne Abläufe.
+
+<Callout kind="version">
+  Laut „What's new in .NET 9“ ist die neue Ausnahmebehandlung in .NET 9 standardmäßig aktiv und
+  kann über eine Laufzeiteinstellung auf die alte Implementierung zurückgestellt werden. Die
+  Reihenfolge von Filtern, finally-Blöcken und catch ist in allen Versionen gleich. Was sich
+  ändert, sind Kosten, Details der Stack-Traces in Randfällen und das Verhalten an nativen Grenzen.
+</Callout>
+
+{/* TODO(verify): .NET 9 managed EH: enabled by default, ported from NativeAOT, not on Windows x86 in .NET 9; switch name System.Runtime.LegacyExceptionHandling / DOTNET_LegacyExceptionHandling=1; whether the legacy path was removed in .NET 10; Windows x86 funclets/new EH in .NET 10. */}
+
+Für Native AOT ist das Modell dasselbe, dort lief diese Implementierung schon vorher. Wie sich Native AOT sonst von der JIT-Welt unterscheidet, steht in „Native AOT“.
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Das Programm prüft drei Aussagen dieser Lektion: die Reihenfolge von Filter und `finally`, den Unterschied zwischen `throw;` und `throw ex;` und den zusammengesetzten Trace von `ExceptionDispatchInfo`.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „Run“. Prüfe, dass „Filter in Main“ vor „Finally in B“ steht. Vergleiche die beiden Stack-Traces: Nach throw ex; fehlt Fail, nach throw; ist es da. Stelle danach auf „IL“ und suche die Blöcke .try, filter und finally: Das ist die Klauseltabelle, als Blockstruktur dargestellt."
+  code={orderCode}
+  note="Die Reihenfolge ist durch ECMA-335 festgelegt und hängt nicht von der .NET-Version ab. Das genaue Format der Stack-Traces kann sich zwischen Versionen unterscheiden."
+/>
+
+{/* TODO(verify): SharpLab Run output for orderCode on the current default runtime. */}
+
+Lokal kannst du zusätzlich `AppDomain.CurrentDomain.FirstChanceException += (_, e) => Console.WriteLine("first chance: " + e.Exception.GetType().Name);` an den Anfang setzen. Du siehst dann, dass jede der Exceptions gemeldet wird, bevor ein Filter oder `catch` sie zu Gesicht bekommt, auch die mit `throw;` erneut geworfene.
+
+{/* TODO(verify): That rethrow (throw;) and ExceptionDispatchInfo.Throw raise FirstChanceException again. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="exception-handling"
+  questions={[
+    {
+      q: 'B wirft, B hat ein finally, Main fängt mit catch (...) when (Log()). Was erscheint zuerst?',
+      options: ['Die Ausgabe des finally in B', 'Die Ausgabe von Log im Filter', 'Beides gleichzeitig, die Reihenfolge ist undefiniert'],
+      correct: 1,
+      explanation:
+        'Filter laufen im ersten Durchlauf, während B noch unverändert auf dem Stack liegt. Das finally in B läuft erst im zweiten Durchlauf.',
+    },
+    {
+      q: 'Wie wird ein C#-try mit zwei catch-Blöcken und einem finally in der Klauseltabelle abgelegt?',
+      options: [
+        'Als eine Klausel mit drei Handlern',
+        'Als zwei catch-Klauseln für einen inneren Bereich und eine finally-Klausel für einen äußeren Bereich',
+        'Gar nicht, try ist eine eigene IL-Instruktion',
+      ],
+      correct: 1,
+      explanation:
+        'Jede Klausel verbindet genau einen geschützten Bereich mit genau einem Handler. catch und finally zusammen werden zu zwei geschachtelten Bereichen.',
+    },
+    {
+      q: 'Was unterscheidet throw ex; von throw;?',
+      options: [
+        'Nichts, beide werfen dasselbe Objekt',
+        'throw ex; beginnt den Stack-Trace neu, throw; behält den ursprünglichen',
+        'throw; erzeugt eine neue Exception mit der alten als InnerException',
+      ],
+      correct: 1,
+      explanation:
+        'throw ex; ist ein gewöhnliches throw, die Runtime behandelt es als neuen Wurf. throw; ist die IL-Instruktion rethrow und erhält den Trace.',
+    },
+    {
+      q: 'Ein Filter wirft selbst eine NullReferenceException. Was passiert?',
+      options: [
+        'Die NullReferenceException ersetzt die ursprüngliche Exception',
+        'Der Filter gilt als false, die Suche geht weiter',
+        'Der Prozess endet sofort',
+      ],
+      correct: 1,
+      explanation:
+        'Exceptions im Filter werden verschluckt, der Filter zählt als „kein Treffer“. Das kann einen Handler unbemerkt abschalten.',
+    },
+    {
+      q: 'Wozu eignet sich AppDomain.UnhandledException?',
+      options: [
+        'Um unbehandelte Exceptions abzufangen und das Programm fortzusetzen',
+        'Um vor dem Prozessende noch etwas zu protokollieren',
+        'Um alle Exceptions zu sehen, auch die gefangenen',
+      ],
+      correct: 1,
+      explanation:
+        'Das Ereignis meldet eine Exception ohne Handler. Das Prozessende kann es nicht verhindern. Alle Würfe, auch gefangene, meldet FirstChanceException.',
+    },
+    {
+      q: 'Warum zeigt ein Crash-Dump nach einem Logging-Filter mit return false noch den originalen Wurfpunkt?',
+      options: [
+        'Weil der Filter den Stack-Trace kopiert',
+        'Weil im ersten Durchlauf nichts abgewickelt wird und der Filter nicht fängt',
+        'Weil Filter immer in einem eigenen Thread laufen',
+      ],
+      correct: 1,
+      explanation:
+        'Der Filter läuft auf dem unberührten Stack. Liefert er false, wird nie abgewickelt, und beim Absturz liegt der Wurfpunkt noch auf dem Stack.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Im IL gibt es keine try-Instruktion. Jede Methode trägt eine **Klauseltabelle** mit geschützten Bereichen und Handlern der Arten `catch`, `filter`, `finally` und `fault`, eine Klausel pro Handler.
+- **Durchlauf 1** sucht vom Wurfpunkt nach oben den ersten passenden `catch` oder Filter. Er führt Filter aus, aber kein `finally`, und verändert den Stack nicht.
+- **Durchlauf 2** führt die `finally`- und `fault`-Blöcke von innen nach außen aus und betritt dann den `catch`. Deshalb laufen äußere Filter vor inneren `finally`-Blöcken.
+- Auf 64-Bit-Plattformen sind Handler und Filter **Funclets**. Der catch-Funclet liefert die Adresse, an der die Methode weitermacht, erst dann verschwinden die abgewickelten Frames.
+- **`throw;`** erhält den Stack-Trace, **`throw ex;`** beginnt ihn neu. Zum späteren Weiterwerfen dient **`ExceptionDispatchInfo`**, das auch `await` nutzt.
+- Ohne Handler ist die Exception **unbehandelt**: `UnhandledException` meldet sie, der Prozess endet, und `finally`-Blöcke laufen nicht garantiert. Über native Grenzen dürfen verwaltete Exceptions nicht laufen.
+- Seit **.NET 9** erledigt eine neue, von Native AOT übernommene Implementierung die Arbeit, das Modell der zwei Durchläufe ist dasselbe geblieben.
+
+</Block>

@@ -1,0 +1,302 @@
+---
+id: safe-points
+title: GC-Info und Safe Points
+summary: Woher der GC weiß, in welchen Registern und Stack-Slots einer laufenden Methode Verweise liegen, warum er Threads nur an bestimmten Stellen auswerten kann und warum ein Objekt sterben darf, bevor seine Methode endet.
+status: draft
+dotnetVersion: '8.0'
+sources:
+  - title: 'Book of the Runtime: CLR ABI (GC-Info, Interruptibility und EH)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/clr-abi.md
+  - title: 'Book of the Runtime: Managed Thread Suspension (threading.md)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/threading.md
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'dotnet/runtime: gcinfoencoder.h (Aufbau der kodierten GC-Info)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/inc/gcinfoencoder.h
+  - title: 'dotnet/runtime: gcinfotypes.h (Slot-Flags interior, pinned, untracked)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/inc/gcinfotypes.h
+  - title: 'dotnet/runtime: flowgraph.cpp (fgSetBlockOrder, Zyklen ohne Safe Point)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/flowgraph.cpp
+  - title: 'dotnet/runtime: morph.cpp (fgSetOptions)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/morph.cpp
+  - title: 'GC.KeepAlive (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.gc.keepalive
+  - title: 'Viewing JIT dumps (dotnet/runtime docs)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/viewing-jit-dumps.md
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './safe-points.steps';
+import interruptibleScript from './safe-points-interruptible.steps';
+import keepAliveScript from './safe-points-keepalive.steps';
+import { lifetimeCode, disasmCode } from './safe-points-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein kompaktierender GC verschiebt Objekte. Danach muss jeder Verweis auf ein verschobenes Objekt die neue Adresse enthalten, sonst zeigt er ins Leere. Für Verweise in anderen Objekten ist das überschaubar: Die MethodTable jedes Typs beschreibt, an welchen Offsets Verweisfelder liegen. Aber was ist mit den Verweisen, die gerade in einer laufenden Methode stecken?
+
+Eine Methode, die der JIT übersetzt hat, hält ihre lokalen Variablen nicht in einer ordentlichen Liste. Ein `StringBuilder` kann in `rsi` liegen, ein Parameter in `rbx`, ein Zwischenergebnis in `rax`, ein anderes in einem Stack-Slot bei `[rsp+20h]`. Im nächsten Befehl kann `rax` schon eine Zahl enthalten. Aus Sicht des Prozessors ist ein Register nur eine 64-Bit-Zahl. Ob `0x7F3A0400` eine Adresse auf dem Heap oder zufällig ein Integer mit diesem Wert ist, sieht man ihm nicht an.
+
+Der GC muss aber genau das wissen. Er muss jedes Register und jeden Slot finden, der auf ein Objekt zeigt, um es als **Root** zu markieren und beim Kompaktieren umzuschreiben. Er darf dabei keinen Verweis übersehen (sonst sammelt er ein lebendes Objekt ein) und keine Zahl für einen Verweis halten (sonst würde er sie beim Verschieben „korrigieren“ und damit deine Daten zerstören).
+
+Die Antwort von .NET ist eine Vereinbarung zwischen JIT und Runtime: Der JIT schreibt zu jeder Methode auf, wo zu welchem Zeitpunkt Verweise liegen. Diese Beschreibung heißt **GC-Info**. Und weil es zu teuer wäre, das für jeden einzelnen Befehl aufzuschreiben, gilt sie meist nur an ausgewählten Stellen, den **Safe Points**.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Vier Sätze tragen diese Lektion:
+
+1. **Zu jeder Methode gehört eine GC-Info.** Der JIT erzeugt sie zusammen mit dem Maschinencode. Sie sagt für Offsets im Code: In diesen Registern und Stack-Slots liegen jetzt lebende Objektverweise.
+2. **Ein Safe Point ist eine Stelle, für die die GC-Info gilt.** Nur dort darf der GC einen Thread auswerten. In den meisten Methoden sind das die Aufrufstellen (**partially interruptible**), in manchen jede Stelle (**fully interruptible**).
+3. **Lebendig heißt: wird später noch gebraucht.** Der JIT meldet einen Verweis nur, solange er im weiteren Code noch verwendet wird. Der Gültigkeitsbereich im Quelltext spielt keine Rolle.
+4. **Daraus folgt die Lebensdauer von Objekten.** In optimiertem Code kann ein Objekt eingesammelt werden, während die Methode, die es angelegt hat, noch läuft.
+
+Der Zusammenhang mit dem Anhalten von Threads ist eng. Weil die GC-Info nur an Safe Points gilt, muss die Runtime jeden Thread an einen Safe Point bringen, bevor eine Collection beginnen kann. Wie sie das anstellt, ist Thema der Lektion „Wie Threads für den GC angehalten werden“. Hier geht es darum, was an einem Safe Point bekannt ist und was daraus folgt.
+
+<Callout kind="fehlannahme">
+  „Ein Objekt lebt mindestens bis zum Ende der Methode, in der seine Variable steht.“ Nein: In
+  optimiertem Code meldet der JIT einen Verweis nur bis zu seiner letzten Verwendung. Danach ist er
+  für den GC keine Root mehr, auch wenn die Variable im Quelltext noch sichtbar ist.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Die folgende Methode baut einen Text aus einer Bestellung zusammen. Sie hat keine Schleife und kein `try`, sie ist deshalb partially interruptible. Links siehst du Ausschnitte aus dem Maschinencode, rechts die GC-Info als Tabelle: für jeden Safe Point die Register mit lebenden Verweisen. Achte besonders auf den Schritt bei `Append(order.Total)`.
+
+<StepPlayer script={script} />
+
+Das Listing ist ein vereinfachtes Beispiel für Windows x64, kein echtes `JitDisasm`-Ergebnis. Echter Code ruft Methoden meist indirekt über Zellen auf, und Offsets und Register können anders aussehen. Am Prinzip ändert das nichts. Wie du solche Listings liest, zeigt „JIT-Assembler lesen“.
+
+{/* TODO(verify): Compare the illustrative listing with DOTNET_JitDisasm=Describe on .NET 8 x64 (register choice, offsets, call form). */}
+
+Zwei Dinge aus dem Durchspielen sind wichtig für alles Weitere. Erstens liegen die Safe Points einer partially interruptible Methode an den **Rücksprungadressen** ihrer Aufrufe. Das ist kein Zufall: Wenn ein Thread angehalten wird, steckt er meist irgendwo tief in einer aufgerufenen Methode. Für jeden Frame weiter oben im Stack ist die aktuelle Position genau eine solche Rücksprungadresse. Der Stack Walk (siehe „Stack Walking“) schlägt für jeden Frame die GC-Info an dieser Adresse nach.
+
+Zweitens können über einen Aufruf hinweg nur bestimmte Register Verweise halten. Die Aufrufkonvention legt fest, welche Register der Aufgerufene erhalten muss (auf Windows x64 unter anderem `rbx`, `rsi`, `rdi`, `r12` bis `r15`) und welche er beliebig überschreiben darf (`rax`, `rcx`, `rdx`, `r8` bis `r11`). Ein Verweis, der einen Aufruf überleben soll, muss also in einem zu erhaltenden Register oder in einem Stack-Slot stehen. Wo der Aufgerufene die geretteten Register ablegt, beschreibt seine Unwind-Info, mehr dazu in „Calling Conventions und Frames“.
+
+</Block>
+
+<Block n={4} title="Was in der GC-Info steht">
+
+Die GC-Info einer Methode ist mehr als eine Liste von Registern. Für jeden Ort, an dem ein Verweis liegen kann, kennt sie einen **Slot** mit einigen Eigenschaften.
+
+### Tracked und untracked
+
+Die meisten Slots sind **tracked**: Der JIT verfolgt ihre Lebensdauer genau und meldet sie nur dort, wo sie lebendig sind, so wie `order` und `sb` im Durchspielen. Daneben gibt es **untracked** Slots. Sie gelten in der ganzen Methode als lebendig, vom Prolog bis zum Epilog. Damit der GC dort nie Müll als Verweis liest, nullt der Prolog solche Slots, bevor irgendetwas anderes passiert.
+
+Untracked wird ein Slot, wenn der JIT seine Lebensdauer nicht sicher bestimmen kann oder will. Ein typischer Fall ist eine lokale Variable, deren Adresse genommen wird, etwa für einen `ref`-Parameter: Dann kann der Wert über einen Zeiger geändert werden, den der JIT nicht verfolgt. Der wichtigste Fall ist aber unoptimierter Code. In Tier 0 und in Debug-Code verzichtet der JIT ganz auf die Lebensdaueranalyse, alle lokalen Variablen sind dort untracked. Das wird bei der Stolperfalle weiter unten entscheidend.
+
+{/* TODO(verify): Typical reasons for untracked GC locals in optimized code (address exposed, too many locals for tracking) per lclvars.cpp; minopts/debug: all locals untracked (lvaComputeRefCounts fast path, checked on main). */}
+
+### Innere Zeiger
+
+Nicht jeder Verweis zeigt auf den Anfang eines Objekts. Ein `ref int` auf ein Array-Element, das Feld `_reference` in einem `Span<T>` oder der Zeiger `this` in einer Methode eines Structs, das in einem Objekt liegt: Alle diese **byrefs** können mitten in ein Objekt zeigen. Die GC-Info kennzeichnet solche Slots als **interior**. Der GC muss dann zuerst das Objekt finden, in dem die Adresse liegt, bevor er es markieren kann. Beim Kompaktieren verschiebt er den inneren Zeiger um dieselbe Strecke wie das Objekt. Zeigt ein byref auf den Stack oder auf nativen Speicher, liegt die Adresse außerhalb des GC-Heaps, und der GC lässt sie in Ruhe. Warum byrefs deshalb nie selbst auf dem Heap liegen dürfen, zeigt „ref struct, ref-Locals und scoped“.
+
+### Fixierte Slots
+
+Ein drittes Flag heißt **pinned**. Damit markiert der JIT lokale Variablen aus `fixed`-Anweisungen. Findet der GC einen solchen Slot lebendig vor, darf er das Zielobjekt in dieser Collection nicht verschieben. Wie teuer das werden kann, steht in „Pinning und Fragmentierung“.
+
+{/* TODO(verify): Flag names GC_SLOT_INTERIOR = 0x1, GC_SLOT_PINNED = 0x2, GC_SLOT_UNTRACKED = 0x4 in src/coreclr/inc/gcinfotypes.h (checked on main). */}
+
+### Wie die GC-Info gespeichert wird
+
+Die Tabelle aus dem Durchspielen ist eine Vereinfachung. Gespeichert wird die GC-Info von einem `GcInfoEncoder` in einem kompakten Bitstrom. Laut dem Aufbau, den der Quellcode in `gcinfoencoder.h` beschreibt, enthält er einen Kopf (Codelänge, Zahl der Aufrufstellen, Sonderslots), die Offsets der Aufrufstellen, eventuell Bereiche, die fully interruptible sind, eine Tabelle aller Slots, für jede Aufrufstelle einen Bitvektor der lebenden Slots und für fully interruptible Code die Übergänge in Abschnitten („Chunks“). Der Decoder liest daraus bei Bedarf genau den Zustand für einen Offset. Die Daten sind dicht gepackt, weil jede übersetzte Methode sie mitbringt, auch wenn nie eine GC sie braucht.
+
+{/* TODO(verify): Encoding details (slim/fat header, call site offsets, interruptible ranges, slot table, call site states, chunk pointers and chunk encodings) per gcinfoencoder.h on main; x86 uses a separate, older encoder (JIT32_GCENCODER). */}
+
+</Block>
+
+<Block n={5} title="Partially oder fully interruptible">
+
+Warum nicht einfach jede Methode fully interruptible machen? Weil die GC-Info dann für jeden Offset stimmen muss, auch für flüchtige Register wie `rax` und `rcx`, die alle paar Befehle etwas anderes enthalten. Das macht die GC-Info deutlich größer, und es zwingt den JIT zu mehr Buchführung. Partially interruptible ist deshalb der Normalfall.
+
+Es gibt aber Fälle, in denen Aufrufstellen nicht genügen. Der wichtigste ist eine **Schleife ohne Aufruf**. Läuft ein Thread in so einer Schleife, erreicht er womöglich sekundenlang keinen einzigen Safe Point, und jede GC im Prozess müsste so lange warten. Der JIT sucht deshalb im Kontrollflussgraphen nach Zyklen, die keinen Safe Point enthalten. Findet er einen, macht er die ganze Methode fully interruptible. Dann kann die Runtime den Thread an jeder Stelle der Schleife auswerten.
+
+<StepPlayer script={interruptibleScript} />
+
+{/* TODO(verify): Decision as implemented on main: fgSetOptions (compDbgCode, EH via setFramePointerRequiredEH on non-x86 targets) and fgSetBlockOrder/fgHasCycleWithoutGCSafePoint; behavior on older versions such as .NET 6. */}
+
+Und was ist mit „GC-Polls“, von denen man manchmal liest? Ein GC-Poll ist ein Stück Code, das der JIT einfügt und das prüft, ob gerade eine GC ansteht, und dann freiwillig anhält. Auf x64 und Arm64 nutzt der JIT dieses Mittel heute nicht für Schleifen, sondern vor allem nach Aufrufen von nativen Funktionen mit `[SuppressGCTransition]`: Diese Aufrufe wechseln nicht in den Modus, in dem der GC den Thread in Ruhe lässt, also braucht es danach eine Gelegenheit zum Anhalten. Für Schleifen bleibt es auf diesen Plattformen bei fully interruptible Code.
+
+{/* TODO(verify): fgInsertGCPolls only handles blocks with SuppressGCTransition calls (OMF_NEEDS_GCPOLLS); Wasm uses GC polls instead of fully interruptible code; checked in flowgraph.cpp and morph.cpp on main. */}
+
+Ein Sonderfall verdient noch Erwähnung: Auch in fully interruptible Methoden gibt es Stellen, die kein Safe Point sind, vor allem Prolog und Epilog, in denen der Frame gerade auf- oder abgebaut wird. Die Runtime erkennt diese Stellen und behandelt den Thread dort wie in partially interruptible Code.
+
+{/* TODO(verify): Prolog/epilog are not interruptible in fully interruptible methods (codegencommon.cpp extends the non-interruptible prolog; the VM checks IsIPInEpilog before hijacking). */}
+
+</Block>
+
+<Block n={6} title="Stolperfalle: Objekte sterben früher als ihre Variable">
+
+Aus dem dritten Satz des Modells folgt eine Überraschung, die in der Praxis echte Fehler verursacht. Wenn eine Variable nach ihrer letzten Verwendung nicht mehr gemeldet wird, kann ihr Objekt eingesammelt werden, während die Methode noch läuft. Normalerweise merkst du davon nichts: Wer das Objekt nicht mehr benutzt, vermisst es auch nicht. Gefährlich wird es, wenn ein **Finalizer** an der Lebensdauer hängt, etwa einer, der ein Betriebssystem-Handle schließt.
+
+<StepPlayer script={keepAliveScript} />
+
+Das Muster ist immer dasselbe: Aus dem Objekt wird ein Wert herausgezogen, den der GC nicht als Verweis kennt (ein `IntPtr`, ein Index, eine ID), und mit diesem Wert wird weitergearbeitet. Für den GC hängt an dem Wert nichts. Was Finalizer sonst noch für die Lebensdauer bedeuten, steht in „Finalisierung“.
+
+### GC.KeepAlive
+
+`GC.KeepAlive(obj)` ist die gezielte Antwort. Die Methode tut laut Dokumentation nichts, außer die Lebensdauer ihres Arguments zu verlängern: Sie ist eine Verwendung von `obj`, die der JIT nicht wegoptimieren darf. Bis zu dieser Stelle gilt `obj` als lebendig, also auch an allen Safe Points davor. Wichtig ist die Position: `KeepAlive` gehört **hinter** die letzte Stelle, an der das Objekt gebraucht wird, nicht an den Anfang der Methode.
+
+Noch besser ist es, das Problem gar nicht entstehen zu lassen. Für Handles gibt es `SafeHandle`: Der Marshaller hält ein `SafeHandle` während des nativen Aufrufs selbst fest und verhindert so, dass es mittendrin geschlossen wird. Details dazu folgen in „SafeHandle“.
+
+### Auch this kann sterben
+
+Dasselbe gilt für `this`. In einer Instanzmethode ist `this` nur ein Parameter. Wird er nach einer bestimmten Stelle nicht mehr gebraucht, kann das Objekt eingesammelt werden, während seine eigene Methode noch läuft. Hat der Typ einen Finalizer, entsteht genau das Problem aus der Visualisierung oben, nur ohne zweite Variable.
+
+{/* TODO(verify): Exceptions where the JIT keeps `this` alive for the whole method (shared generic code that uses `this` as generics context, lvaKeepAliveAndReportThis). */}
+
+### Debug, Tier 0 und Debugger verfälschen das Bild
+
+Experimente zur Lebensdauer liefern je nach Umgebung verschiedene Ergebnisse:
+
+- **Debug-Build:** Der JIT erzeugt debuggbaren Code, alle lokalen Variablen sind untracked und leben bis zum Ende der Methode. Das ist Absicht, damit du sie im Debugger noch ansehen kannst.
+- **Angehängter Debugger:** Auch im Release-Build schaltet ein Debugger die Optimierungen meist ab, mit demselben Effekt.
+- **Tier 0:** Mit Tiered Compilation läuft jede Methode zuerst unoptimiert. Auch dort sind lokale Variablen untracked. Der Fehler aus dem Durchspielen tritt also womöglich erst auf, wenn die Methode in Tier 1 neu übersetzt wurde (siehe „Tiered Compilation und OSR“).
+
+Das erklärt, warum solche Fehler im Test selten auftauchen und erst unter Last in Produktion: Erst dort ist der Code optimiert, und erst dort kommt eine GC zur falschen Zeit.
+
+{/* TODO(verify): Debugger attach disables JIT optimizations by default ("Suppress JIT optimization on module load" in Visual Studio) and its effect when attaching later. */}
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Im Alltag brauchst du die GC-Info nicht zu lesen, aber ihr Modell hilft dir an mehreren Stellen:
+
+- **Interop:** Wann immer du aus einem verwalteten Objekt einen nackten Wert für nativen Code herausziehst (`IntPtr`, Zeiger aus `GCHandle.AddrOfPinnedObject`, Rückruf-Delegates), frage dich, wer das Objekt währenddessen am Leben hält. Delegates, die nativer Code später aufruft, sind ein Klassiker: Ohne eigene Referenz sammelt der GC sie ein, und der Rückruf landet im Nichts.
+- **Timer und Ressourcen in Main:** Ein `System.Threading.Timer`, den nur eine lokale Variable hält, kann eingesammelt werden und hört dann auf zu feuern. Halte ihn in einem Feld oder entsorge ihn ausdrücklich mit `using`.
+- **Tests mit WeakReference:** Wer prüft, ob ein Objekt eingesammelt wird, muss Release-Code testen und die Allokation in eine eigene Methode mit `NoInlining` legen. Sonst halten Tier 0 oder Debug-Code die Variable fest.
+- **Lange Schleifen:** Eine Schleife ohne Aufruf macht die Methode fully interruptible. Das ist harmlos, und du solltest dafür keine künstlichen Aufrufe einbauen. Wichtig wird das Thema erst bei der Frage, wie schnell Threads für eine GC anhalten, und die beantwortet die nächste Lektion.
+
+{/* TODO(verify): Timer collected while only referenced by a local (documented in the System.Threading.Timer remarks: "As long as you are using a Timer, you must keep a reference to it"). */}
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die GC-Info ist ein Vertrag mit zwei Seiten. Der JIT schreibt sie, und er muss dabei exakt sein: Meldet er einen Verweis zu wenig, wird ein lebendes Objekt eingesammelt, meldet er einen Slot mit Müll darin, liest der GC eine falsche Adresse. Deshalb hängt so viel Buchführung an der Codegenerierung: Der Emitter verfolgt bei jedem erzeugten Befehl, welche Register gerade Verweise enthalten (siehe „Die Pipeline von RyuJIT“).
+
+Die Runtime liest die GC-Info beim Stack Walk. Für jeden verwalteten Frame bestimmt sie den Codeoffset, sucht die GC-Info der Methode, dekodiert den Zustand an diesem Offset und meldet jeden lebenden Slot an den GC. Der GC markiert die Ziele und schreibt beim Kompaktieren die neuen Adressen zurück, direkt in den Stack-Slot oder in die Stelle, an der das Register gesichert wurde. Diese Wurzeln zählt die Markierphase als „Stack“, wie in „Mark, Plan, Relocate, Compact“ beschrieben.
+
+Dieselbe Information nutzen auch andere: Der Debugger will nur an Safe Points anhalten, das Exception Handling meldet beim Abwickeln von Frames lebende Verweise, und ReadyToRun-Code bringt seine GC-Info vorkompiliert im Image mit.
+
+<Callout kind="version">
+  Wie der JIT entscheidet, ist versionsabhängig. Die Beschreibung folgt dem aktuellen Quellcode von
+  dotnet/runtime und gilt sinngemäß für .NET 8 und neuer auf x64 und Arm64. x86 verwendet ein
+  älteres, eigenes Format für die GC-Info. Tier 0 und damit untracked Locals in frisch übersetztem
+  Code gibt es, seit Tiered Compilation standardmäßig aktiv ist (.NET Core 3.0).
+</Callout>
+
+{/* TODO(verify): Tiered compilation on by default since .NET Core 3.0; R2R images contain GC info for precompiled methods. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Zwei Experimente. Das erste zeigt, dass ein Objekt vor dem Ende seiner Methode stirbt, und dass `GC.KeepAlive` das verhindert. Das zweite zeigt dir, wie der JIT eine Methode einstuft.
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ohne Debugger ausführen (dotnet run -c Release). Erwartet: ohne KeepAlive False, mit KeepAlive True. Im Debug-Build (dotnet run) sollten beide True liefern, weil der JIT dort alle Variablen bis zum Ende der Methode meldet."
+  code={lifetimeCode}
+/>
+
+{/* TODO(verify): Expected output of both runs on .NET 8 x64 and Arm64. */}
+
+Für das zweite Experiment startest du das folgende Programm mit der Umgebungsvariable `DOTNET_JitDisasm`. Der Kopf jedes Listings nennt die Einstufung. Die vollständige GC-Info lässt sich nur mit einem Checked-Build des JIT ausgeben (`DOTNET_JitGCDump`), der normale Release-JIT zeigt nur diese Kopfzeile.
+
+<VerifyCard
+  sharplab="Lokal im Release-Modus starten und dabei DOTNET_JitDisasm auf die beiden Methoden Sum und Poll setzen (siehe Kommentar im Code). Erwartet: Sum mit „fully interruptible“ (Schleife ohne Aufruf), Poll mit „partially interruptible“ (Handle wird in jeder Runde aufgerufen). Sum erscheint zweimal, zuerst als Tier 0 und später optimiert, die Einstufung gilt für jede Fassung getrennt."
+  code={disasmCode}
+/>
+
+{/* TODO(verify): Header line text "; fully interruptible" / "; partially interruptible" (codegencommon.cpp) and that Sum's Tier 0 version is also fully interruptible (cycle without call), Poll's Tier 1 version partially interruptible. JitGCDump only in checked JIT (CONFIG_METHODSET, not RELEASE_CONFIG). */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="safe-points"
+  questions={[
+    {
+      q: 'Was beschreibt die GC-Info einer Methode?',
+      options: [
+        'Welche Objekte die Methode alloziert',
+        'In welchen Registern und Stack-Slots an bestimmten Code-Offsets lebende Verweise liegen',
+        'Wie viel Speicher die Methode auf dem Heap belegt',
+      ],
+      correct: 1,
+      explanation:
+        'Die GC-Info verbindet Code-Offsets mit Orten (Register, Stack-Slots), an denen dort lebende Verweise liegen. Damit findet der GC die Roots eines angehaltenen Threads.',
+    },
+    {
+      q: 'Eine Methode ist partially interruptible. Wo darf der GC einen Thread in ihr auswerten?',
+      options: ['An jeder Stelle', 'Nur an ihren Aufrufstellen', 'Nur am Ende der Methode'],
+      correct: 1,
+      explanation:
+        'Partially interruptible heißt: Die GC-Info gilt nur an den Rücksprungadressen der Aufrufe. Steht der Thread woanders, muss die Runtime ihn erst zu einem Safe Point bringen.',
+    },
+    {
+      q: 'Eine Methode enthält eine Schleife ohne jeden Aufruf. Was macht der JIT auf x64?',
+      options: [
+        'Er fügt in jede Runde einen Aufruf ein',
+        'Er macht die Methode fully interruptible',
+        'Nichts, die GC wartet bis zum Ende der Schleife',
+      ],
+      correct: 1,
+      explanation:
+        'Der JIT sucht nach Zyklen ohne Safe Point und macht die Methode dann fully interruptible. GC-Polls verwendet er auf x64 vor allem nach Aufrufen mit SuppressGCTransition.',
+    },
+    {
+      q: 'var f = new NativeFile(); IntPtr h = f.Handle; NativeApi.ReadAll(h); Kann f während ReadAll eingesammelt werden (Release, Tier 1)?',
+      options: ['Nein, f ist bis zum Methodenende sichtbar', 'Ja, f wird nach der letzten Verwendung nicht mehr gemeldet'],
+      correct: 1,
+      explanation:
+        'Die letzte Verwendung von f ist das Lesen von Handle. An der Aufrufstelle von ReadAll meldet die GC-Info f nicht mehr. GC.KeepAlive(f) hinter dem Aufruf oder ein SafeHandle verhindert das.',
+    },
+    {
+      q: 'Warum zeigt dasselbe Experiment zur Lebensdauer im Debug-Build ein anderes Ergebnis?',
+      options: [
+        'Im Debug-Build läuft keine GC',
+        'Im Debug-Code sind alle lokalen Variablen untracked und gelten bis zum Methodenende als lebendig',
+        'Der Debug-Build verwendet einen anderen GC',
+      ],
+      correct: 1,
+      explanation:
+        'Debuggbarer Code verzichtet auf die Lebensdaueranalyse, damit du Variablen im Debugger ansehen kannst. Gleiches gilt für Tier 0.',
+    },
+    {
+      q: 'Ein ref int zeigt auf ein Element mitten in einem int[]. Wie behandelt die GC-Info diesen Slot?',
+      options: [
+        'Gar nicht, byrefs sind für den GC unsichtbar',
+        'Als interior: Der GC sucht das umgebende Array und passt den Zeiger beim Verschieben an',
+        'Als pinned: Das Array darf nie verschoben werden',
+      ],
+      correct: 1,
+      explanation:
+        'Innere Zeiger werden als interior gemeldet. Der GC findet das Objekt, in das sie zeigen, hält es am Leben und verschiebt den Zeiger mit.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Der JIT erzeugt zu jeder Methode eine **GC-Info**: welche Register und Stack-Slots an welchen Code-Offsets lebende Verweise enthalten. Ohne sie könnte der GC Roots auf dem Stack weder finden noch umschreiben.
+- **Safe Points** sind die Stellen, für die die GC-Info gilt. In **partially interruptible** Methoden sind das die Rücksprungadressen der Aufrufe, in **fully interruptible** Methoden fast jede Stelle.
+- Fully interruptible wird eine Methode bei **Schleifen ohne Aufruf**, mit **Exception-Handling** und in **Debug-Code**. GC-Polls setzt der JIT auf x64 vor allem nach Aufrufen mit `SuppressGCTransition` ein.
+- Slots sind **tracked** (nur gemeldet, solange gebraucht) oder **untracked** (die ganze Methode lang). **Interior** kennzeichnet innere Zeiger, **pinned** fixierte Locals.
+- In optimiertem Code endet die Lebensdauer eines Verweises mit seiner **letzten Verwendung**. Ein Objekt, auch `this`, kann sterben, während seine Methode noch läuft.
+- Wo ein Finalizer an einem herausgezogenen Wert hängt, verlängert **`GC.KeepAlive`** hinter der letzten Verwendung die Lebensdauer. Für Handles ist `SafeHandle` die bessere Lösung.
+- **Debug-Builds, Debugger und Tier 0** halten Variablen bis zum Methodenende fest. Experimente zur Lebensdauer gehören in optimierten Release-Code.
+
+</Block>

@@ -1,0 +1,302 @@
+---
+id: suspension
+title: Wie Threads für den GC angehalten werden
+summary: Warum der GC alle Threads stoppen muss, was kooperativer und präemptiver Modus bedeuten, wie die Runtime laufende Threads per Umleitung oder umgebogener Rücksprungadresse an einen Safe Point bringt und wie du die Dauer des Anhaltens misst.
+status: draft
+dotnetVersion: '8.0'
+sources:
+  - title: 'Book of the Runtime: Managed Thread Suspension (threading.md)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/threading.md
+  - title: 'Book of the Runtime: Garbage Collection Design (SuspendEE, RestartEE)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Book of the Runtime: CLR ABI (P/Invoke-Übergänge, SuppressGCTransition)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/clr-abi.md
+  - title: 'dotnet/runtime: threadsuspend.cpp (SuspendAllThreads, Hijack, Aktivierungen)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/threadsuspend.cpp
+  - title: 'Garbage collection runtime events (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/fundamentals/diagnostics/runtime-garbage-collection-events
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'SuppressGCTransitionAttribute (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.suppressgctransitionattribute
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './suspension.steps';
+import modesScript from './suspension-modes.steps';
+import { suspendCode } from './suspension-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine blockierende Collection beginnt und endet mit demselben Satz: Alle verwalteten Threads stehen still. In „Mark, Plan, Relocate, Compact“ ist das der erste und der letzte Schritt, und es ist leicht, darüber hinwegzulesen. Dabei ist das Anhalten selbst ein kleines Kunststück.
+
+Warum muss der GC überhaupt anhalten? Weil er beim Markieren die Roots aller Threads liest und beim Kompaktieren Objekte verschiebt und jeden Verweis darauf umschreibt, auch in Registern und Stack-Slots laufender Methoden. Würde ein Thread währenddessen weiterlaufen, könnte er einen Verweis in ein Feld kopieren, das der GC schon durchsucht hat, oder mit einer alten Adresse weiterarbeiten, nachdem das Objekt verschoben wurde. Selbst Background GC, die den größten Teil der Gen2-Markierung parallel zum Programm erledigt, kommt nicht ohne zwei kurze Pausen aus (siehe „Background GC“).
+
+Das Anhalten ist aber nicht so einfach, wie es klingt. Ein Thread lässt sich zwar vom Betriebssystem jederzeit einfrieren. Nur steht er dann an einer beliebigen Stelle, mitten in einer Methode, in der die Runtime nicht weiß, welche Register gerade Verweise enthalten. Wie „GC-Info und Safe Points“ gezeigt hat, gilt die GC-Info nur an **Safe Points**. Die Aufgabe lautet also genauer: Bring jeden Thread schnell an einen Safe Point und halte ihn dort fest, ohne in die Abläufe des Programms einzugreifen.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Das Book of the Runtime beschreibt den Mechanismus mit einem Bild: Jeder Thread hat einen **GC-Modus**, und dieser Modus funktioniert wie ein Lock.
+
+1. **Kooperativer Modus:** Der Thread hält den Lock. Er führt verwalteten Code aus und darf Verweise lesen und schreiben. Solange er in diesem Modus ist, darf keine GC laufen. Er muss „kooperieren“, also den Lock irgendwann freigeben.
+2. **Präemptiver Modus:** Der Thread hat den Lock freigegeben. Er führt nativen Code aus oder wartet, und er verspricht, keine verwalteten Verweise anzufassen. Eine GC darf jederzeit laufen, ohne ihn zu stören.
+3. **Eine GC beginnt erst, wenn kein Thread mehr kooperativ ist.** Die Runtime setzt dafür ein globales Flag, damit niemand den Lock neu nimmt, und bringt dann jeden kooperativen Thread an einen Safe Point, wo er in den präemptiven Modus wechselt.
+4. **Wer zurück will, wartet.** Ein präemptiver Thread, der während der GC in verwalteten Code zurückkehren will, sieht das Flag und blockiert, bis die GC fertig ist.
+
+Daraus folgt etwas Wichtiges: Threads in nativem Code oder in einem Wartezustand muss der GC gar nicht anhalten. Sie laufen einfach weiter, solange sie nicht in verwalteten Code zurückkehren.
+
+<Callout kind="fehlannahme">
+  „Der GC hält Threads sofort an, egal wo sie gerade sind.“ Nein: Ein Thread im kooperativen Modus
+  muss erst einen Safe Point erreichen, und die Zeit bis dahin gehört zur Pause. Threads im
+  präemptiven Modus werden gar nicht angehalten, sie dürfen sogar während der GC weiterlaufen.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Vier Threads, eine blockierende Workstation-GC. Thread 1 alloziert und löst die GC aus, Thread 2 rechnet in einer Schleife, Thread 3 steckt in einem nativen Aufruf und Thread 4 wartet auf einen Lock. Achte darauf, welche Threads die GC überhaupt bemerken und wann.
+
+<StepPlayer script={script} />
+
+Die Zeiteinheiten sind abstrakt. In echten Programmen dauert das Anhalten typischerweise Mikrosekunden bis wenige Millisekunden, dazu unten mehr. Bei Workstation GC macht der auslösende Thread die Arbeit selbst, wie hier Thread 1. Bei Server GC werden die GC-Threads geweckt und suspendieren die verwalteten Threads, der Ablauf ist sonst derselbe (siehe „Workstation, Server und DATAS“).
+
+{/* TODO(verify): Typical suspension times (microseconds, rarely above 1 ms) as described in Maoni Stephens' mem-doc. */}
+
+</Block>
+
+<Block n={4} title="Kooperativ und präemptiv im Detail">
+
+Wann wechselt ein Thread den Modus? Nicht ständig, sondern an wenigen, klar definierten Übergängen.
+
+**P/Invoke.** Für einen Aufruf von nativem Code erzeugt der JIT um die Aufrufstelle herum einen Übergang. Vereinfacht: Er legt einen kleinen Frame an, damit der Stack Walk den nativen Teil überspringen kann, setzt den Thread auf präemptiv und ruft die Funktion auf. Das CLR-ABI-Dokument hält fest, dass ab diesem Moment keine Verweise mehr in Registern leben dürfen. Nach der Rückkehr setzt der Code den Thread wieder auf kooperativ und prüft das Trap-Flag. Ist es gesetzt, ruft er einen Helfer, der bis zum Ende der GC wartet.
+
+{/* TODO(verify): Inlined P/Invoke sequence on x64 (InlinedCallFrame, m_fPreemptiveGCDisabled store, g_TrapReturningThreads check, CORINFO_HELP_STOP_FOR_GC / JIT_PInvokeEndRarePath) per clr-abi.md "Per-call-site PInvoke work". */}
+
+**Warten und Blockieren.** Wartet ein Thread auf einen Lock, auf `Thread.Sleep`, auf ein Event oder auf I/O, wechselt die Runtime vorher in den präemptiven Modus. Ein Thread, der minutenlang auf eine Netzwerkantwort wartet, hält deshalb keine einzige GC auf.
+
+**Runtime-Code.** Auch der C++-Code der Runtime selbst läuft oft im kooperativen Modus, etwa wenn er Objekte anlegt oder Felder liest. Trifft die Suspendierung einen Thread dort, kann die Runtime ihn nicht umleiten. Sie wartet, bis der Code den Modus von selbst wechselt.
+
+**SuppressGCTransition.** Mit `[SuppressGCTransition]` an einer P/Invoke-Deklaration verzichtest du auf den Übergang. Der Aufruf wird billiger, aber der Thread bleibt während der nativen Funktion kooperativ. Der GC muss also warten, bis die Funktion zurückkehrt. Damit danach überhaupt eine Gelegenheit zum Anhalten besteht, fügt der JIT hinter solchen Aufrufen einen **GC-Poll** ein: eine Prüfung des Trap-Flags. Die Dokumentation erlaubt das Attribut deshalb nur für sehr kurze Funktionen, die nicht blockieren und nicht in die Runtime zurückrufen.
+
+Die folgende Zustandsmaschine fasst die Modi eines Threads zusammen. Sie zeigt auch schon die beiden Wege, auf denen die Runtime einen kooperativen Thread an einen Safe Point bringt, das Thema des nächsten Abschnitts.
+
+<StepPlayer script={modesScript} />
+
+</Block>
+
+<Block n={5} title="Der Suspendierungsalgorithmus">
+
+Im Quellcode der Runtime heißt das Anhalten **SuspendEE** (Execution Engine) und das Fortsetzen **RestartEE**. Der Kern ist eine Schleife in `ThreadSuspend::SuspendAllThreads`. Sie arbeitet in drei Schritten.
+
+### 1. Das Trap-Flag setzen
+
+Zuerst setzt der suspendierende Thread ein Event zurück, auf das später alle warten, und erhöht den globalen Zähler `g_TrapReturningThreads` (im Book of the Runtime noch `g_fTrapReturningThreads` genannt). Ab jetzt bleibt jeder Thread hängen, der in den kooperativen Modus wechseln will. Eine prozessweite Speicherbarriere sorgt dafür, dass alle Prozessoren das Flag sehen und der suspendierende Thread den Modus jedes anderen Threads zuverlässig lesen kann.
+
+{/* TODO(verify): g_TrapReturningThreads is a counter (incremented by 2 for GC suspension, bit 0 for other uses) and the process-wide barrier (minipal_memory_barrier_process_wide) as in threadsuspend.cpp on main. */}
+
+### 2. Kooperative Threads einsammeln
+
+Dann geht die Runtime in einer Schleife alle Threads durch und zählt, wie viele noch kooperativ sind. Präemptive Threads sind erledigt. Für jeden kooperativen Thread versucht sie, ihn an einen Safe Point zu bringen. Dafür gibt es zwei Techniken:
+
+- **Umleiten (Redirection):** Steht der Thread an einer Stelle, für die die GC-Info gilt, also in fully interruptible Code, wird sein Befehlszeiger auf einen Stub der Runtime gesetzt. Der Stub sichert den vollständigen Registerzustand, wechselt in den präemptiven Modus und wartet auf das Ende der GC. Danach stellt er den alten Zustand wieder her, und der Thread läuft weiter, als wäre nichts gewesen.
+- **Rücksprung umbiegen (Return Address Hijacking):** Steht der Thread in partially interruptible Code zwischen zwei Aufrufen, gilt an seiner Stelle keine GC-Info. Seine Rücksprungadresse dagegen ist ein Safe Point in der aufrufenden Methode. Die Runtime überschreibt deshalb die Rücksprungadresse im Stack mit der Adresse eines Stubs und lässt den Thread weiterlaufen. Sobald die Methode zurückkehrt, landet er im Stub, der die echte Adresse wiederherstellt und den Thread anhält. Weil dabei der Rückgabewert schon in einem Register liegen kann, sichert der Stub auch diesen und meldet ihn an den GC, falls er ein Verweis ist.
+
+{/* TODO(verify): How the hijack stub learns whether the return register holds an object reference on x64/Arm64 in current versions (ReturnKind in GC info is x86 only on main). */}
+
+Ein umgebogener Rücksprung wirkt nicht sofort. Ruft die Methode vorher noch etwas anderes auf, läuft der Thread dort weiter. Die Runtime wiederholt deshalb ihre Runde: Sie beobachtet kurz, ob Threads von selbst anhalten, und versucht es bei ausbleibendem Fortschritt erneut, mit wachsenden Pausen. Nach etwa einer Millisekunde ohne Erfolg gibt der suspendierende Thread seine Zeitscheibe ab, damit die anzuhaltenden Threads überhaupt Prozessorzeit bekommen.
+
+{/* TODO(verify): Retry loop on main: observe for 5 µs after progress, re-hijack with delay starting at 8 µs doubling up to 100 µs, yield after 1 ms (minipal_switch_to_thread). Older versions (.NET 8) used a different loop. */}
+
+### 3. Wie die Runtime an einen fremden Thread kommt
+
+Um umzuleiten oder umzubiegen, braucht die Runtime den Registerzustand eines anderen Threads. Das geht je nach Plattform verschieden:
+
+- **Windows (klassisch):** Die Runtime friert den Thread mit `SuspendThread` ein, liest seinen Kontext und prüft erneut seinen Modus, denn er könnte inzwischen präemptiv geworden sein. Steht er in verwaltetem Code, wird er umgeleitet (über `SetThreadContext`) oder sein Rücksprung umgebogen. Dann läuft er mit `ResumeThread` weiter.
+- **Windows mit Special User APC:** Auf neueren Windows-Versionen kann die Runtime stattdessen einen besonderen asynchronen Prozeduraufruf in den Thread einschleusen. Der Thread unterbricht sich dann selbst und prüft seine Lage.
+- **Linux und macOS:** Die Runtime schickt dem Thread ein Signal (eine „Aktivierung“). Der Signal-Handler läuft auf dem unterbrochenen Thread, schlägt in der GC-Info nach, ob die Stelle ein Safe Point ist, und leitet dann entweder sofort um oder biegt die Rücksprungadresse um.
+
+{/* TODO(verify): Windows versions supporting special user-mode APCs (QueueUserAPC2, Windows 11 / Server 2022?) and the .NET version that started using them; INJECT_ACTIVATION_SIGNAL (SIGRTMIN on Linux) in the PAL. */}
+
+Mit Schattenstapeln (Intel CET), die neuere .NET-Versionen unter Windows unterstützen, darf niemand die Rücksprungadresse einfach ändern, sonst bricht die Hardware das Programm ab. Windows stellt dafür ein eigenes, abgesegnetes Sprungziel bereit, das die Runtime beim Umbiegen verwendet.
+
+{/* TODO(verify): CET shadow stack support enabled by default in .NET 9 on Windows; RtlGetReturnAddressHijackTarget used as hijack target (threadsuspend.cpp, ThreadSuspend::Initialize). */}
+
+### Fortsetzen
+
+`RestartEE` ist dagegen einfach: Das Trap-Flag wird zurückgenommen, und das Event, auf das alle angehaltenen Threads warten, wird gesetzt. Jeder Thread wechselt zurück in den kooperativen Modus und läuft an seiner Stelle weiter. Für ihn sieht es aus, als hätte er nur kurz gewartet. Höchstens zeigen seine Verweise jetzt auf andere Adressen.
+
+</Block>
+
+<Block n={6} title="Stolperfalle: Die Zeit bis zum Safe Point">
+
+Die Pause einer GC besteht aus zwei Teilen: der Zeit, bis alle Threads angehalten sind, und der eigentlichen Arbeit des GC. Meist ist der erste Teil verschwindend klein. Wenn nicht, ist die Ursache fast nie der GC selbst, sondern ein Thread, der den Safe Point nicht erreicht. Typische Gründe:
+
+- **Zu viele Threads für zu wenige Kerne.** Ein umgebogener oder umgeleiteter Thread muss laufen, um anzuhalten. Sind alle Kerne mit anderen Threads oder Prozessen belegt, wartet er auf seine Zeitscheibe. In Containern mit knappem CPU-Limit ist das besonders häufig.
+- **SuppressGCTransition an langen Funktionen.** Der Thread bleibt während des ganzen nativen Aufrufs kooperativ. Dauert die Funktion eine Millisekunde, dauert jede GC, die sie trifft, mindestens so lange länger, und zwar für alle Threads.
+- **Lange Arbeit in Runtime-Code im kooperativen Modus.** Der Thread lässt sich weder umleiten noch umbiegen, die Runtime muss warten, bis der Code fertig ist.
+- **Tiefe Aufrufketten.** Ein umgebogener Rücksprung wirkt erst, wenn die Methode zurückkehrt. Ruft sie vorher weitere partially interruptible Methoden auf, braucht die Runtime mehrere Runden, bis der Thread steht.
+
+{/* TODO(verify): Which runtime operations run long in cooperative mode (for example large Array.Copy or Buffer.Memmove of reference-free data, which chunk the copy to allow GC suspension?). */}
+
+Die Schleife ohne Aufruf, die man als Erstes verdächtigt, ist dagegen meist harmlos. Der JIT macht ihre Methode fully interruptible (siehe „GC-Info und Safe Points“), und ein unterbrochener Thread kann direkt umgeleitet werden.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Die Suspendierung siehst du nur, wenn du gezielt nachsiehst. Die Runtime meldet jede GC mit einer Reihe von Ereignissen. Für das Anhalten sind laut Microsoft Learn vier davon zuständig, alle unter dem Schlüsselwort `GCKeyword` (0x1):
+
+| Ereignis              | ID  | Bedeutung                                         |
+| --------------------- | --- | ------------------------------------------------- |
+| `GCSuspendEEBegin_V1` | 9   | Anhalten beginnt, mit Grund (etwa 0x1 für GC)     |
+| `GCSuspendEEEnd_V1`   | 8   | alle Threads stehen                               |
+| `GCRestartEEBegin_V1` | 7   | Fortsetzen beginnt                                |
+| `GCRestartEEEnd_V1`   | 3   | alle Threads dürfen weiterlaufen                  |
+
+Die Zeit zwischen `GCSuspendEEBegin` und `GCSuspendEEEnd` ist die Zeit bis zum Safe Point für den langsamsten Thread. Zeichne die Ereignisse mit `dotnet-trace` auf und werte sie mit PerfView aus. Dessen Ansicht GCStats führt zu jeder Collection auch die Dauer des Anhaltens auf. Maoni Stephens empfiehlt in ihrem Leitfaden zur Speicheranalyse, bei langen Pausen genau diese Spalte zuerst anzusehen: Ist sie groß, liegt das Problem beim Anhalten, nicht beim GC.
+
+{/* TODO(verify): PerfView GCStats column name "Suspend MSec" and the mem-doc recommendation wording. */}
+
+Einige Faustregeln für den Alltag:
+
+- **Kurze Pausen messen, nicht raten.** Wenn eine Anwendung hakt und der GC verdächtigt wird, prüfe zuerst, ob die Pause im Anhalten oder in der Arbeit steckt.
+- **CPU-Limits ernst nehmen.** Mehr Threads als Kerne verlängern nicht nur Wartezeiten, sondern auch jede Suspendierung. Wie sich der GC an Container anpasst, steht in „GC-Konfiguration und Container“.
+- **`SuppressGCTransition` nur für Funktionen im Nanosekundenbereich.** Typisch sind Abfragen wie das Lesen eines Zeitgebers, nicht I/O.
+- **Native Arbeit stört nicht.** Ein Thread, der lange in nativem Code rechnet, hält keine GC auf, solange der Übergang normal stattfindet. Er wartet höchstens bei der Rückkehr.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die Suspendierung ist Teamarbeit. Der JIT liefert drei Bausteine: die GC-Info, ohne die kein Thread auswertbar wäre, die Übergänge bei P/Invoke-Aufrufen mit der Prüfung des Trap-Flags und die Entscheidung, Methoden mit Schleifen ohne Aufruf fully interruptible zu machen, damit kein Thread unerreichbar wird. Die Runtime liefert den Rest: das Trap-Flag, die Schleife über alle Threads, Umleitung und umgebogene Rücksprünge für jede Plattform und das Warten auf das Ende der GC.
+
+Weil die Mechanismen eng mit Betriebssystem und Prozessor verzahnt sind, haben sie sich über die Versionen immer wieder verändert. Unter Unix gibt es Aktivierungen per Signal, unter Windows kamen Special User APCs und die Unterstützung für Schattenstapel hinzu, und die Schleife in `SuspendAllThreads` wurde überarbeitet. Native AOT verwendet eine eigene, schlankere Runtime mit denselben Grundideen.
+
+<Callout kind="version">
+  Die Beschreibung folgt dem aktuellen Quellcode von dotnet/runtime und dem Book of the Runtime.
+  Einzelheiten wie die Wiederholungsschleife, die Nutzung von Special User APCs unter Windows und
+  CET-Schattenstapel hängen von der .NET-Version und vom Betriebssystem ab. Das Grundmodell aus
+  kooperativem und präemptivem Modus, Trap-Flag und Safe Points gilt seit den Anfängen der CLR.
+</Callout>
+
+{/* TODO(verify): .NET versions for: Unix activation injection for GC suspension, special user-mode APC on Windows, rewrite of the SuspendAllThreads retry loop, CET default; Native AOT suspension in src/coreclr/nativeaot/Runtime (thread.cpp, threadstore.cpp). */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das Experiment hängt einen `EventListener` an die Ereignisquelle der Runtime und misst für jede ausgelöste GC, wie lange das Anhalten gedauert hat. Ein Thread rechnet dabei ununterbrochen in einer Schleife ohne Aufruf, ein zweiter schläft.
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ohne Debugger ausführen (dotnet run -c Release). Erwartet: fünf Zeilen mit Zeiten im Bereich von Mikrosekunden, obwohl ein Thread die ganze Zeit rechnet. Starte das Programm danach mit mehr Rechen-Threads als Kernen, dann sollten einzelne Werte deutlich steigen."
+  code={suspendCode}
+/>
+
+{/* TODO(verify): Expected magnitude (tens to hundreds of µs) and the effect of oversubscription; not measured. */}
+
+Für eine Messung im echten Betrieb zeichnest du die Ereignisse von außen auf:
+
+```bash
+dotnet-trace collect --process-id <pid> --providers Microsoft-Windows-DotNETRuntime:0x1:4
+```
+
+Öffne die Datei in PerfView. In den Ereignissen findest du zu jeder Collection die Paare aus `GCSuspendEEBegin` und `GCSuspendEEEnd` sowie `GCRestartEEBegin` und `GCRestartEEEnd`. Die GCStats-Ansicht rechnet die Dauern für dich aus.
+
+{/* TODO(verify): Provider string syntax "Microsoft-Windows-DotNETRuntime:0x1:4" for dotnet-trace and that PerfView's GCStats shows suspension time for .nettrace files. */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="suspension"
+  questions={[
+    {
+      q: 'Ein Thread steckt seit Sekunden in einem nativen Aufruf über P/Invoke. Was passiert mit ihm, wenn eine GC beginnt?',
+      options: [
+        'Die Runtime friert ihn sofort ein',
+        'Nichts, er läuft weiter und blockiert erst, wenn er während der GC zurückkehren will',
+        'Die GC wartet, bis der Aufruf zurückkehrt',
+      ],
+      correct: 1,
+      explanation:
+        'Für den P/Invoke ist der Thread in den präemptiven Modus gewechselt. Er gilt sofort als angehalten und läuft nativ weiter. Erst bei der Rückkehr sieht er das Trap-Flag und wartet.',
+    },
+    {
+      q: 'Was bedeutet der kooperative Modus?',
+      options: [
+        'Der Thread wartet auf andere Threads',
+        'Der Thread führt verwalteten Code aus und hält den Lock, der eine GC verhindert',
+        'Der Thread arbeitet mit dem GC zusammen an der Markierung',
+      ],
+      correct: 1,
+      explanation:
+        'Im kooperativen Modus darf der Thread Verweise anfassen. Die GC beginnt erst, wenn er diesen Modus an einem Safe Point verlassen hat.',
+    },
+    {
+      q: 'Ein Thread wird in partially interruptible Code zwischen zwei Aufrufen unterbrochen. Was tut die Runtime?',
+      options: [
+        'Sie hält ihn an Ort und Stelle an',
+        'Sie überschreibt die Rücksprungadresse, damit er beim Zurückkehren an einem Safe Point anhält',
+        'Sie bricht die GC ab',
+      ],
+      correct: 1,
+      explanation:
+        'An seiner Stelle gilt keine GC-Info, die Rücksprungstelle im Aufrufer ist aber ein Safe Point. Deshalb biegt die Runtime die Rücksprungadresse auf einen Stub um.',
+    },
+    {
+      q: 'Wann wird ein Thread umgeleitet statt seine Rücksprungadresse umzubiegen?',
+      options: [
+        'Wenn er an einer Stelle steht, für die die GC-Info gilt, etwa in fully interruptible Code',
+        'Wenn er gerade auf einen Lock wartet',
+        'Nur unter Windows',
+      ],
+      correct: 0,
+      explanation:
+        'Steht der Thread an einem Safe Point, setzt die Runtime seinen Befehlszeiger auf einen Stub, der den Kontext sichert und wartet. Das gibt es auf allen Plattformen, nur der Weg zum fremden Thread ist verschieden.',
+    },
+    {
+      q: 'Was misst die Zeit zwischen GCSuspendEEBegin und GCSuspendEEEnd?',
+      options: [
+        'Die Dauer der Markierphase',
+        'Wie lange es gedauert hat, bis alle Threads an einem Safe Point standen',
+        'Die gesamte Pause der GC',
+      ],
+      correct: 1,
+      explanation:
+        'Diese Spanne ist die Zeit bis zum Safe Point für den langsamsten Thread. Sie gehört zur Pause, ist aber nur ein Teil davon.',
+    },
+    {
+      q: 'Warum kann [SuppressGCTransition] an einer lange laufenden nativen Funktion jede GC verlängern?',
+      options: [
+        'Weil der Thread dann im kooperativen Modus bleibt und die GC auf seine Rückkehr warten muss',
+        'Weil die Funktion dann im GC-Heap läuft',
+        'Weil der JIT dann keine GC-Info erzeugt',
+      ],
+      correct: 0,
+      explanation:
+        'Ohne Übergang wechselt der Thread nicht in den präemptiven Modus. Die Runtime kann ihn im nativen Code weder umleiten noch anhalten und wartet bis zum GC-Poll nach dem Aufruf.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Für die meisten GC-Phasen müssen alle verwalteten Threads stehen, weil der GC Roots liest und Verweise umschreibt. Auch Background GC braucht kurze Pausen.
+- Jeder Thread ist **kooperativ** (verwalteter Code, darf Verweise anfassen) oder **präemptiv** (nativer Code oder Warten). Eine GC beginnt erst, wenn kein Thread mehr kooperativ ist.
+- **SuspendEE** setzt das **Trap-Flag**: Präemptive Threads laufen weiter und blockieren erst bei der Rückkehr in verwalteten Code.
+- Kooperative Threads bringt die Runtime an einen Safe Point: **Umleitung**, wenn die Stelle selbst einer ist (fully interruptible Code), sonst **umgebogene Rücksprungadresse**. Unter Unix per Signal, unter Windows per `SuspendThread` oder Special User APC.
+- Die **Zeit bis zum Safe Point** gehört zur GC-Pause. Sie wächst bei zu vielen Threads pro Kern, bei `SuppressGCTransition` an langen Funktionen und bei langer Arbeit in Runtime-Code.
+- Messen lässt sich das Anhalten mit den Ereignissen **GCSuspendEEBegin/End** und **GCRestartEEBegin/End**, aufgezeichnet mit `dotnet-trace` und ausgewertet in PerfView.
+
+</Block>

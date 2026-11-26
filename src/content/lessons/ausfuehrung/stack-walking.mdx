@@ -1,0 +1,315 @@
+---
+id: stack-walking
+title: Stack Walking
+summary: Wozu die Runtime den Stack eines Threads Frame für Frame abläuft, wie sie dabei verwaltete Frames, Übergänge in nativen Code und Exception-Handler erkennt und warum ein Stack Trace nie ganz dem Quelltext entspricht.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Book of the Runtime: Stackwalking'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/stackwalking.md
+  - title: 'Book of the Runtime: CLR ABI (clr-abi.md)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/clr-abi.md
+  - title: 'Book of the Runtime: Exception Handling'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/exceptions.md
+  - title: 'StackTrace-Klasse (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.stacktrace
+  - title: 'Environment.StackTrace (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.environment.stacktrace
+  - title: 'StackTraceHiddenAttribute (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.stacktracehiddenattribute
+  - title: 'Aufruferinformationen: CallerMemberName und Co. (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/attributes/caller-information
+  - title: 'x64-Ausnahmebehandlung und Unwind-Daten (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './stack-walking.steps';
+import unwindScript from './stack-walking-unwind.steps';
+import inliningScript from './stack-walking-inlining.steps';
+import { traceCode, benchmarkCode } from './stack-walking-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein Thread weiß nicht, wie er dorthin gekommen ist, wo er gerade ist. Der Prozessor kennt nur den aktuellen Befehl und den Stackzeiger. Dass `Main` die Methode `Sort` aufgerufen hat und diese über eine C-Bibliothek die Methode `Compare`, steht nirgends als Liste. Es steckt verstreut in Rücksprungadressen und gesicherten Registern, die irgendwo im Speicher des Stacks liegen.
+
+Die Runtime braucht diese Liste aber ständig, und zwar nicht nur für Fehlermeldungen:
+
+- **Garbage Collection:** Lokale Variablen und Argumente mit Verweisen sind Wurzeln. Um sie zu finden, läuft der GC bei jeder Collection den Stack jedes angehaltenen Threads ab, Frame für Frame.
+- **Exceptions:** Beim Werfen sucht die Runtime den passenden `catch`-Block, indem sie die Frames vom Wurfpunkt aus nach oben durchgeht, und räumt sie danach ab.
+- **Stack Traces:** `Exception.StackTrace`, `new StackTrace()` und `Environment.StackTrace` beschreiben den Weg zum aktuellen Punkt.
+- **Werkzeuge:** Debugger zeigen die Aufrufliste, Profiler nehmen in kurzen Abständen Stichproben vom Stack jedes Threads.
+- **Aufrufer-Informationen:** Einige APIs wollen wissen, wer sie aufgerufen hat, etwa `Assembly.GetCallingAssembly`. Im .NET Framework liefen dafür auch die Stack Walks der Code Access Security.
+
+Diesen Vorgang nennt man **Stack Walking**. Diese Lektion zeigt, wie er funktioniert, warum er an Übergängen zu nativem Code besondere Hilfe braucht und warum das Ergebnis vom Quelltext abweicht.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir drei Sätze:
+
+1. **Der Walker spielt Rücksprünge nach, ohne sie auszuführen.** Er beginnt mit einem Satz Register und rechnet Frame für Frame aus, welche Werte die Register im Aufrufer hatten. Das BOTR nennt das einen **virtuellen Unwind**: Stack und echte Register bleiben unverändert.
+2. **Für JIT-Code gibt es eine Beschreibung, für Übergänge Wegmarken.** Zu jeder vom JIT übersetzten Methode findet die Runtime über die Codeadresse ihre Unwind-Info, GC-Info und Debug-Info. Wo die Ausführung verwalteten Code verlässt, hinterlegt die Runtime **`Frame`-Objekte** mit gesicherten Registern. Fremden nativen Code überspringt sie mit deren Hilfe, ohne ihn verstehen zu müssen.
+3. **Der Walker sieht physische Frames, nicht Quelltext.** Eingebettete Methoden haben keinen Frame, Tail Calls haben ihren Frame schon geräumt, async-Methoden haben nach einem `await` einen ganz anderen Stack. Ein Stack Trace ist eine Rekonstruktion, kein Protokoll.
+
+<Callout kind="fehlannahme">
+  „Der Stack Trace zeigt jeden Aufruf genau so, wie er im Quelltext steht.“ Er zeigt die
+  verwalteten Frames, die beim Walk physisch auf dem Stack lagen, und lässt davon noch einige
+  absichtlich weg. Eingebettete Methoden fehlen, native Frames fehlen, und nach einem `await` fehlt
+  der ursprüngliche Aufrufer.
+</Callout>
+
+<Legend items={['stack', 'heap', 'ref']} />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ist absichtlich gemischt: `Sort` ruft per P/Invoke die C-Funktion `qsort` auf, und diese ruft für jeden Vergleich die verwaltete Methode `Compare` zurück. In `Compare` entsteht ein `StackTrace`. Der Stack besteht damit aus verwalteten Frames, nativen Frames der C-Bibliothek und Frames der Runtime selbst. Die `Frame`-Objekte der Runtime erscheinen als Slots innerhalb des Frames, in dem sie liegen.
+
+<StepPlayer script={script} />
+
+{/* TODO(verify): That qsort via DllImport("libc") with these blittable arguments is an inlined P/Invoke with an InlinedCallFrame in Sort in optimized code; on Windows the library would be msvcrt or ucrtbase. */}
+
+Achte auf die zwei Arten, wie der Walker weiterkommt. Bei `Compare`, `Sort` und `Main` rechnet er mit der Unwind-Info. Bei `qsort` und beim Runtime-Code rechnet er gar nicht, sondern übernimmt gesicherte Register aus einem `Frame`-Objekt. Dass dabei Frames übersprungen werden, ist kein Mangel, sondern Absicht: Die Runtime braucht nur die verwalteten Frames und ihre eigenen.
+
+</Block>
+
+<Block n={4} title="Vom Frame zum Aufrufer">
+
+Jeder Schritt des Walkers folgt derselben Entscheidung. Die folgende Ansicht zeigt sie für das Beispiel oben:
+
+<StepPlayer script={unwindScript} />
+
+### Welche Methode ist das?
+
+Ausgangspunkt ist immer ein Instruktionszeiger. Die Runtime führt Buch darüber, welche Adressbereiche JIT-Code enthalten und zu welcher Methode ein Bereich gehört. Das BOTR beschreibt die Suche als Nachschlagen über die Codeadresse. Gefunden wird der Kopf der Methode mit Verweisen auf drei Datensätze, die der JIT beim Übersetzen erzeugt hat:
+
+- **Unwind-Info:** Wie hat der Prolog den Stack verändert? Daraus folgen Rücksprungadresse und gesicherte Register des Aufrufers. Mehr dazu in „Calling Conventions und Frames“.
+- **GC-Info:** Welche Register und Stack-Slots enthalten an dieser Stelle lebende Verweise? Das braucht nur der GC, erklärt in „GC-Info und Safe Points“.
+- **Debug-Info:** Welcher native Offset gehört zu welchem IL-Offset? Daraus wird mit der PDB-Datei eine Zeilennummer.
+
+{/* TODO(verify): CoreCLR names: code heap lookup through RangeSection and nibble map (codeman.cpp), EECodeManager as ICodeManager implementation, CodeHeader with GC info and unwind info pointers. */}
+
+Für R2R-Code aus ReadyToRun-Images gilt dasselbe, nur stammen die Daten aus dem Image statt aus dem JIT. Für Stubs, die die Runtime selbst erzeugt, gibt es eigene Wege, die hier keine Rolle spielen.
+
+### Woher kommt die Zeilennummer?
+
+Der Walker selbst kennt nur IL-Offsets. `new StackTrace(true)` liest zusätzlich die PDB-Datei der Assembly und übersetzt den IL-Offset in Datei und Zeile. Fehlt die PDB, fehlen die Zeilen. Das ist auch der teuerste Teil: Das erste Lesen einer PDB kostet spürbar Zeit.
+
+{/* TODO(verify): That file and line information comes from portable PDBs read via System.Reflection.Metadata in System.Diagnostics.StackTrace (StackTraceSymbols), cached per assembly. */}
+
+</Block>
+
+<Block n={5} title="Frame-Objekte an den Grenzen">
+
+Die Namensgebung ist unglücklich, das BOTR warnt ausdrücklich davor: Ein **`Frame`** (mit großem F, eine C++-Klasse der Runtime) ist etwas anderes als ein Stack-Frame. Ein `Frame`-Objekt liegt **auf** dem Stack, innerhalb des Stack-Frames der Methode, die es angelegt hat. Alle `Frame`-Objekte eines Threads bilden eine einfach verkettete Liste vom jüngsten zum ältesten, und der Thread kennt den Anfang. Der Walker vergleicht Stackadressen, um zu entscheiden, ob als Nächstes ein verwalteter Frame oder ein `Frame`-Objekt an der Reihe ist.
+
+Es gibt eine ganze Hierarchie davon, jede Art für eine Grenze:
+
+- **Inlined P/Invoke:** Ruft optimierter Code eine native Funktion direkt auf, legt der JIT ein `InlinedCallFrame` in den Frame der aufrufenden Methode. Laut CLR-ABI enthält es Rücksprungadresse, Stackzeiger und Framepointer, und die Methode muss auf x64 `rbp` als Framepointer verwenden.
+- **Übergänge in die Runtime:** Wenn verwalteter Code Hilfsfunktionen der Runtime aufruft, die ihrerseits einen GC auslösen oder eine Exception werfen können, sichert ein Übergangsframe den Zustand des Aufrufers und hält Verweise in Argumenten für den GC sichtbar.
+- **Einstieg aus nativem Code:** Wird verwalteter Code von außen aufgerufen, etwa über `[UnmanagedCallersOnly]` oder einen Delegate-Funktionszeiger, markiert die Runtime auch diese Grenze.
+
+{/* TODO(verify): Current Frame types in src/coreclr/vm/frames.h (InlinedCallFrame, FaultingExceptionFrame, ResumableFrame, PInvokeCalliFrame, PrestubMethodFrame, ...); HelperMethodFrame was removed in .NET 10 when FCalls were converted; how reverse P/Invoke entry is recorded on x64. */}
+
+Warum dieser Aufwand? Weil über fremde Frames nichts Verlässliches bekannt ist. Ein C-Compiler kann Framepointer weglassen und Unwind-Daten in einem Format ablegen, das die Runtime nicht lesen will. Statt zu raten, sorgt die Runtime dafür, dass sie an jeder Grenze selbst einen Ankerpunkt hinterlassen hat.
+
+### Funclets
+
+Auf x64 und ARM64 übersetzt der JIT `catch`-, `finally`- und `filter`-Blöcke als eigene kleine Funktionen, sogenannte **Funclets**. Sie liegen im selben Codeblock wie die Methode, werden aber über einen `call` angesprungen und bekommen einen eigenen kleinen Frame. Ihre Locals greifen sie über den Framepointer der Elternmethode ab, den die Runtime ihnen mitgibt. Der Walker muss Funclets deshalb erkennen und ihrer Elternmethode zuordnen. Im Stack Trace erscheinen sie als die Methode, in der der Handler steht. Wie das beim Werfen zusammenspielt, zeigt „Exception Handling in zwei Durchläufen“.
+
+{/* TODO(verify): Funclets on all 64-bit platforms (x64, ARM64) and on x86 since .NET 9 or 10; funclet frames reported as the parent method in StackTrace; parent frame register passed in rcx (Windows) or rsi (Unix) per clr-abi.md. */}
+
+</Block>
+
+<Block n={6} title="Was im Stack Trace fehlt und was dazukommt">
+
+Der Walker meldet physische Frames. Zwischen ihnen und dem Quelltext liegen mehrere Übersetzungsschritte, und jeder davon kann einen Aufruf verschlucken oder umbenennen.
+
+<StepPlayer script={inliningScript} />
+
+**Eingebettete Methoden** fehlen, weil ihr Code Teil des Aufrufers ist, wie in „Inlining“ beschrieben. Der JIT kennt das Inlining zwar und kann es in erweiterten Debug-Informationen für Werkzeuge festhalten, aber ein gewöhnlicher Stack Trace zeigt nur die äußere Methode. **Tail Calls** räumen den Frame vor dem Sprung, die Methode taucht ebenfalls nicht auf.
+
+{/* TODO(verify): "Rich debug info" with inline trees (since .NET 7, DOTNET_RichDebugInfo) and whether any current .NET version reconstructs inlined frames in System.Diagnostics.StackTrace. */}
+
+**Exception-Stack-Traces** sind kürzer, als viele denken. Der Trace einer Exception enthält die Frames vom Wurfpunkt bis zu dem Frame, der sie fängt, nicht den ganzen Stack. Wer die vollständige Aufrufkette braucht, muss im `catch` zusätzlich `Environment.StackTrace` erfassen.
+
+{/* TODO(verify): Exception stack trace contains only frames between throw and catch (frames are appended during the first pass), per BOTR exceptions.md. */}
+
+**async-Methoden** sind der größte Unterschied. Nach einem `await` läuft der Rest der Methode als Fortsetzung, aufgerufen vom ThreadPool, nicht vom ursprünglichen Aufrufer. Der physische Stack enthält dann `MoveNext` der State Machine und darunter ThreadPool-Code. Seit .NET Core 2.1 zeigt .NET in Exception-Traces trotzdem den Methodennamen statt `MoveNext` und blendet die Maschinerie dazwischen aus. Abschnitte, die vor einem `await` liegen, trennt eine Zeile `--- End of stack trace from previous location ---`. Die Grundlagen dazu erklärt „Die async State Machine“.
+
+{/* TODO(verify): .NET Core 2.1 async stack trace improvements (state machine frames shown as the original method, hidden infrastructure frames) and the exact separator text. */}
+
+**Ausgeblendete Frames:** Methoden mit `[StackTraceHidden]` lässt der Stack Trace weg. Die BCL nutzt das für Throw-Helper, damit ein Trace dort beginnt, wo der Fehler wirklich liegt, und nicht in einer Hilfsmethode. Das Attribut ist seit .NET 6 öffentlich, du kannst es für eigene Helfer verwenden.
+
+{/* TODO(verify): StackTraceHiddenAttribute public since .NET 6. */}
+
+**Hinzugefügte Namen:** Lambdas, lokale Funktionen und Iteratoren erscheinen mit den Namen, die der Compiler vergeben hat, etwa `<Main>b__0_0` oder `<Process>g__Local|1_0`. Das ist kein Fehler, sondern die Methode, die wirklich lief, wie in „Lambdas und Closures“ gezeigt.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+**Den eigenen Aufrufer über den Stack bestimmen.** Code wie `new StackFrame(1).GetMethod()` liefert in einem Debug-Build den Aufrufer und in Release womöglich eine ganz andere Methode, weil der JIT eine Ebene eingebettet hat. Dasselbe gilt für `MethodBase.GetCurrentMethod()` in kleinen Hilfsmethoden. Die Runtime schützt nur einige eigene APIs, die den Aufrufer kennen müssen, gegen Inlining. Eigener Code bekommt diesen Schutz nicht, es sei denn, du markierst ihn mit `[MethodImpl(MethodImplOptions.NoInlining)]`.
+
+{/* TODO(verify): That BCL methods using StackCrawlMark (e.g. Assembly.GetCallingAssembly) are not inlined and prevent their callers from being inlined in the relevant ways. */}
+
+**Stack Traces im heißen Pfad.** Ein Stack Walk ist teuer: Für jeden Frame sucht die Runtime die Methode, liest Unwind- und Debug-Info und baut am Ende Strings. Mit Dateiinformationen kommt das PDB-Lesen hinzu. Ein Logger, der bei jeder Meldung `Environment.StackTrace` oder `new StackTrace(true)` erfasst, kann leicht die Hälfte der Zeit nur damit verbringen.
+
+**Exceptions als Kontrollfluss.** Jede geworfene Exception löst mindestens einen Stack Walk aus, beim Fangen oft mehrere. Was das kostet, misst „Was Exceptions kosten“.
+
+**Stack Traces ohne Symbole.** In Containern fehlen oft die PDB-Dateien, dann fehlen die Zeilennummern. Mit Native AOT können je nach Einstellung sogar die Methodennamen fehlen, weil die Metadaten dafür weggelassen werden.
+
+{/* TODO(verify): Native AOT StackTraceSupport feature switch and the resulting stack trace format without metadata. */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die meisten Fragen, für die man früher einen Stack Walk benutzt hat, lassen sich heute zur **Compile-Zeit** beantworten. Die Attribute `[CallerMemberName]`, `[CallerFilePath]`, `[CallerLineNumber]` und `[CallerArgumentExpression]` lassen den C#-Compiler den Namen der aufrufenden Methode, Datei, Zeile oder den Ausdruck eines Arguments als Konstante einsetzen. Das kostet zur Laufzeit nichts, ist unabhängig vom Inlining und funktioniert auch mit Native AOT.
+
+```csharp
+static void Log(string msg,
+                [CallerMemberName] string member = "",
+                [CallerLineNumber] int line = 0)
+    => Console.WriteLine($"{member}:{line} {msg}");
+
+Log("Start");   // der Compiler schreibt daraus Log("Start", "Main", 12)
+```
+
+{/* TODO(verify): Line number 12 is an example. */}
+
+Weitere Regeln aus dem Alltag:
+
+- **Stack Traces gehören in den Fehlerfall.** Erfasse sie, wenn wirklich etwas schiefgegangen ist, nicht vorsorglich bei jeder Meldung.
+- **Throw-Helper mit `[StackTraceHidden]` markieren.** So beginnt der Trace beim Aufrufer, der den Fehler verursacht hat.
+- **Release-Traces mit Vorsicht lesen.** Fehlt eine Methode, die es offensichtlich gab, war sie vermutlich eingebettet. Die Zeilennummer verweist dann in die äußere Methode.
+- **PDBs mit ausliefern** oder in die Assembly einbetten, wenn Zeilennummern in Produktion wichtig sind.
+- **Für Profiling Werkzeuge nehmen, die den Walk außerhalb deines Codes machen.** `dotnet-trace` und andere Profiler sammeln Stichproben über die Runtime, ohne dass du `StackTrace` aufrufen musst.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Der JIT legt beim Übersetzen jeder Methode die drei Datensätze an, von denen der Walker lebt: Unwind-Info, GC-Info und die Zuordnung von nativen zu IL-Offsets. Diese Daten sind komprimiert, denn sie existieren für jede übersetzte Methode, auch wenn nie ein Stack Walk stattfindet.
+
+Den häufigsten Stack Walk bemerkst du nie: den des GC. Bei jeder Collection hält die Runtime alle Threads an und läuft ihre Stacks ab, um die Wurzeln zu finden. Damit der Walker dabei verlässliche Informationen bekommt, darf ein Thread nur an bestimmten Stellen angehalten werden. Wie das funktioniert, zeigen „GC-Info und Safe Points“ und „Wie Threads für den GC angehalten werden“.
+
+Profiler und Debugger nutzen dieselbe Maschinerie über eigene Schnittstellen. Der Sample-Profiler von EventPipe etwa hält Threads in kurzen Abständen an und lässt die Runtime ihre Stacks ablaufen. Debugger arbeiten von außen über eine eigene Bibliothek, die die Datenstrukturen der Runtime lesen kann, ohne dass Code im Zielprozess laufen muss.
+
+{/* TODO(verify): EventPipe sample profiler interval (about 1 ms by default) and that it suspends threads; debugger stack walks via the DAC (mscordaccore). */}
+
+<Callout kind="version">
+  Stack Traces haben sich über die Versionen verbessert: Seit .NET Core 2.1 sind async-Traces
+  lesbar, seit .NET 6 ist `[StackTraceHidden]` öffentlich. Mit „Runtime Async“ übernimmt die
+  Runtime selbst einen Teil der async-Maschinerie, was auch die Form der Traces verändern kann.
+  Prüfe Aussagen über das genaue Format deshalb immer mit deiner Version.
+</Callout>
+
+{/* TODO(verify): Version facts in the callout; effect of runtime async on stack traces. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente: den Unterschied zwischen Debug und Release im Stack Trace sehen und die Kosten verschiedener Wege zum Aufrufernamen messen.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein, stelle die Ausgabe auf „Run“ und vergleiche Debug und Release. Achte darauf, ob Validate im ersten Trace erscheint. Prüfe, dass Hidden im zweiten Trace fehlt, und sieh dir an, welche Namen und Zeilen die Ausgabe von Log enthält."
+  code={traceCode}
+  benchmark={benchmarkCode}
+  note="Erwartung: CallerMember liegt im Bereich weniger Nanosekunden, weil der Name eine Konstante ist. Alle Varianten mit Stack Walk sind um Größenordnungen langsamer und allozieren, die Variante mit Dateiinformationen am meisten."
+/>
+
+{/* TODO(verify): SharpLab Run mode honours the Debug/Release switch and its tiering settings. Validate may be inlined only after Tier 1 promotion; with a single call in Release it may still run in Tier 0. For a reliable experiment, set <TieredCompilation>false</TieredCompilation> or <TieredPGO> settings; check the actual output. Benchmark orders of magnitude not measured. */}
+
+Ein Hinweis zum ersten Experiment: Lokal geht es genauso mit `dotnet run` und `dotnet run -c Release`. Mit Tiered Compilation läuft `Validate` beim ersten Aufruf in Tier 0, und dort wird nicht eingebettet. Damit du den Unterschied sicher siehst, setze für den Release-Lauf die Umgebungsvariable `DOTNET_TieredCompilation=0`. Dann übersetzt der JIT sofort voll optimiert.
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="stack-walking"
+  questions={[
+    {
+      q: 'Wofür läuft die Runtime am häufigsten den Stack ab, ohne dass dein Code darum bittet?',
+      options: ['Für Exception-Stack-Traces', 'Für die Garbage Collection', 'Für den Debugger'],
+      correct: 1,
+      explanation:
+        'Bei jeder Collection muss der GC in allen Frames aller Threads die lebenden Verweise finden. Dafür läuft er jeden Stack ab.',
+    },
+    {
+      q: 'Der Walker steht mit dem Instruktionszeiger in einer nativen C-Funktion. Wie kommt er zurück in verwalteten Code?',
+      options: [
+        'Er wertet die Framepointer der C-Funktion aus',
+        'Er nimmt das nächste Frame-Objekt der Runtime, das an der Grenze die Register des verwalteten Aufrufers gesichert hat',
+        'Er sucht im Speicher nach bekannten Rücksprungadressen',
+      ],
+      correct: 1,
+      explanation:
+        'Über fremden nativen Code weiß die Runtime nichts Verlässliches. Deshalb hinterlegt sie an jeder Grenze ein Frame-Objekt, etwa ein InlinedCallFrame beim P/Invoke.',
+    },
+    {
+      q: 'Was ist ein virtueller Unwind?',
+      options: [
+        'Das Abbauen der Frames beim Werfen einer Exception',
+        'Das Berechnen der Register des Aufrufers aus der Unwind-Info, ohne Stack und Register zu verändern',
+      ],
+      correct: 1,
+      explanation:
+        'Der Walker rechnet nur. Der Thread steht danach genau da, wo er vorher stand.',
+    },
+    {
+      q: 'In einem Release-Build fehlt eine kleine Hilfsmethode im Stack Trace einer Exception. Was ist die wahrscheinlichste Ursache?',
+      options: [
+        'Die PDB-Datei fehlt',
+        'Der JIT hat die Methode in ihren Aufrufer eingebettet',
+        'Die Runtime kürzt lange Traces',
+      ],
+      correct: 1,
+      explanation:
+        'Eingebettete Methoden haben keinen eigenen Frame, der Walker kann sie nicht melden. Eine fehlende PDB würde nur Zeilennummern kosten.',
+    },
+    {
+      q: 'Welche Frames enthält Exception.StackTrace in einem catch-Block?',
+      options: [
+        'Den ganzen Stack bis Main',
+        'Die Frames vom Wurfpunkt bis zur Methode, die fängt',
+      ],
+      correct: 1,
+      explanation:
+        'Der Trace wächst, während die Exception nach oben wandert. Was oberhalb des fangenden Frames liegt, gehört nicht dazu.',
+    },
+    {
+      q: 'Du willst in einer Log-Methode den Namen der aufrufenden Methode ausgeben. Was ist die robusteste Lösung?',
+      options: [
+        'new StackFrame(1).GetMethod().Name',
+        'Ein Parameter mit [CallerMemberName]',
+        'Environment.StackTrace parsen',
+      ],
+      correct: 1,
+      explanation:
+        'Der Compiler setzt den Namen als Konstante ein. Das kostet nichts und hängt nicht davon ab, was der JIT einbettet.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Die Runtime läuft Stacks ab für **GC-Wurzeln**, **Exceptions**, **Stack Traces**, Debugger und Profiler. Der GC ist der häufigste Nutzer.
+- Der Walker macht einen **virtuellen Unwind**: Aus einem Registersatz berechnet er mit der Unwind-Info Frame für Frame die Register des Aufrufers, ohne etwas zu verändern.
+- Zu jeder JIT-Methode findet die Runtime über die Codeadresse **Unwind-Info, GC-Info und Debug-Info**. Die Debug-Info liefert den IL-Offset, die PDB daraus die Zeile.
+- An Grenzen zu nativem Code und zur Runtime liegen **`Frame`-Objekte** auf dem Stack, als verkettete Liste. Mit ihnen überspringt der Walker native Frames, ohne sie zu verstehen.
+- Handler laufen auf x64 und ARM64 als **Funclets** mit eigenem kleinen Frame und werden der Elternmethode zugeordnet.
+- Ein Stack Trace ist eine **Rekonstruktion**: Eingebettete Methoden, Tail Calls, native Frames und mit `[StackTraceHidden]` markierte Methoden fehlen, async-Traces werden nachträglich aufbereitet.
+- Stack Walks sind teuer. Für Aufrufer-Informationen gibt es **`[CallerMemberName]`** und Verwandte, die der Compiler kostenlos einsetzt.
+
+</Block>
