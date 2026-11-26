@@ -1,0 +1,337 @@
+---
+id: readytorun
+title: ReadyToRun und Crossgen
+summary: Wie crossgen2 Maschinencode neben das IL in deine Assembly legt, wie die Runtime ihn über Fixups an die laufende Version anbindet, warum er vorsichtiger ist als Tier-1-Code und wann der JIT trotzdem übersetzt.
+status: draft
+dotnetVersion: '6+'
+sources:
+  - title: 'ReadyToRun deployment overview (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/ready-to-run
+  - title: 'Book of the Runtime: Managed Executables with Native Code (ReadyToRun Overview)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/readytorun-overview.md
+  - title: 'Book of the Runtime: ReadyToRun File Format'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/readytorun-format.md
+  - title: 'ReadyToRun Composite Format Design (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/readytorun-composite-format-design.md
+  - title: 'Tiered Compilation (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/tiered-compilation.md
+  - title: 'Laufzeitkonfiguration: Kompilierung (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/runtime-config/compilation
+  - title: 'Performance Improvements in .NET 8 (.NET Blog, Abschnitt „Tiering and Dynamic PGO“)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './readytorun.steps';
+import fixupScript from './readytorun-fixups.steps';
+import tierScript from './readytorun-tiers.steps';
+import { jitCountCode, jitListCode } from './readytorun-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine .NET-Assembly enthält keinen Maschinencode für deine Methoden, nur IL und Metadaten. Bevor eine Methode zum ersten Mal läuft, muss der JIT sie übersetzen. Bei einer Methode ist das schnell erledigt. Beim Start einer echten Anwendung sind es aber Tausende: Hosting, Dependency Injection, Konfiguration, Logging, Routing, Serialisierung. Jede davon kostet Übersetzungszeit, und diese Zeit sieht der Benutzer als langsamen Start oder als zähe erste Anfrage.
+
+Tiered Compilation mildert das, indem der JIT beim ersten Aufruf nur schnell und kaum optimiert übersetzt. Übersetzen muss er trotzdem. Die naheliegende Idee lautet deshalb: Warum nicht schon beim Veröffentlichen übersetzen und den fertigen Code mitliefern? C- und C++-Programme machen das schließlich immer so.
+
+Für verwalteten Code ist das schwieriger, als es klingt. Ein .NET-Programm läuft gegen Bibliotheken, die sich unabhängig von ihm ändern: Das Framework bekommt Patches, NuGet-Pakete neue Versionen. Maschinencode, der beim Veröffentlichen entsteht, trifft Annahmen über diese Bibliotheken, etwa über Feldpositionen oder über den Rumpf einer eingebetteten Methode. Ändert sich die Bibliothek, sind solche Annahmen falsch, und falscher Maschinencode stürzt nicht höflich ab, er rechnet still mit falschen Daten.
+
+Der Vorgänger NGEN aus dem .NET Framework hat das Problem über einen Cache gelöst: Native Images wurden auf der Zielmaschine erzeugt und bei jeder Änderung einer Abhängigkeit verworfen und neu gebaut. **ReadyToRun** (R2R) geht einen anderen Weg. Der Code entsteht beim Veröffentlichen, wird mit der App ausgeliefert und muss mit späteren Versionen der Abhängigkeiten weiter funktionieren. Wie das gelingt und was es kostet, ist Thema dieser Lektion.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Stell dir ein ReadyToRun-Image als **gewöhnliche Assembly mit einem Anhang** vor. IL und Metadaten sind vollständig da, wie in der Lektion „Aufbau einer Assembly“ beschrieben. Dazu kommt vorkompilierter Maschinencode für eine bestimmte Plattform, etwa Linux x64, und ein Verzeichnis, über das die Runtime zu jeder Methode den passenden Code findet.
+
+Drei Sätze tragen den Rest der Lektion:
+
+1. **R2R-Code ist ein Angebot, keine Pflicht.** Die Runtime prüft beim ersten Aufruf jeder Methode, ob sie den vorkompilierten Code verwenden darf. Wenn nicht, übersetzt der JIT aus dem IL, das in derselben Datei liegt.
+2. **R2R-Code fragt die Runtime, was er nicht wissen darf.** Alles, was sich in einer anderen Assembly ändern könnte, etwa Adressen von Methoden oder Typen, steht nicht fest im Code, sondern in **Zellen**, die die Runtime beim ersten Gebrauch füllt.
+3. **R2R-Code ist eine Startstufe.** Für Tiered Compilation spielt er die Rolle von Tier 0. Heiße Methoden ersetzt der JIT später durch Tier-1-Code.
+
+<Callout kind="fehlannahme">
+  „Mit ReadyToRun entfällt der JIT.“ Nein: Der JIT bleibt im Prozess und hat weiter zu tun. Er
+  übersetzt Methoden, für die es keinen vorkompilierten Code gibt, Methoden, deren Code die Runtime
+  verwirft, und alle heißen Methoden ein zweites Mal für Tier 1. ReadyToRun verringert die
+  JIT-Arbeit beim Start, es ersetzt den JIT nicht.
+</Callout>
+
+Den Unterschied zu Native AOT solltest du dir gleich hier merken: Native AOT übersetzt das ganze Programm vorab und lässt den JIT tatsächlich weg, mit allen Einschränkungen, die das mit sich bringt. ReadyToRun ändert nichts am Ausführungsmodell. Alles, was mit JIT funktioniert, funktioniert auch mit ReadyToRun.
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Die App wurde mit `PublishReadyToRun=true` veröffentlicht. Verfolge, was beim ersten Aufruf von drei Methoden passiert: einer eigenen Methode, einer Framework-Methode mit einer Klasse als Typargument und einer Framework-Methode mit einem eigenen Struct als Typargument. Die beiden letzten Schritte zeigen, wann vorhandener R2R-Code nicht benutzt wird.
+
+<StepPlayer script={script} />
+
+Beachte, dass die Entscheidung **pro Methode** fällt. Es gibt kein „die App läuft mit R2R“ oder „die App läuft mit JIT“. Ein typischer Prozess führt eine Mischung aus: Framework-Code aus den Images des Frameworks, deinen Code aus deinem Image und dazwischen gejittete Methoden, für die niemand Code vorbereiten konnte.
+
+</Block>
+
+<Block n={4} title="Wie crossgen2 ein Image baut">
+
+Das Werkzeug hinter ReadyToRun heißt **crossgen2**. Du rufst es nicht selbst auf, das SDK erledigt das beim Veröffentlichen:
+
+```xml
+<PropertyGroup>
+  <PublishReadyToRun>true</PublishReadyToRun>
+  <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+</PropertyGroup>
+```
+
+Ein `dotnet build` erzeugt weiterhin reine IL-Assemblies. Erst `dotnet publish` mit einer Ziel-RID wie `linux-x64` oder `win-x64` führt crossgen2 aus. Ohne RID geht es nicht, denn Maschinencode gibt es nur für eine bestimmte Kombination aus Betriebssystem und Prozessorarchitektur.
+
+crossgen2 erfindet dabei keinen eigenen Codegenerator. Es lädt denselben JIT, den die Runtime benutzt, und stellt ihm die Fragen, die sonst die Runtime beantwortet: Wie groß ist dieser Typ? Darf ich diese Methode einbetten? Wie erreiche ich jenes Feld? Die Lektion „Die Pipeline von RyuJIT“ zeigt diese Schnittstelle. Der Unterschied liegt in den Antworten. Die Runtime antwortet mit festen Adressen und Fakten des laufenden Prozesses. crossgen2 antwortet vorsichtig, weil es den späteren Prozess nicht kennt.
+
+{/* TODO(verify): crossgen2 hosts RyuJIT through the same JIT-EE interface (BOTR readytorun-overview.md "Current State" says RyuJIT is the code generator); crossgen2 is a managed tool under src/coreclr/tools/aot sharing infrastructure with the Native AOT compiler. */}
+
+### Was im Image landet
+
+Das SDK übersetzt die Assemblies, die mit deiner App ausgeliefert werden. Bei einer framework-abhängigen App sind das deine Projekte und die NuGet-Pakete, bei einer self-contained App zusätzlich das ganze Framework. Assemblies aus C++/CLI sind ausgeschlossen. Einzelne Assemblies kannst du mit `PublishReadyToRunExclude` aus der Übersetzung nehmen.
+
+Innerhalb einer Assembly versucht crossgen2, so viele Methoden wie möglich zu übersetzen. Laut Microsoft Learn gibt es aber Gründe, aus denen der JIT trotzdem gebraucht wird:
+
+- generische Typen aus anderen Assemblies, wie `List<Price>` im Durchspielen,
+- Interop mit nativem Code,
+- Hardware-Intrinsics, deren Verfügbarkeit auf der Zielmaschine der Compiler nicht beweisen kann,
+- ungewöhnliche IL-Muster,
+- zur Laufzeit erzeugte Methoden, etwa über Reflection.Emit oder kompilierte LINQ-Ausdrücke.
+
+### Der Preis: Dateigröße
+
+Weil das IL im Image bleiben muss, wird jede übersetzte Assembly größer. Microsoft Learn nennt als Faustregel das Zwei- bis Dreifache. Eine größere Datei muss gelesen und gemappt werden und vergrößert den Working Set. Bei Apps mit viel eigenem Code überwiegt der Gewinn durch eingesparte JIT-Arbeit deutlich. Bei kleinen Apps ist der Effekt dagegen gering, denn das Framework, das den größten Teil des Startcodes stellt, ist ohnehin schon vorkompiliert.
+
+{/* TODO(verify): Size factor 2 to 3 is the Microsoft Learn rule of thumb; measure for a sample app before quoting concrete numbers. */}
+
+</Block>
+
+<Block n={5} title="Fixups und die Version Bubble">
+
+Wie kann vorkompilierter Code eine Methode in einer anderen Assembly aufrufen, deren Adresse erst zur Laufzeit feststeht? Die Antwort ist eine Ebene Indirektion. Der Code ruft nicht das Ziel auf, sondern springt über eine **Zelle** im Datenbereich des Images. Zu jeder Zelle speichert das Image eine **Signatur**, die beschreibt, was hineingehört: „Einstiegspunkt von `Geometry.Distance`“, „Typ-Handle von `List<Price>`“, „Basisadresse der Statics von `Config`“. Das Füllen einer Zelle heißt **Fixup**.
+
+<StepPlayer script={fixupScript} />
+
+Die meisten Zellen füllt die Runtime **lazy**, erst wenn sie zum ersten Mal gebraucht werden. Bei Aufrufen geht das besonders elegant: Die Zelle zeigt anfangs auf einen Delay-Load-Helfer, der sich beim ersten Aufruf selbst durch das echte Ziel ersetzt. Andere Zellen stehen in einer Liste am Einstieg einer Methode und werden gefüllt, bevor die Methode zum ersten Mal läuft. Einige wenige füllt die Runtime gleich beim Laden des Images. So entspricht der Ladezeitpunkt von Typen ungefähr dem, den du vom JIT kennst, siehe „Wie ein Typ geladen wird“.
+
+{/* TODO(verify): Per-method fixup lists in MethodDefEntryPoints are resolved before the method first runs; eager import sections are filled at image load (readytorun-format.md, ImportSections flags). */}
+
+### Was eine Version Bubble ist
+
+Das Book of the Runtime definiert eine **Version Bubble** als eine Menge von Assemblies, die nur gemeinsam aktualisiert werden. Innerhalb der Bubble darf crossgen2 alles annehmen, was auch der JIT annimmt: Methoden einbetten, Feldoffsets fest in den Code schreiben, direkt springen. Über die Grenze hinweg muss es so tun, als könnte sich auf der anderen Seite alles ändern, was die Kompatibilitätsregeln erlauben.
+
+Standardmäßig ist die Bubble genau eine Assembly. Daraus folgen die typischen Unterschiede zum JIT:
+
+- **Kein Inlining über Assembly-Grenzen.** Ein eingebetteter Rumpf würde nach einem Update der anderen Assembly veralten. Die Lektion „Inlining“ beschreibt die Ausnahme für Methoden, die das Framework ausdrücklich als unveränderlich kennzeichnet.
+- **Vorsicht bei Feldern fremder Typen.** Bei Klassen aus anderen Assemblies darf eine Basisklasse neue Felder bekommen, also kann der Code nicht jeden Offset fest annehmen. Das BOTR beschreibt dafür Fixups, die Offsets oder Basisgrößen zur Laufzeit liefern.
+- **Vorsicht bei der Devirtualisierung.** Ob eine fremde Klasse `sealed` bleibt, ist nicht garantiert, siehe „Devirtualisierung“.
+- **Generics über fremde Bubbles.** Der Code von `List<T>.Add` gehört CoreLib. Für ein Struct aus deiner App als `T` kann ihn keines der beiden Images liefern, ohne die Grenze zu verletzen.
+
+Ein paar Annahmen erlaubt sich ReadyToRun trotzdem: Das Layout von `System.Object`, von Arrays und von Strings gilt als unveränderlich, sonst würde jeder Feldzugriff außerhalb des Frameworks bezahlen. Und öffentliche Structs gelten als stabil: Wer Anzahl oder Typ ihrer Felder ändert, bricht laut BOTR die Kompatibilität. Für Fälle, in denen das nicht reicht, legt crossgen2 Prüf-Fixups an, die das erwartete Layout mit dem tatsächlichen vergleichen. Passt es nicht, verwirft die Runtime den Code dieser Methode und jittet.
+
+{/* TODO(verify): Behaviour when a Check_TypeLayout or Check_FieldOffset fixup fails at runtime (method code silently dropped, JIT fallback) as described in readytorun-format.md. */}
+
+</Block>
+
+<Block n={6} title="ReadyToRun im Zusammenspiel mit Tiering">
+
+Microsoft Learn sagt es ohne Umschweife: Vorab erzeugter Code ist nicht so stark optimiert wie Code des JIT. Die Gründe kennst du jetzt: keine Einbettung über Bubble-Grenzen, Indirektionen über Zellen, ein vorsichtiger Befehlssatz, keine Profildaten aus deinem Prozess. Statt das zu verstecken, setzt .NET auf Tiered Compilation, wie die Lektion „Tiered Compilation und OSR“ beschreibt.
+
+<StepPlayer script={tierScript} />
+
+Daraus ergibt sich eine Arbeitsteilung, die du dir merken solltest. ReadyToRun bezahlt den **Start**: Methoden, die einmal oder selten laufen, und das sind beim Start fast alle, bekommen ordentlich optimierten Code ohne JIT-Kosten. Tier 1 bezahlt den **Dauerbetrieb**: Die wenigen heißen Methoden werden im Hintergrund neu übersetzt, diesmal mit vollem Wissen über den Prozess. Wie Dynamic PGO dabei misst, zeigt die Lektion „Dynamic PGO“.
+
+### Warum der R2R-Code trotzdem ordentlich ist
+
+R2R-Code ist nicht dasselbe wie Tier 0. Tier 0 verzichtet fast vollständig auf Optimierungen, um schnell fertig zu werden. crossgen2 hat beim Veröffentlichen Zeit und optimiert innerhalb der Bubble wie der JIT in Tier 1. Für das Framework bekommt es zusätzlich Profildaten aus Trainingsläufen mit. R2R-Code liegt also zwischen beiden: deutlich besser als Tier 0, aber nicht so gut wie Tier 1 mit Profil.
+
+{/* TODO(verify): crossgen2 compiles with full optimization (not MinOpts) by default; framework images use static PGO data (.mibc). */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Messen ohne Tiering
+
+Wer `TieredCompilation` abschaltet, um „stabilere“ Benchmarks zu bekommen, misst mit R2R-Code etwas anderes als die Produktion: Heiße Framework-Methoden bleiben dann bei ihrer vorsichtigen R2R-Fassung. Lass Tiering in Benchmarks an und lass BenchmarkDotNet aufwärmen, dann misst du Tier 1.
+
+### Die falsche RID
+
+Ein R2R-Image für `linux-x64` enthält Code für genau diese Plattform. Läuft die App woanders, etwa auf `linux-arm64`, kann die Runtime den Code nicht benutzen und jittet alles aus dem IL. Die App funktioniert, aber der erhoffte Startgewinn bleibt aus, ohne dass dich jemand warnt.
+
+{/* TODO(verify): An R2R image for another architecture is loaded as IL only (no failure); check behaviour of the loader for mismatched Machine field. */}
+
+### Mehr JIT als erwartet
+
+Viele generische Instanziierungen über eigene Structs, Code mit `Reflection.Emit` oder kompilierten Expression Trees und Methoden, deren Prüf-Fixups scheitern, landen trotz ReadyToRun beim JIT. Wenn der Start nicht so schnell wird wie erhofft, zähl nach, statt zu raten. Wie, zeigt „Selbst nachweisen“.
+
+### Entladbare Kontexte
+
+Assemblies, die in einen entladbaren `AssemblyLoadContext` geladen werden, nutzen laut Microsoft Learn keinen R2R-Code. Plugins mit Entladen starten deshalb langsamer, siehe „AssemblyLoadContext und Isolierung“.
+
+{/* TODO(verify): Whether R2R code is still ignored for collectible AssemblyLoadContexts in .NET 9 and 10. */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Situation | ReadyToRun lohnt sich? | Grund |
+| --- | --- | --- |
+| große App mit viel eigenem Startcode | ja | viele JIT-Übersetzungen beim Start entfallen |
+| kleine Konsolen-App | kaum | das Framework ist schon vorkompiliert |
+| Serverless, kurze Prozesse | ja | der Prozess erreicht Tier 1 oft nie |
+| langlaufender Dienst | beim Start ja, später egal | heiße Methoden landen ohnehin in Tier 1 |
+| App mit vielen Plugins in entladbaren Kontexten | nein | R2R-Code wird dort ignoriert |
+| Desktop-App mit spürbarem Kaltstart | ja | erste Klicks werden flüssiger |
+
+Zwei Varianten erweitern das Grundmodell.
+
+**Composite ReadyToRun** übersetzt mehrere Assemblies gemeinsam, bei einer self-contained App einschließlich des Frameworks. Die Assemblies bilden dann eine große Version Bubble: Der Compiler darf über ihre Grenzen hinweg einbetten und mehr Methoden vorab übersetzen. Laut Microsoft Learn kostet das deutlich längere Übersetzung, eine deutlich größere App und funktioniert nur self-contained, und die Assemblies müssen gemeinsam ausgeliefert werden. Du schaltest es mit `PublishReadyToRunComposite` ein.
+
+{/* TODO(verify): That a self-contained composite build includes the framework assemblies in the composite image by default. */}
+
+**Symbole für Profiler** erzeugst du mit `PublishReadyToRunEmitSymbols`. Unter Windows entstehen `.ni.pdb`-Dateien, unter Linux `.r2rmap`-Dateien. Sie helfen vor allem, wenn du den Start profilierst, denn im Dauerbetrieb ist der R2R-Code heißer Methoden längst durch Tier 1 ersetzt.
+
+Ob sich ReadyToRun für deine App lohnt und wie es gegen Native AOT steht, entscheidest du am besten mit Messungen. Die Abwägung im Ganzen beschreibt „Startzeit gegen Spitzenleistung“.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Runtime behandelt ein R2R-Image mit Misstrauen auf mehreren Ebenen. Beim Laden prüft sie den ReadyToRun-Header: Die Hauptversion des Formats muss sie verstehen, und das Image muss zur Plattform passen. Ist ReadyToRun per `DOTNET_ReadyToRun=0` abgeschaltet oder verlangt ein angehängter Profiler, keine vorkompilierten Images zu verwenden, nimmt sie das Image nur als IL-Assembly. Beim ersten Aufruf einer Methode folgen die Fixups und Prüfungen aus dem Durchspielen.
+
+{/* TODO(verify): Profiler flag that disables use of R2R code (COR_PRF_DISABLE_ALL_NGEN_IMAGES) and the exact load-time checks (MajorVersion, Machine) in src/coreclr/vm/readytoruninfo.cpp. */}
+
+Das Format ist so angelegt, dass neuere Runtimes ältere Images weiter verstehen. Das BOTR beschreibt die Regel: Für jede Änderung muss die Runtime das alte und das neue Format unterstützen. Deshalb kann eine Bibliothek, die für .NET 8 vorkompiliert wurde, auch auf .NET 9 ihren R2R-Code nutzen, solange die Formatversion verstanden wird.
+
+{/* TODO(verify): R2R code compiled against an older framework major version is still used on a newer runtime (minor format versions are backward compatible); check whether there are exceptions when CoreLib is outside the bubble. */}
+
+<Callout kind="version">
+  crossgen2 ist seit .NET 6 der Compiler für ReadyToRun im SDK. Composite ReadyToRun gibt es seit
+  .NET 6, seit .NET 7 ist es für self-contained Single-File-Apps mit ReadyToRun standardmäßig an.
+  Seit .NET 8 ist Dynamic PGO Standard, heiße R2R-Methoden gehen dadurch über eine instrumentierte
+  Zwischenstufe. Bis .NET 10 verwendet ReadyToRun auf allen Plattformen das PE-Format, für spätere
+  Versionen plant das Runtime-Team native Formate wie Mach-O.
+</Callout>
+
+{/* TODO(verify): crossgen2 default since .NET 6 (crossgen1 removed), composite default for self-contained single-file since .NET 7 (Microsoft Learn), PE envelope through .NET 10 and Mach-O plans for .NET 11 (BOTR readytorun-overview.md "Platform-Native Envelope Support"). */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+### JIT-Arbeit zählen
+
+Die Klasse `System.Runtime.JitInfo` verrät, wie viele Methoden der JIT im Prozess übersetzt hat und wie lange er dafür brauchte. Starte das Programm dreimal: mit `dotnet run`, als mit ReadyToRun veröffentlichte App und als dieselbe App mit `DOTNET_ReadyToRun=0`.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht. SharpLab zeigt keine ReadyToRun-Images. Lege mit dotnet new console ein Projekt an, ersetze Program.cs und folge den Schritten im Kommentar am Ende des Codes."
+  code={jitCountCode}
+/>
+
+Erwartetes Ergebnis: Die veröffentlichte R2R-App meldet weniger JIT-Methoden und weniger JIT-Zeit als `dotnet run`, weil deine eigenen Methoden vorkompiliert sind. Ganz auf null fällt die Zahl nicht, unter anderem wegen `List<Price>`. Mit `DOTNET_ReadyToRun=0` steigt sie stark an, weil nun auch das Framework gejittet wird.
+
+{/* TODO(verify): Run on .NET 8/9/10 and record the three method counts before stating any concrete numbers. */}
+
+### Sehen, was gejittet wird
+
+Die Runtime kann jede Übersetzung mit Stufe protokollieren. In der Liste sollte `Billing.Sum` beim Start nicht auftauchen, `List<Price>.Add` dagegen schon. Lässt du die Schleife länger laufen, erscheint `Sum` später mit Tier 1, weil sie heiß wurde.
+
+<VerifyCard code={jitListCode} />
+
+{/* TODO(verify): Output format of DOTNET_JitDisasmSummary (tier names, whether instrumented Tier 1 is labelled) on .NET 8+. */}
+
+Dazu passt ein Blick ins Dateisystem: Vergleiche die Größe von `App.dll` im Ordner von `dotnet build` mit der im Veröffentlichungsordner. Das Werkzeug aus der Lektion „Aufbau einer Assembly“ zeigt dir außerdem, dass im CLI-Header des veröffentlichten Images das Feld ManagedNativeHeader belegt ist.
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="readytorun"
+  questions={[
+    {
+      q: 'Warum enthält ein ReadyToRun-Image weiterhin das vollständige IL?',
+      options: [
+        'Nur aus Kompatibilität mit alten Werkzeugen',
+        'Weil die Runtime R2R-Code verwerfen und heiße Methoden neu übersetzen kann, dafür braucht der JIT das IL',
+        'Weil der R2R-Code das IL zur Laufzeit interpretiert',
+      ],
+      correct: 1,
+      explanation:
+        'R2R-Code ist ein Angebot. Passt er nicht oder wird eine Methode heiß, übersetzt der JIT aus dem IL, das in derselben Datei liegt.',
+    },
+    {
+      q: 'Deine App ist mit ReadyToRun veröffentlicht und ruft List<Price>.Add auf, Price ist ein Struct aus deiner App. Was passiert typischerweise?',
+      options: [
+        'Der Code kommt aus dem Image von CoreLib',
+        'Der Code kommt aus dem Image deiner App',
+        'Der JIT übersetzt die Methode zur Laufzeit',
+      ],
+      correct: 2,
+      explanation:
+        'Der Rumpf von Add gehört CoreLib, das Struct deiner App. Keines der beiden Images liegt in einer gemeinsamen Version Bubble, also bleibt die Instanziierung für den JIT.',
+    },
+    {
+      q: 'Warum bettet crossgen2 eine kleine Methode aus einem NuGet-Paket nicht in deinen Code ein?',
+      options: [
+        'Weil das Paket nach einem Update anders aussehen könnte und der eingebettete Rumpf dann veraltet wäre',
+        'Weil crossgen2 grundsätzlich nicht einbettet',
+        'Weil eingebettete Methoden nicht vorkompiliert werden können',
+      ],
+      correct: 0,
+      explanation:
+        'Einbetten ist nur innerhalb der Version Bubble erlaubt. Über die Grenze ruft der Code das Ziel über eine Zelle auf, die die Runtime beim ersten Aufruf füllt.',
+    },
+    {
+      q: 'Eine R2R-Methode wird im Dauerbetrieb sehr oft aufgerufen. Was passiert mit eingeschalteter Tiered Compilation?',
+      options: [
+        'Nichts, R2R-Code ist bereits voll optimiert',
+        'Der JIT übersetzt sie neu, über eine instrumentierte Stufe bis Tier 1',
+        'Die Runtime wechselt zurück zu Tier 0',
+      ],
+      correct: 1,
+      explanation:
+        'R2R-Code ist die Startstufe. Heiße Methoden werden gezählt und neu übersetzt, mit Dynamic PGO zuerst optimiert und instrumentiert, dann endgültig in Tier 1.',
+    },
+    {
+      q: 'Was zeigt eine Zelle in einem R2R-Image an, bevor ihr Aufruf zum ersten Mal ausgeführt wurde?',
+      options: [
+        'Die feste Adresse der Zielmethode aus der Übersetzungszeit',
+        'Einen Delay-Load-Helfer der Runtime, der das Ziel auflöst und die Zelle füllt',
+        'Den IL-Code der Zielmethode',
+      ],
+      correct: 1,
+      explanation:
+        'Adressen anderer Assemblies stehen erst zur Laufzeit fest. Der Helfer löst die Signatur der Zelle auf, schreibt die Adresse hinein, und ab dann geht der Aufruf direkt.',
+    },
+    {
+      q: 'Eine kleine Konsolen-App wird mit ReadyToRun veröffentlicht, der Start wird kaum schneller. Was ist die wahrscheinlichste Erklärung?',
+      options: [
+        'ReadyToRun funktioniert bei Konsolen-Apps nicht',
+        'Der größte Teil des Startcodes stammt aus dem Framework, das schon vorkompiliert ist',
+        'Die Runtime hat das Image verworfen',
+      ],
+      correct: 1,
+      explanation:
+        'Das Framework wird als ReadyToRun ausgeliefert. Bei wenig eigenem Code bleibt kaum JIT-Arbeit übrig, die ReadyToRun noch einsparen könnte.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Ein **ReadyToRun-Image** ist eine vollständige Assembly mit IL und Metadaten plus vorkompiliertem Maschinencode für eine Plattform. crossgen2 erzeugt es beim `dotnet publish` mit `PublishReadyToRun` und einer RID.
+- Die Runtime entscheidet **pro Methode** beim ersten Aufruf, ob sie den R2R-Code benutzt. Fehlt er oder passt er nicht, übersetzt der JIT aus dem IL. Der JIT bleibt also im Prozess.
+- Verweise auf andere Assemblies laufen über **Zellen**, die die Runtime beim ersten Gebrauch füllt. So bleibt der Code gültig, wenn Abhängigkeiten aktualisiert werden.
+- Die **Version Bubble** begrenzt Optimierungen: kein Einbetten über Assembly-Grenzen, Vorsicht bei fremden Typen, keine Generics über fremde Bubbles. Composite vergrößert die Bubble zum Preis gemeinsamer Auslieferung.
+- R2R-Code ist eine **Startstufe**: besser als Tier 0, schwächer als Tier 1. Heiße Methoden ersetzt Tiered Compilation durch Tier-1-Code, ohne Tiering bleibt der vorsichtigere Code.
+- Images werden **zwei- bis dreimal so groß**. Der Gewinn ist bei Apps mit viel eigenem Startcode am größten, bei kleinen Apps gering, weil das Framework schon vorkompiliert ist.
+
+</Block>

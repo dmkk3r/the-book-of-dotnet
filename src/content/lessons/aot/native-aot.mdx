@@ -1,0 +1,327 @@
+---
+id: native-aot
+title: Native AOT
+summary: Wie der Native-AOT-Compiler dein ganzes Programm samt Runtime in eine native Programmdatei übersetzt, was er dabei vorab berechnet und warum Reflection, nachgeladene Assemblies und Codeerzeugung zur Laufzeit an ihre Grenzen stoßen.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Native AOT deployment overview (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/
+  - title: 'Introduction to AOT warnings (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/fixing-warnings
+  - title: 'Native AOT: Diagnostics and instrumentation (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/diagnostics
+  - title: 'Native AOT: Cross-compilation (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/cross-compile
+  - title: 'Optimizing AOT deployments (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/optimizing
+  - title: 'ILCompiler: TypePreinit.cs (Vorinitialisierung statischer Konstruktoren, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/tools/aot/ILCompiler.Compiler/Compiler/TypePreinit.cs
+  - title: 'Rd.xml File Format (dotnet/runtime, nur für interne Zwecke)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/nativeaot/docs/rd-xml-format.md
+  - title: 'Performance Improvements in .NET 8 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './native-aot.steps';
+import contentScript from './native-aot-inhalt.steps';
+import checkScript from './native-aot-check.steps';
+import { aotCompareCode, aotSizeCode } from './native-aot-verify';
+
+<Block n={1} title="Das Problem">
+
+Selbst mit ReadyToRun bleibt eine .NET-App ein Gespann aus vielen Teilen: ein Host, der die passende Runtime sucht, die Runtime selbst, ein JIT, der Framework mit seinen Assemblies und schließlich deine App als IL. Beim Start lädt der Typlader Metadaten und baut daraus MethodTables, der JIT übersetzt, was nicht vorkompiliert ist, und statische Konstruktoren laufen beim ersten Gebrauch. Die Lektion „Vom Prozessstart bis Main“ zeigt diese Kette im Detail.
+
+Für einen Dienst, der wochenlang läuft, ist das kein Problem. Die Startkosten fallen einmal an, danach optimiert Tiered Compilation den heißen Code besser, als es ein Compiler vorab könnte. Es gibt aber Umgebungen, in denen genau diese Startkosten zählen: Funktionen in der Cloud, die pro Anfrage gestartet werden, Kommandozeilenwerkzeuge, die nach einer halben Sekunde fertig sind, Container, von denen Hunderte Kopien laufen und bei denen jedes Megabyte Speicher Geld kostet. Dazu kommen Plattformen, auf denen ein JIT gar nicht erlaubt ist, weil das Betriebssystem keinen ausführbaren Speicher zur Laufzeit hergibt.
+
+Für diese Fälle gibt es **Native AOT**: Beim Veröffentlichen wird das gesamte Programm, deine App, die benutzten Teile des Frameworks und eine schlanke Runtime, in eine einzige native Programmdatei übersetzt. Zur Laufzeit gibt es keinen JIT, keinen Host und keine IL-Dateien mehr. Das klingt nach einem reinen Gewinn. Es ist aber ein Tausch, und diese Lektion zeigt, was du dafür hergibst.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Der Kern von Native AOT ist eine **Annahme über die Welt**: Das Programm ist beim Veröffentlichen vollständig bekannt. Kein Code kommt später dazu, keine Assembly wird nachgeladen, kein IL wird zur Laufzeit erzeugt. Unter dieser Annahme kann der Compiler vom Einstiegspunkt aus alles finden, was je laufen wird, und genau das übersetzen. Alles andere lässt er weg.
+
+Aus dieser einen Annahme folgt fast alles in dieser Lektion:
+
+1. **Was der Compiler nicht sieht, existiert nicht.** Typen und Methoden, die nur über einen Namen in einem String erreichbar sind, landen nicht im Programm.
+2. **Was der Compiler sieht, kann er vorab erledigen.** MethodTables, viele statische Konstruktoren und generische Instanziierungen berechnet er beim Veröffentlichen statt beim Start.
+3. **Was erst zur Laufzeit entsteht, geht nicht.** Ohne JIT kann kein neuer Maschinencode entstehen, also auch keine neue Struct-Instanziierung und kein `Reflection.Emit`.
+
+<Callout kind="fehlannahme">
+  „Native AOT macht jede App schneller.“ Native AOT macht vor allem den **Start** schneller und den
+  Speicherbedarf kleiner. Beim Durchsatz im Dauerbetrieb fehlen ihm Tier 1 mit Dynamic PGO und das
+  Wissen über die konkrete CPU. Ein langlaufender Dienst kann mit JIT genauso schnell oder schneller
+  sein. Native AOT ist eine Entscheidung für Start und Größe, nicht für Spitzenleistung.
+</Callout>
+
+Grenze Native AOT von zwei Dingen ab, mit denen es oft verwechselt wird. **Self-contained** kopiert Runtime und Framework in den App-Ordner, das Ausführungsmodell mit IL und JIT bleibt, wie die Lektion „Die Bausteine von .NET“ beschreibt. **ReadyToRun** legt vorkompilierten Code neben das IL und behält den JIT als Rückfallebene, siehe „ReadyToRun und Crossgen“. Native AOT dagegen hat keine Rückfallebene.
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Du schaltest Native AOT mit einer Eigenschaft in der Projektdatei ein und veröffentlichst für eine Ziel-RID:
+
+```xml
+<PropertyGroup>
+  <PublishAot>true</PublishAot>
+</PropertyGroup>
+```
+
+Beim `dotnet publish -r linux-x64` läuft dann statt crossgen2 der Native-AOT-Compiler, im Repository **ILCompiler** genannt. Verfolge, wie er von `Main` aus das Programm erkundet.
+
+<StepPlayer script={script} />
+
+Der Compiler arbeitet wie ein sehr gründlicher Leser, der nur Verweisen folgt, die im Code stehen. Jeder Aufruf, jedes `new`, jedes `typeof` und jeder Feldzugriff ist so ein Verweis. Ein String, der zufällig wie ein Typname aussieht, ist keiner. Dieser Schritt heißt **Trimming**, und Native AOT setzt ihn immer voraus. Was dabei im Detail behalten wird und wie du es steuerst, beschreibt die Lektion „Trimming und Reflection“.
+
+{/* TODO(verify): The SDK option PublishAot makes the build use ILCompiler (package Microsoft.DotNet.ILCompiler / runtime.<rid>.Microsoft.DotNet.ILCompiler) and the platform linker (link.exe or clang) for the final executable. */}
+
+</Block>
+
+<Block n={4} title="Was in der Programmdatei steckt">
+
+Native AOT übersetzt nicht nur Methoden. Der Compiler erzeugt auch alle Datenstrukturen, die eine JIT-Runtime zur Laufzeit aus Metadaten aufbaut. Die folgende Gegenüberstellung zeigt, was eine framework-abhängige JIT-App beim Start zusammensucht und was in der Native-AOT-Programmdatei schon fertig liegt.
+
+<StepPlayer script={contentScript} />
+
+### Eine schlanke Runtime
+
+Laut Microsoft Learn enthält die Programmdatei eine abgespeckte Version der CoreCLR-Runtime. Sie hat einen Garbage Collector, Thread-Verwaltung, Ausnahmebehandlung und Stack Walking, also alles, was verwalteter Code zur Ausführung braucht. Was fehlt, ist alles, was Code erzeugt oder aus Metadaten Typen baut. Den Code dieser Runtime findest du im Repository unter `src/coreclr/nativeaot/`, wie in „Orientierung im dotnet/runtime-Repo“ beschrieben.
+
+{/* TODO(verify): Native AOT uses the same GC implementation as CoreCLR (src/coreclr/gc) linked statically into the executable. */}
+
+### Vorab berechnet statt beim Start gebaut
+
+Bei einer JIT-App baut der Typlader jede MethodTable beim ersten Gebrauch aus den Metadaten zusammen. Bei Native AOT kennt der Compiler alle Typen, die vorkommen können, und legt ihre MethodTables als fertige Daten in die Datei. Der Code verweist direkt darauf.
+
+Noch weiter geht die **Vorinitialisierung**. Der Compiler enthält einen Interpreter, der statische Konstruktoren beim Veröffentlichen ausführt, wenn sie nur mit Werten arbeiten, die er nachvollziehen kann. Das Ergebnis, etwa ein Array mit Konstanten oder eine kleine Nachschlagetabelle, legt er als **eingefrorenes Objekt** in die Datei. Zur Laufzeit läuft der statische Konstruktor dann gar nicht mehr. Greift ein Konstruktor auf etwas zu, das erst zur Laufzeit feststeht, etwa eine Umgebungsvariable, verzichtet der Compiler darauf und der Konstruktor läuft wie gewohnt.
+
+{/* TODO(verify): Preinitialization rules in TypePreinit.cs (which IL opcodes and calls are supported, fallback to runtime cctor when interpretation fails) and that frozen objects live outside the GC heap. */}
+
+### Generics: alles im Voraus
+
+Bei JIT entsteht Code für `List<Point>` erst, wenn jemand ihn braucht. Bei Native AOT muss jede Instanziierung mit einem Struct als Typargument beim Veröffentlichen erzeugt werden, für Referenztypen teilen sich die Instanziierungen wie beim JIT gemeinsamen Code, siehe „Generics zur Laufzeit“. Microsoft Learn weist auf zwei Folgen hin: Viele Struct-Instanziierungen machen die Datei spürbar größer. Und generische virtuelle Methoden brauchen eine Instanziierung für jeden Typ, der sie implementiert oder überschreibt, weil der Compiler nicht weiß, welche Implementierung zur Laufzeit gerufen wird.
+
+### Größe gegen Geschwindigkeit
+
+Der Compiler wählt standardmäßig einen Mittelweg: schneller Code, aber mit Blick auf die Dateigröße. Mit `OptimizationPreference` kannst du ihn zu `Size` oder `Speed` verschieben. Außerdem zielt er standardmäßig auf den kleinsten Befehlssatz, den die Plattform garantiert. Mit `IlcInstructionSet` kannst du neuere Befehlssätze wie AVX2 voraussetzen, dann läuft die Datei aber nur noch auf Prozessoren, die sie haben. Ein JIT würde das zur Laufzeit selbst prüfen.
+
+</Block>
+
+<Block n={5} title="Reflection, Warnungen und Source Generators">
+
+Reflection ist unter Native AOT nicht verboten. `typeof(Order).GetProperties()` funktioniert, weil der Compiler den Typ sieht und behält, was die Methode braucht. Probleme gibt es dort, wo der Compiler nicht sehen kann, worauf sich Reflection bezieht. Für diese Stellen gibt das SDK **Warnungen** aus, und zwar schon beim Bauen, sobald `PublishAot` gesetzt ist.
+
+Nimm diese Warnungen ernst. Microsoft Learn beschreibt sie als Hinweise auf mögliche Laufzeitfehler: Eine App mit AOT-Warnungen kann sich nach dem Veröffentlichen anders verhalten oder abstürzen. Eine Warnung ist also ein Fehler, der nur noch auf seinen Auftritt wartet. Zwei Familien sind wichtig:
+
+- **Trimming-Warnungen** (IL2xxx) melden Reflection, deren Ziel der Compiler nicht kennt, etwa `Type.GetType` mit einem berechneten Namen. Ursache und Abhilfe mit Attributen wie `DynamicallyAccessedMembers` oder `DynamicDependency` erklärt „Trimming und Reflection“.
+- **AOT-Warnungen** (IL3xxx) melden Code, der zur Laufzeit neuen Maschinencode bräuchte. Die häufigste ist **IL3050** für Methoden mit dem Attribut `RequiresDynamicCode`, darunter `MakeGenericType`, `MakeGenericMethod` und `Reflection.Emit`.
+
+Für `RequiresDynamicCode` gibt es laut Microsoft Learn wenig Auswege. Die beste Lösung ist, die Methode unter Native AOT nicht aufzurufen. Wer sicher ist, dass ein Pfad unter AOT nie erreicht wird, kann mit `RuntimeFeature.IsDynamicCodeSupported` verzweigen und die Warnung mit `UnconditionalSuppressMessage` und einer Begründung unterdrücken. Ein einfaches `#pragma` reicht nicht, weil der Compiler beim Veröffentlichen keine Quelltextdirektiven sieht.
+
+{/* TODO(verify): Warning ranges (IL2xxx trimming, IL3xxx AOT and single-file) and that analyzers run during build when PublishAot is set (Microsoft Learn says PublishAot "enables dynamic code-usage analysis during build and editing"). */}
+
+### Was ist mit rd.xml?
+
+In älteren Anleitungen findest du `rd.xml`-Dateien, mit denen man dem Compiler Typen nennen konnte. Die Dokumentation im Repository bezeichnet dieses Format ausdrücklich als intern und nicht unterstützt. Für eigenen Code sind die Attribute aus „Trimming und Reflection“ der richtige Weg.
+
+### Source Generators statt Reflection
+
+Der eigentliche Ausweg ist, Reflection zur Laufzeit durch Code zu ersetzen, der beim Kompilieren entsteht. Genau dafür hat das .NET-Team in den letzten Versionen mehrere Source Generators gebaut:
+
+| Bereich | mit Reflection | AOT-tauglich |
+| --- | --- | --- |
+| JSON | `JsonSerializer.Serialize(obj)` | `JsonSerializerContext` mit `[JsonSerializable]` |
+| Konfiguration | `config.Bind(options)` | Binding-Generator (`EnableConfigurationBindingGenerator`) |
+| Reguläre Ausdrücke | `RegexOptions.Compiled` erzeugt IL | `[GeneratedRegex]` erzeugt C# |
+| Logging | Formatierung zur Laufzeit | `[LoggerMessage]` |
+| Interop | Marshalling-Stubs zur Laufzeit | `[LibraryImport]`, siehe „LibraryImport“ |
+
+{/* TODO(verify): System.Text.Json disables reflection-based serialization by default for PublishAot apps (.NET 8+, JsonSerializerIsReflectionEnabledByDefault); EnableConfigurationBindingGenerator is enabled automatically with PublishAot; RegexOptions.Compiled falls back to the interpreter when dynamic code is not supported. */}
+
+Auch `System.Linq.Expressions` funktioniert, aber laut Microsoft Learn immer in der interpretierten Form. `Expression.Compile()` liefert dann einen Delegate, der den Ausdrucksbaum interpretiert, statt echten Maschinencode. Das ist korrekt, aber langsamer.
+
+Für Bibliotheken gibt es die Eigenschaft `IsAotCompatible`. Sie schaltet die Analyzer für Trimming, Single-File und AOT ein, damit der Autor die Warnungen sieht, bevor seine Nutzer sie sehen.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+Die meisten Probleme mit Native AOT lassen sich auf eine Frage zurückführen: Braucht dieser Code etwas, das erst zur Laufzeit entsteht? Spiel die fünf typischen Fälle durch.
+
+<StepPlayer script={checkScript} />
+
+### Es läuft mit F5, aber nicht veröffentlicht
+
+`dotnet run`, der Debugger in der IDE und `dotnet test` verwenden laut Microsoft Learn die normale Runtime mit JIT, auch wenn `PublishAot` gesetzt ist. Erst `dotnet publish` erzeugt das Native-AOT-Programm. Ein Fehler wie das fehlende `Report` aus dem Durchspielen zeigt sich deshalb erst im veröffentlichten Programm. Teste das veröffentlichte Programm, nicht nur das Projekt in der IDE.
+
+### Bibliotheken mit Warnungen
+
+Viele Warnungen stammen nicht aus deinem Code, sondern aus NuGet-Paketen, die Reflection nutzen, etwa ältere Serialisierer, ORMs oder Mapper. Eine Bibliothek, die nicht für Native AOT vorbereitet ist, kann im veröffentlichten Programm scheitern, obwohl dein eigener Code sauber ist. Microsoft Learn nennt zudem Teile der Runtime-Bibliotheken, deren Warnungen du nicht selbst beheben kannst.
+
+### Keine Übersetzung für fremde Betriebssysteme
+
+Native AOT linkt am Ende mit den Werkzeugen der Plattform, unter Windows mit den C++-Werkzeugen von Visual Studio, unter Linux mit `clang`. Deshalb kannst du laut Microsoft Learn nicht von Windows für Linux übersetzen oder umgekehrt, nur zwischen x64 und Arm64 auf demselben Betriebssystem. Unter Linux läuft ein Programm außerdem nur auf derselben oder einer neueren Distribution als der, auf der es gebaut wurde. In der Praxis baut man deshalb in einem Container mit dem ältesten unterstützten System.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+| Szenario | Native AOT? | Grund |
+| --- | --- | --- |
+| Kommandozeilenwerkzeug | ja | Start dominiert die Laufzeit, eine Datei ohne Installation |
+| Cloud-Funktion, Scale-to-Zero | ja | kurze Kaltstarts, wenig Speicher pro Instanz |
+| Microservice mit Minimal APIs | oft | kleiner, schneller Start, sofern alle Bibliotheken mitspielen |
+| langlaufender Dienst mit hoher Last | prüfen | JIT mit Dynamic PGO kann im Durchsatz vorne liegen |
+| App mit Plugins | nein | kein Nachladen von Assemblies |
+| App mit MVC oder viel Reflection | eher nein | nicht alle ASP.NET-Core-Features sind unterstützt |
+
+{/* TODO(verify): ASP.NET Core Native AOT support matrix (Minimal APIs and gRPC supported, MVC and Blazor Server not supported) per Microsoft Learn "ASP.NET Core support for Native AOT". */}
+
+Microsoft Learn nennt als Hauptnutzen den Einsatz mit vielen Instanzen, etwa in Cloud-Infrastruktur, weil sich dort kleinere Programme und schnellerer Start vervielfachen. Für die Abwägung gegen ReadyToRun und JIT lies „Startzeit gegen Spitzenleistung“.
+
+### Diagnose
+
+Ein veröffentlichtes Native-AOT-Programm ist ein echtes natives Programm. Der verwaltete Debugger funktioniert dort nicht, wohl aber native Debugger wie WinDbg, Visual Studio, `gdb` oder `lldb`. Der Compiler erzeugt Zeilennummern und Informationen über lokale Variablen. Sie liegen in einer eigenen Symboldatei, unter Linux `.dbg`, unter Windows `.pdb`, unter macOS ein `.dSYM`-Ordner. Bewahre diese Datei zu jeder ausgelieferten Version auf, ohne sie sind Abstürze kaum auszuwerten.
+
+EventPipe und damit `dotnet-trace` und `dotnet-counters` funktionieren seit .NET 8, aber nur, wenn du `EventSourceSupport` einschaltest. Heap-Analysen mit `dotnet-gcdump` werden laut Microsoft Learn nicht unterstützt. Die Faustregel lautet daher: Entwickle und debugge mit der normalen Runtime, veröffentliche als Native AOT erst, wenn das Programm funktioniert, und teste dann das veröffentlichte Ergebnis.
+
+</Block>
+
+<Block n={8} title="Was Runtime und Compiler dazu tun">
+
+Der Native-AOT-Compiler nutzt für die Übersetzung einzelner Methoden denselben JIT wie die Runtime und crossgen2. Der Unterschied liegt wieder in den Antworten auf die Fragen des JIT. Weil der Compiler das ganze Programm kennt, kann er Dinge beweisen, die weder der JIT zur Laufzeit noch crossgen2 wissen: Hat eine virtuelle Methode im ganzen Programm keine Überschreibung, kann er den Aufruf direkt machen, siehe „Devirtualisierung“. Und weil alles in einer einzigen Einheit übersetzt wird, gibt es keine Version Bubble, Einbetten über Assembly-Grenzen ist erlaubt.
+
+Dafür fehlt, was nur der Prozess weiß: Profildaten aus der echten Last, die konkrete CPU und die Möglichkeit, eine heiße Methode ein zweites Mal besser zu übersetzen. Was der Compiler beim Veröffentlichen entscheidet, gilt für die gesamte Lebenszeit des Programms.
+
+{/* TODO(verify): ILCompiler uses RyuJIT through the JIT-EE interface (same clrjit sources as crossgen2), whole-program devirtualization of methods without overrides, and no Dynamic PGO; whether static PGO (.mibc) can be fed to ILCompiler for apps. */}
+
+<Callout kind="version">
+  Native AOT gibt es offiziell seit .NET 7 für Konsolen-Apps unter Windows und Linux. .NET 8 brachte
+  Unterstützung für ASP.NET Core, macOS und EventPipe. Seit .NET 9 werden zusätzlich Windows x86
+  und Linux Arm unterstützt. Mit .NET 10 schreiben Bibliotheken mit `IsAotCompatible` diese
+  Eigenschaft als Metadaten in die Assembly, sodass Apps mit `VerifyReferenceAotCompatibility`
+  ihre Abhängigkeiten prüfen lassen können.
+</Callout>
+
+{/* TODO(verify): Native AOT officially supported since .NET 7 for console apps (Windows, Linux); macOS since .NET 8 (Microsoft Learn prerequisites: "Supported on .NET 8 and later versions"); .NET 9+ platform table adds Windows x86 and Linux Arm; IsAotCompatible assembly metadata since .NET 10. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+### Dasselbe Programm, zwei Welten
+
+Das folgende Programm misst die Zeit bis `Main`, fragt die Runtime, ob sie Code erzeugen kann, und sucht einen Typ über seinen Namen. Starte es einmal mit `dotnet run` und einmal als veröffentlichtes Native-AOT-Programm, jeweils mit dem Argument `Report`.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht, SharpLab erzeugt keine Native-AOT-Programme. Unter Windows brauchst du die C++-Werkzeuge von Visual Studio, unter Linux clang. Lege das Projekt mit dotnet new console --aot an und folge den Schritten im Kommentar."
+  code={aotCompareCode}
+/>
+
+Erwartetes Ergebnis: Beim Veröffentlichen meldet der Compiler eine Warnung an der Zeile mit `Type.GetType`. Mit `dotnet run` meldet das Programm „Dynamischer Code: True“ und findet `Report`. Das Native-AOT-Programm meldet „False“, liefert für `Report` den Wert `null`, braucht deutlich weniger Zeit bis `Main` und hat einen kleineren Working Set.
+
+{/* TODO(verify): Run on .NET 8/9/10 (Linux x64): warning number at Type.GetType, time to Main and working set for both variants; do not quote numbers before measuring. */}
+
+### In die Datei schauen
+
+Im Veröffentlichungsordner liegen statt vieler DLLs nur die Programmdatei und ihre Symboldatei. Wenn du wissen willst, welche Typen und Methoden wie viel Platz belegen, lässt du den Compiler eine `.mstat`-Datei erzeugen. Sie ist selbst eine Assembly mit Größenangaben und lässt sich mit Werkzeugen wie ILSpy öffnen.
+
+<VerifyCard code={aotSizeCode} />
+
+{/* TODO(verify): IlcGenerateMstatFile is described in src/coreclr/nativeaot/docs/troubleshooting.md as unsupported compiler option; the option name may change. */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="native-aot"
+  questions={[
+    {
+      q: 'Worin unterscheidet sich Native AOT grundsätzlich von ReadyToRun?',
+      options: [
+        'Native AOT erzeugt schnelleren Maschinencode',
+        'Native AOT hat zur Laufzeit keinen JIT und kein IL als Rückfallebene, ReadyToRun schon',
+        'ReadyToRun funktioniert nur für das Framework',
+      ],
+      correct: 1,
+      explanation:
+        'ReadyToRun legt Code neben das IL und behält den JIT. Native AOT übersetzt alles vorab, im Programm gibt es weder IL noch JIT.',
+    },
+    {
+      q: 'Eine Klasse Report wird im Programm nur über Type.GetType(name) mit einem Namen aus der Konfiguration erreicht. Was passiert unter Native AOT?',
+      options: [
+        'Der Compiler findet die Klasse über den String und behält sie',
+        'Die Klasse fehlt im Programm, beim Veröffentlichen gibt es eine Warnung, zur Laufzeit liefert GetType null',
+        'Der Typ wird zur Laufzeit aus der DLL nachgeladen',
+      ],
+      correct: 1,
+      explanation:
+        'Der Compiler folgt nur Verweisen im Code. Einen berechneten Namen kann er nicht auflösen, er warnt und lässt den Typ weg.',
+    },
+    {
+      q: 'Warum ist typeof(List<>).MakeGenericType(typeof(Point)) mit einem Struct Point problematisch?',
+      options: [
+        'Weil Reflection unter Native AOT verboten ist',
+        'Weil List<Point> eigenen Maschinencode braucht, der zur Laufzeit nicht mehr entstehen kann',
+        'Weil Structs unter Native AOT nicht unterstützt werden',
+      ],
+      correct: 1,
+      explanation:
+        'Struct-Instanziierungen brauchen eigenen Code. Wurde List<Point> nicht beim Veröffentlichen erzeugt, scheitert der Aufruf. Deshalb warnt der Compiler mit IL3050.',
+    },
+    {
+      q: 'Ein langlaufender Webdienst mit hoher Last wird auf Native AOT umgestellt. Was ist die realistische Erwartung?',
+      options: [
+        'Deutlich höherer Durchsatz, weil kein JIT mehr läuft',
+        'Schnellerer Start und weniger Speicher, beim Durchsatz eher gleich oder etwas schwächer als JIT mit Dynamic PGO',
+        'Gar kein Unterschied',
+      ],
+      correct: 1,
+      explanation:
+        'Native AOT spart JIT-Arbeit beim Start und Speicher. Ohne Tier 1 und Dynamic PGO fehlen aber Optimierungen, die nur mit Laufzeitwissen möglich sind.',
+    },
+    {
+      q: 'Was macht der Compiler mit einem statischen Konstruktor, der nur ein Array mit Konstanten füllt?',
+      options: [
+        'Er führt ihn beim Veröffentlichen aus und legt das fertige Array in die Programmdatei',
+        'Er entfernt ihn, das Array bleibt leer',
+        'Er übersetzt ihn wie jeden anderen Konstruktor, der beim ersten Zugriff läuft',
+      ],
+      correct: 0,
+      explanation:
+        'Diese Vorinitialisierung spart Arbeit beim Start. Kann der Compiler einen Konstruktor nicht vollständig nachvollziehen, läuft er wie gewohnt zur Laufzeit.',
+    },
+    {
+      q: 'Dein Projekt hat PublishAot gesetzt und läuft mit dotnet run fehlerfrei. Was ist damit bewiesen?',
+      options: [
+        'Dass auch das veröffentlichte Programm funktioniert',
+        'Wenig: dotnet run verwendet die normale Runtime mit JIT, Fehler durch fehlende Typen zeigen sich erst im veröffentlichten Programm',
+        'Dass keine Trimming-Warnungen existieren',
+      ],
+      correct: 1,
+      explanation:
+        'Erst dotnet publish erzeugt das Native-AOT-Programm. Teste immer das veröffentlichte Ergebnis und nimm jede Warnung ernst.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- **Native AOT** übersetzt beim Veröffentlichen das ganze Programm samt benutzter Framework-Teile und einer schlanken Runtime in eine native Programmdatei. Zur Laufzeit gibt es weder JIT noch IL noch Host.
+- Der Compiler beginnt bei `Main` und folgt allen Verweisen im Code. **Was er nicht sieht, fehlt im Programm**, typischerweise Typen, die nur über einen Namen erreicht werden.
+- Vieles wird **vorab berechnet**: MethodTables als Daten, Struct-Instanziierungen von Generics und viele statische Konstruktoren als eingefrorene Objekte.
+- Nicht möglich sind Codeerzeugung zur Laufzeit (`Reflection.Emit`), das Nachladen von Assemblies und neue Struct-Instanziierungen über `MakeGenericType`.
+- **Warnungen beim Veröffentlichen sind Fehler, die warten.** Source Generators für JSON, Konfiguration, Regex, Logging und Interop ersetzen Reflection durch Code, der beim Kompilieren entsteht.
+- Native AOT gewinnt bei **Start und Speicher**, nicht automatisch beim Durchsatz: Ohne Tier 1 und Dynamic PGO kann JIT im Dauerbetrieb gleichziehen oder vorbeiziehen.
+- Debuggen geht nur mit nativen Werkzeugen und der Symboldatei. Entwickle mit der normalen Runtime und teste das veröffentlichte Programm.
+
+</Block>

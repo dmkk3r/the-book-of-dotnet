@@ -1000,6 +1000,48 @@
       "aliases": [],
       "definition": "Von Dynamic PGO gesammelte Statistik, welche Typen an einer virtuellen oder Interface-Aufrufstelle tatsächlich vorkommen. Grundlage für Guarded Devirtualization.",
       "lesson": "pgo"
+    },
+    {
+      "id": "crossgen2",
+      "term": "crossgen2",
+      "aliases": ["Crossgen"],
+      "definition": "Werkzeug, das beim Veröffentlichen ReadyToRun-Code erzeugt: Es übersetzt IL vorab in Maschinencode und legt ihn zusätzlich zum IL in die Assembly.",
+      "lesson": "readytorun"
+    },
+    {
+      "id": "version-bubble",
+      "term": "Version Bubble",
+      "aliases": [],
+      "definition": "Gruppe von Assemblies, die ReadyToRun gemeinsam übersetzt. Nur innerhalb dieser Gruppe darf vorab übersetzter Code über Assembly-Grenzen hinweg inlinen, weil sich die Assemblies nicht unabhängig voneinander ändern.",
+      "lesson": "readytorun"
+    },
+    {
+      "id": "trimming",
+      "term": "Trimming",
+      "aliases": [],
+      "definition": "Entfernen von Code, der von den Einstiegspunkten aus nicht erreichbar ist, beim Veröffentlichen (Werkzeug ILLink). Code, der nur per Reflection erreicht wird, kann dabei verloren gehen.",
+      "lesson": "trimming"
+    },
+    {
+      "id": "illink",
+      "term": "ILLink",
+      "aliases": [],
+      "definition": "Das Werkzeug des SDK, das beim Trimming die Erreichbarkeit analysiert, nicht benötigten IL-Code entfernt und Trim-Warnungen meldet.",
+      "lesson": "trimming"
+    },
+    {
+      "id": "vorinitialisierung",
+      "term": "Vorinitialisierung",
+      "aliases": ["Preinitialization"],
+      "definition": "Native AOT führt geeignete statische Konstruktoren schon beim Kompilieren aus und legt ihr Ergebnis als fertige Daten in die ausführbare Datei.",
+      "lesson": "native-aot"
+    },
+    {
+      "id": "working-set",
+      "term": "Working Set",
+      "aliases": [],
+      "definition": "Der Teil des Prozessspeichers, der gerade im physischen Arbeitsspeicher liegt. Gängiges Maß für den Speicherbedarf einer laufenden App.",
+      "lesson": "start-vs-durchsatz"
     }
   ]
 }

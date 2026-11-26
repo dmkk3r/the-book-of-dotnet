@@ -1,0 +1,339 @@
+---
+id: start-vs-durchsatz
+title: Startzeit gegen Spitzenleistung
+summary: Warum es keinen Kompiliermodus gibt, der in allem gewinnt, woraus die Startzeit einer .NET-App besteht und wie du zwischen JIT, ReadyToRun und Native AOT entscheidest.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Laufzeitkonfiguration: Kompilierung (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/runtime-config/compilation
+  - title: 'ReadyToRun-Kompilierung (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/ready-to-run
+  - title: 'Native AOT deployment overview (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/
+  - title: 'ASP.NET Core support for Native AOT (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/aspnet/core/fundamentals/native-aot
+  - title: 'Tiered Compilation (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/tiered-compilation.md
+  - title: 'Performance Improvements in .NET 8 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+  - title: 'dotnet-counters (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-counters
+  - title: 'dotnet-trace (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-trace
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './start-vs-durchsatz.steps';
+import decisionScript from './start-vs-durchsatz-entscheidung.steps';
+import { startupCode, benchmarkCode } from './start-vs-durchsatz-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein Compiler kann Zeit auf zwei Arten sparen: indem er schnell fertig wird oder indem er schnellen Code erzeugt. Beides gleichzeitig geht nicht. Gute Optimierung braucht Analyse, und Analyse braucht Zeit. Beim JIT fällt diese Zeit in die Laufzeit deines Programms, also genau dann an, wenn ein Nutzer auf eine Antwort wartet.
+
+.NET hat deshalb nicht einen Kompiliermodus, sondern mehrere. Der JIT mit **Tiered Compilation** übersetzt zuerst schnell und später gut. **ReadyToRun** legt vorkompilierten Code in die Assemblies, behält aber den JIT. **Native AOT** übersetzt alles vorab und verzichtet zur Laufzeit ganz auf einen JIT. Dazu kommen Schalter, die einzelne Bausteine ein- oder ausschalten.
+
+Jede dieser Varianten verschiebt Arbeit: vom Start in den Hintergrund, von der Laufzeit in den Build, von der Maschine des Nutzers auf die Maschine, die veröffentlicht. Und jede bezahlt dafür mit etwas anderem: mit langsameren ersten Sekunden, mit größeren Dateien, mit weniger Wissen über das laufende Programm oder mit Einschränkungen im Programmiermodell.
+
+Diese Lektion bringt die Bausteine aus den vorigen Kapiteln zusammen und beantwortet die Frage, die am Ende zählt: Welche Variante passt zu welcher App, und wie findest du das für deine eigene heraus?
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Trenne zwei Größen, die im Alltag gern zu „Performance“ verschmelzen:
+
+1. **Startzeit:** die Zeit vom Prozessstart bis zur ersten nützlichen Arbeit, etwa der ersten beantworteten Anfrage. Sie wird von einmaligen Kosten bestimmt: Runtime aufbauen, Assemblies laden, Typen laden, Code übersetzen, App initialisieren.
+2. **Durchsatz im Dauerbetrieb:** wie viel Arbeit pro Sekunde erledigt wird, wenn alles geladen und aufgewärmt ist. Er hängt nur noch von der Qualität des Maschinencodes und vom Verhalten der App ab.
+
+Jede Variante setzt einen anderen Punkt auf dieser Achse. Je mehr vorab übersetzt wird, desto kürzer der Start. Je später übersetzt wird, desto mehr weiß der Compiler über das laufende Programm und die konkrete CPU, und desto besser kann der Code im Dauerbetrieb werden. Dazwischen liegt die **Aufwärmphase**, in der die App schon antwortet, aber noch nicht mit dem endgültigen Code.
+
+<Callout kind="fehlannahme">
+  „AOT ist immer schneller als JIT.“ Native AOT gewinnt fast immer beim Start und meist beim
+  Speicher. Im Dauerbetrieb dagegen kann ein JIT mit Dynamic PGO und Code für genau die CPU, auf der
+  er läuft, gleichauf liegen oder schneller sein. Welche Seite gewinnt, hängt von der App ab und
+  lässt sich nur messen.
+</Callout>
+
+{/* TODO(verify): Microsoft Learn (Native AOT / ASP.NET Core Native AOT) states that JIT can yield better steady-state throughput in some cases; find the exact wording before citing it. */}
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Dieselbe kleine Web-API, viermal gestartet. Jede Zeile zeigt, in welcher Phase sich die App über die Zeit befindet. Die Zeitachse ist abstrakt: Sie zeigt die Reihenfolge und wer früher wo ankommt, keine gemessenen Verhältnisse.
+
+<StepPlayer script={script} />
+
+Lies das Bild in zwei Richtungen. Senkrecht am Anfang siehst du, wer zuerst antwortet: Native AOT vor ReadyToRun vor dem JIT-Standard, und ganz hinten die Variante ohne Tiering. Senkrecht am Ende siehst du, mit welchem Code jede Variante dauerhaft läuft. Dort liegen JIT und ReadyToRun gleichauf, weil beide schließlich bei Tier 1 mit Profil ankommen.
+
+</Block>
+
+<Block n={4} title="Woraus die Startzeit besteht">
+
+„Startzeit“ ist keine einzelne Größe, sondern eine Summe. Den genauen Ablauf bis `Main` beschreibt die Lektion „Vom Prozessstart bis Main“, das Laden von Typen die Lektion „Wie ein Typ geladen wird“. Hier interessiert, welche Teile eine Kompiliervariante überhaupt beeinflussen kann.
+
+| Phase                        | JIT (Standard)               | ReadyToRun                 | Native AOT                      |
+| ---------------------------- | ---------------------------- | -------------------------- | ------------------------------- |
+| Host und Framework-Auflösung | `hostfxr`, JSON-Dateien      | wie JIT                    | entfällt, eine ausführbare Datei |
+| Runtime-Initialisierung      | GC, Threads, CoreLib         | wie JIT                    | kleinere Runtime, GC bleibt     |
+| Assemblies laden             | viele Dateien abbilden       | wie JIT, Dateien größer    | entfällt                        |
+| Typen laden                  | MethodTables zur Laufzeit    | wie JIT                    | großteils fertig im Image       |
+| Code übersetzen              | jede App-Methode beim 1. Aufruf | nur Reste                | nichts                          |
+| App-Initialisierung          | DI, Konfiguration, Caches    | gleich                     | gleich                          |
+
+{/* TODO(verify): Native AOT does not use hostfxr/hostpolicy; MethodTables and other runtime data structures are emitted by ILC into the image; ILC can preinitialize some static constructors at build time. */}
+
+Zwei Zeilen dieser Tabelle verdienen einen zweiten Blick.
+
+**„Nur Reste“ bei ReadyToRun:** R2R-Code deckt nicht alles ab. Generische Instanziierungen über Typen aus anderen Assemblies, Methoden, die der Vorab-Compiler ablehnt, und Code, den die Runtime aus Versionsgründen nicht verwenden darf, landen trotzdem beim JIT. Wie viel das ist, hängt von der App ab. Die Einzelheiten stehen in der Lektion „ReadyToRun und Crossgen“.
+
+{/* TODO(verify): Which methods R2R cannot precompile or the runtime rejects at load time (generic instantiations across version bubbles, some intrinsics, methods with explicit layout dependencies). */}
+
+**App-Initialisierung ist bei allen gleich:** Wenn deine App beim Start einen DI-Container mit Hunderten Registrierungen aufbaut, Konfigurationsdateien liest und Verbindungen öffnet, dann kostet das unabhängig vom Kompiliermodus. Native AOT macht diesen Code schneller lauffähig, aber nicht weniger. Wer beim Start eine Sekunde auf eine Datenbank wartet, gewinnt mit AOT wenige Millisekunden. Deshalb steht vor jeder Entscheidung die Messung, wohin die Zeit tatsächlich geht.
+
+### Die Startzeit messen
+
+Die ehrlichste Größe ist die **Zeit bis zur ersten Antwort**: von dem Moment, in dem der Prozess gestartet wird, bis eine Anfrage erfolgreich beantwortet ist. Sie lässt sich von außen messen, etwa mit einem Skript, das den Prozess startet und so lange anfragt, bis eine Antwort kommt.
+
+Von innen helfen drei Werkzeuge:
+
+- **`Process.StartTime`** liefert den Startzeitpunkt, den das Betriebssystem kennt. Die Differenz zur aktuellen Zeit in `Main` und nach der ersten Arbeit zeigt, wo die Zeit hingeht.
+- **`System.Runtime.JitInfo`** zählt übersetzte Methoden und die Zeit im JIT. Damit siehst du direkt, wie viel des Starts reine Übersetzung ist.
+- **`dotnet-counters`** und **`dotnet-trace`** zeigen JIT-Zähler, geladene Assemblies und den Working Set. `dotnet-trace` kann die App selbst starten und zeichnet dann ab der ersten Instruktion auf, inklusive der Ereignisse für Assembly-Laden und JIT.
+
+{/* TODO(verify): Counter names in System.Runtime (time-in-jit, methods-jitted-count, assembly-count, working-set) for .NET 8 and the renamed metrics in .NET 9; dotnet-trace collect -- <command> launches and traces from startup. */}
+
+Achte auf den Unterschied zwischen **Kaltstart** und **Warmstart**. Beim ersten Start nach einem Neustart der Maschine liest das Betriebssystem alle Dateien von der Platte. Beim zweiten Start liegen sie im Dateicache. Größere Dateien, wie sie ReadyToRun erzeugt, fallen beim Kaltstart stärker ins Gewicht.
+
+</Block>
+
+<Block n={5} title="Warum der JIT auf lange Sicht gewinnen kann">
+
+Vorkompilierter Code wird übersetzt, bevor das Programm läuft. Der JIT übersetzt heiße Methoden, nachdem das Programm eine Weile gelaufen ist. Dieser Zeitpunkt bringt ihm Wissen, das ein Vorab-Compiler grundsätzlich nicht hat.
+
+### Wissen über das Verhalten
+
+Mit **Dynamic PGO** misst eine instrumentierte Fassung, welche Zweige genommen werden und welche konkreten Typen an virtuellen Aufrufen ankommen. Tier 1 nutzt das für Guarded Devirtualization, für die Anordnung heißer und kalter Blöcke und für bessere Inlining-Entscheidungen. Die Lektion „Dynamic PGO“ zeigt das im Detail. Ein Vorab-Compiler kennt die Last nicht, die später in Produktion ankommt.
+
+### Wissen über die Maschine
+
+Der JIT läuft auf genau der CPU, auf der der Code ausgeführt wird. Er kann Befehlssätze wie AVX2 oder AVX-512 nutzen, wenn sie vorhanden sind. Vorkompilierter Code muss dagegen auf allen Maschinen laufen, für die veröffentlicht wurde, und zielt deshalb auf eine Grundmenge an Befehlssätzen. Wie `IsSupported` beim Übersetzen entschieden wird, erklärt die Lektion „Hardware-Intrinsics und SIMD“. Bei Native AOT kannst du beim Veröffentlichen höhere Befehlssätze verlangen, dann läuft die App aber nur noch auf CPUs, die sie haben.
+
+{/* TODO(verify): Default instruction set baseline for R2R and Native AOT on x64 in .NET 8 and 9, how R2R handles methods that depend on higher ISAs (rejected and rejitted?), and the IlcInstructionSet property for Native AOT. */}
+
+### Wissen über den Zustand
+
+Wenn Tier 1 eine Methode übersetzt, sind die meisten statischen Konstruktoren schon gelaufen. Ein `static readonly`-Feld hat dann einen festen Wert, den der JIT wie eine Konstante behandeln kann, samt aller Zweige, die davon abhängen. Ein Vorab-Compiler muss solche Werte zur Laufzeit lesen, und er muss Prüfungen einbauen, ob die Klasse schon initialisiert ist.
+
+{/* TODO(verify): Tier 1 treats initialized static readonly fields as constants, and R2R code needs class-initialization checks; compare with ILC preinitialization, which can remove some of these checks in Native AOT. */}
+
+### Was der Vorab-Compiler dafür hat
+
+Native AOT hat einen Vorteil, den der JIT nicht hat: Es sieht das **ganze Programm**. Weil zur Laufzeit kein neuer Code nachgeladen werden kann, weiß der Compiler zum Beispiel, ob eine Klasse überhaupt abgeleitete Klassen hat, und kann virtuelle Aufrufe darauf direkt machen. Außerdem fällt keine CPU-Zeit für Hintergrundübersetzung an, und es gibt keine instrumentierte Phase, in der der Code langsamer läuft. Wie diese Effekte gegeneinander stehen, entscheidet die konkrete App.
+
+{/* TODO(verify): ILC whole-program devirtualization for types without derived types (sealing analysis), and whether ILC uses static PGO data (.mibc) for framework code by default. */}
+
+### Tiering ausschalten ist kein Turbo
+
+Ein naheliegender Gedanke: Wenn Tier 0 langsam ist, schalte ich Tiering ab, dann wird alles sofort optimiert. Mit `TieredCompilation=false` passiert genau das, aber mit drei Nebenwirkungen. Erstens wird der Start langsamer, weil jede Methode beim ersten Aufruf die teure Optimierung durchläuft, auch Methoden, die nur einmal laufen. Zweitens fehlt Dynamic PGO, denn ohne Tiering gibt es keine instrumentierte Stufe. Drittens wird vorkompilierter R2R-Code des Frameworks nicht mehr durch Tier 1 ersetzt, er bleibt einfach so, wie er geladen wurde.
+
+{/* TODO(verify): With TieredCompilation disabled, R2R code is used and never rejitted (runtime-config compilation docs, tiered-compilation.md). */}
+
+</Block>
+
+<Block n={6} title="Speicher, Container und Serverless">
+
+Neben Zeit kostet der JIT auch Speicher. Der Compiler selbst ist eine native Bibliothek, die geladen werden muss. Er braucht beim Übersetzen eigene Datenstrukturen, und mit Tiering existieren von heißen Methoden mehrere Fassungen des Maschinencodes. Dazu kommen die Metadaten und die IL aller geladenen Assemblies. Native AOT spart den Compiler und die IL ganz und braucht weniger Laufzeitdaten. Deshalb haben AOT-Apps in der Regel einen kleineren **Working Set**.
+
+{/* TODO(verify): Code from earlier tiers is not freed after tier-up; Native AOT working set reductions as stated in the ASP.NET Core Native AOT docs. */}
+
+Bei einem einzelnen Dienst auf einem großen Server spielt das kaum eine Rolle. Es wird wichtig, wenn viele Instanzen dicht gepackt laufen:
+
+- **Container mit engen Limits:** Begrenzt ein Container die CPU auf einen Bruchteil eines Kerns, konkurriert die Hintergrundübersetzung von Tier 1 direkt mit den Anfragen. Die Aufwärmphase dauert dann länger, und die ersten Minuten nach einem Deployment sind spürbar langsamer.
+- **Automatische Skalierung:** Neue Instanzen entstehen genau dann, wenn die Last steigt. Eine Instanz, die eine halbe Minute zum Aufwärmen braucht, hilft in dieser Zeit wenig.
+- **Serverless und Scale to Zero:** Startet eine Funktion pro Aufruf oder nach Leerlauf kalt, ist die Startzeit die Antwortzeit. Tier 1 wird oft gar nicht erreicht.
+- **Kommandozeilenwerkzeuge:** Ein Werkzeug, das nach Sekundenbruchteilen fertig ist, läuft fast nur in vorkompiliertem Code und Tier 0.
+
+In allen vier Fällen verschiebt sich das Gewicht vom Dauerbetrieb zum Start, und ReadyToRun oder Native AOT werden attraktiv.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Mit dotnet run messen
+
+`dotnet run` baut das Projekt, bevor es startet, und läuft über den SDK-Host. Wer damit Startzeiten misst, misst den Build mit. Startzeiten gehören an die veröffentlichte App, im Release-Modus, so wie sie in Produktion gestartet wird.
+
+### Benchmarks zeigen nur eine Hälfte
+
+BenchmarkDotNet wärmt jede Methode auf, bis sich die Zeiten stabilisieren. Das ist richtig für den Dauerbetrieb, sagt aber nichts über die ersten Sekunden. Umgekehrt sagt eine Startzeitmessung nichts darüber, wie schnell die App nach zehn Minuten Last ist. Vergleiche zwischen JIT und AOT brauchen beide Messungen.
+
+### Entwicklerrechner gegen Produktion
+
+Der JIT nutzt, was die CPU kann. Hat der Entwicklerrechner AVX-512 und der Produktionsserver nicht, misst du lokal anderen Code als in Produktion. Bei Native AOT ist es umgekehrt: Der Code ist überall gleich, aber vielleicht nicht so gut, wie er auf der neueren CPU sein könnte.
+
+### AOT-Kompatibilität ist keine Kleinigkeit
+
+Native AOT setzt Trimming voraus und verbietet Code, der zur Laufzeit neuen Code erzeugt. Eine App mit Reflection über Strings, `Reflection.Emit` oder Plugins, die zur Laufzeit geladen werden, lässt sich nicht einfach umschalten. Was dabei bricht, zeigt die Lektion „Trimming und Reflection“.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die folgende Entscheidungshilfe fasst die Abwägung in drei Fragen zusammen. Sie ersetzt keine Messung, zeigt aber, welche Variante du zuerst ausprobieren solltest.
+
+<StepPlayer script={decisionScript} />
+
+Kompakt als Tabelle:
+
+| Variante              | Start          | Dauerbetrieb                     | Preis                                          |
+| --------------------- | -------------- | -------------------------------- | ---------------------------------------------- |
+| JIT (Standard)        | mittel         | sehr gut, mit Dynamic PGO        | Aufwärmphase, JIT kostet Speicher              |
+| ReadyToRun            | schneller      | wie JIT nach dem Aufwärmen       | größere Dateien, plattformspezifisch           |
+| Native AOT            | am schnellsten | gut, ohne PGO, fester Code       | Trimming, kein dynamischer Code, langer Build  |
+| Tiering aus           | langsamer      | optimiert, aber ohne PGO         | nur für Experimente und Sonderfälle            |
+| Tiering an, PGO aus   | wie Standard   | meist etwas schwächer            | nur zum Messen sinnvoll                        |
+
+{/* TODO(verify): The relative ratings in this table (start and steady state) for a typical ASP.NET Core app; prefer to replace with measured numbers from the .NET blog or own BenchmarkDotNet runs. */}
+
+Einige Regeln aus dieser Tabelle:
+
+- **Bleib beim Standard, bis eine Messung etwas anderes sagt.** Tiering mit Dynamic PGO ist für langlebige Dienste die beste Ausgangslage.
+- **ReadyToRun ist der risikoarme Startgewinn.** Am Code ändert sich nichts, im Dauerbetrieb übernimmt der JIT. Der Preis sind größere Dateien.
+- **Native AOT ist eine Architekturentscheidung,** keine Compileroption. Sie wirkt auf die Wahl der Bibliotheken, auf Serialisierung und auf alles, was Reflection nutzt.
+- **Tiering-Schalter sind Messwerkzeuge.** `DOTNET_TieredCompilation=0` und `DOTNET_TieredPGO=0` helfen zu verstehen, woher ein Effekt kommt. Als Dauereinstellung lohnen sie sich selten.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Runtime versucht, die Nachteile jeder Variante zu verkleinern. Für den JIT-Standard liegt das Framework als ReadyToRun-Code vor, sodass beim Start fast nur App-Code übersetzt werden muss. Die Aufrufzählung für Tier 1 beginnt erst nach einer kurzen Verzögerung, damit die Startphase nicht mit Neuübersetzungen belastet wird, und die Übersetzung selbst läuft im Hintergrund. Methoden mit langen Schleifen wechseln per On-Stack Replacement in optimierten Code. Die Lektion „Tiered Compilation und OSR“ beschreibt diese Mechanik.
+
+Für ReadyToRun-Code hat die Runtime einen eigenen Weg in Dynamic PGO: Heiße R2R-Methoden werden zuerst optimiert und instrumentiert übersetzt, damit die Messphase nicht langsamer ist als der vorkompilierte Code. Das Framework selbst wird mit statischen Profilen aus Trainingsläufen vorkompiliert.
+
+Für Native AOT gibt es eigene Stellschrauben. Mit `OptimizationPreference` wählst du, ob der Compiler auf Geschwindigkeit oder auf Größe optimiert, und mit einer Angabe des Befehlssatzes kannst du neuere CPUs voraussetzen. Was Native AOT sonst ausmacht, beschreibt die Lektion „Native AOT“.
+
+{/* TODO(verify): OptimizationPreference (Speed/Size) and IlcInstructionSet as documented Native AOT properties; framework compiled with static PGO (.mibc) by crossgen2. */}
+
+<Callout kind="version">
+  Tiered Compilation ist seit .NET Core 3.0 standardmäßig an, Dynamic PGO seit .NET 8. AVX-512
+  nutzt der JIT seit .NET 8. Native AOT gibt es für Konsolen-Apps seit .NET 7 und für ASP.NET Core
+  (mit Einschränkungen) seit .NET 8. Die Abwägung in dieser Lektion bezieht sich auf .NET 8 und
+  neuer, in älteren Versionen fällt der Vorsprung des JIT im Dauerbetrieb kleiner aus.
+</Callout>
+
+{/* TODO(verify): Version facts in the callout (TieredPGO default .NET 8, AVX-512 support .NET 8, Native AOT console .NET 7 and ASP.NET Core .NET 8). */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+### Den Start zerlegen
+
+Das erste Experiment misst, wie viel vom Start auf das Konto des JIT geht. Führe es in allen Varianten aus dem Kommentar aus und vergleiche die drei Zahlen jeder Zeile.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht. Lege mit dotnet new console ein Projekt an, ersetze Program.cs und starte die veröffentlichte App jeweils mehrmals, damit der Dateicache keine Rolle spielt."
+  code={startupCode}
+/>
+
+Erwartetes Ergebnis: Im JIT-Standard übersetzt der JIT schon bis `Main` einige Methoden, bis nach der LINQ-Arbeit deutlich mehr. Mit `DOTNET_ReadyToRun=0` steigen Zahl und Zeit stark an, weil jetzt auch das Framework übersetzt wird. Mit `DOTNET_TieredCompilation=0` ist die Anzahl ähnlich, die Zeit im JIT aber höher, weil jede Methode voll optimiert wird. Die ReadyToRun-Fassung zeigt weniger übersetzte Methoden, und unter Native AOT stehen beide JIT-Werte auf null.
+
+{/* TODO(verify): Run all five variants on .NET 8 and 9 and record method counts and times before stating any number; confirm the qualitative ordering described here. */}
+
+### Den Dauerbetrieb vergleichen
+
+Das zweite Experiment misst nur den aufgewärmten Zustand. Die Schleife ruft eine Interface-Methode auf, und 90 Prozent der Objekte haben denselben Typ: ein Fall, den Dynamic PGO mit Guarded Devirtualization gezielt beschleunigt.
+
+<VerifyCard
+  benchmark={benchmarkCode}
+  note="Erwartung: Der JIT-Standard ist am schnellsten oder gleichauf, ohne PGO und mit Tiering aus fällt der Vorteil der Devirtualisierung weg. Wo Native AOT landet, hängt davon ab, ob der Compiler den Aufruf aus der Gesamtsicht auflösen kann. Miss selbst, bevor du Schlüsse ziehst."
+/>
+
+{/* TODO(verify): Run the benchmark on .NET 8 x64 and record means for all four jobs; whether ILC devirtualizes IShape.Area here (two implementations, so probably not). */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="start-vs-durchsatz"
+  questions={[
+    {
+      q: 'Eine Web-API läuft wochenlang ohne Neustart. Welche Variante ist der sinnvolle Ausgangspunkt?',
+      options: ['Native AOT', 'JIT mit Tiering und Dynamic PGO', 'TieredCompilation ausschalten'],
+      correct: 1,
+      explanation:
+        'Fast die gesamte Laufzeit ist Dauerbetrieb. Dort spielt der JIT mit Profil und CPU-spezifischem Code seine Stärken aus, die Aufwärmphase fällt kaum ins Gewicht.',
+    },
+    {
+      q: 'Was passiert mit der Startzeit, wenn du TieredCompilation abschaltest?',
+      options: [
+        'Sie sinkt, weil sofort optimierter Code entsteht',
+        'Sie steigt, weil jede Methode beim ersten Aufruf voll optimiert übersetzt wird',
+      ],
+      correct: 1,
+      explanation:
+        'Volle Optimierung kostet mehr Übersetzungszeit, und das für jede Methode, auch für solche, die nur einmal laufen. Zusätzlich fehlt Dynamic PGO.',
+    },
+    {
+      q: 'Womit verbringt eine ReadyToRun-App im Dauerbetrieb ihre heißen Methoden?',
+      options: [
+        'Mit dem vorkompilierten R2R-Code',
+        'Mit Tier-1-Code, den der JIT neu übersetzt hat',
+      ],
+      correct: 1,
+      explanation:
+        'R2R-Code ist Startcode. Heiße Methoden werden wie Tier-0-Methoden erkannt und neu übersetzt, mit Dynamic PGO.',
+    },
+    {
+      q: 'Warum kann der JIT im Dauerbetrieb schnelleren Code erzeugen als ein Vorab-Compiler?',
+      options: [
+        'Weil er mehr Zeit zum Übersetzen hat',
+        'Weil er das tatsächliche Verhalten, die konkrete CPU und bereits initialisierte statische Werte kennt',
+      ],
+      correct: 1,
+      explanation:
+        'Der späte Zeitpunkt bringt Wissen: Profile aus Dynamic PGO, verfügbare Befehlssätze wie AVX-512 und feste Werte von static readonly-Feldern.',
+    },
+    {
+      q: 'Eine App baut beim Start einen großen DI-Container auf und wartet auf eine Datenbank. Was bringt Native AOT?',
+      options: [
+        'Die Wartezeit verschwindet',
+        'Es spart JIT und Laden, die App-Initialisierung selbst bleibt gleich teuer',
+      ],
+      correct: 1,
+      explanation:
+        'Native AOT entfernt Übersetzung und einen Teil der Ladearbeit. Was deine App beim Start tut, kostet weiterhin Zeit. Deshalb zuerst messen, wohin die Startzeit geht.',
+    },
+    {
+      q: 'Du misst die Startzeit mit dotnet run. Was ist das Problem?',
+      options: [
+        'dotnet run baut das Projekt und misst den Build mit',
+        'dotnet run schaltet Tiered Compilation ab',
+      ],
+      correct: 0,
+      explanation:
+        'dotnet run prüft und baut das Projekt vor dem Start. Startzeiten gehören an die veröffentlichte Release-App.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- **Startzeit** und **Durchsatz im Dauerbetrieb** sind verschiedene Größen. Jede Kompiliervariante tauscht die eine gegen die andere, dazwischen liegt die Aufwärmphase.
+- Die Startzeit setzt sich aus Host, Runtime-Initialisierung, Laden von Assemblies und Typen, JIT und App-Initialisierung zusammen. Kompiliervarianten beeinflussen nur einen Teil davon.
+- **ReadyToRun** verkürzt den Start und landet im Dauerbetrieb beim selben Tier 1 mit Dynamic PGO wie der JIT. Der Preis sind größere Dateien.
+- **Native AOT** startet am schnellsten und braucht meist weniger Speicher, hat aber kein Dynamic PGO, festen Code für eine Grundmenge an Befehlssätzen und verlangt trimmbaren Code ohne Laufzeit-Codeerzeugung.
+- Der JIT kann im Dauerbetrieb gewinnen, weil er Verhalten, CPU und Programmzustand kennt. „AOT ist immer schneller“ stimmt nur für den Start.
+- **Tiering ausschalten** macht den Start langsamer und nimmt Dynamic PGO weg. Die Schalter sind Messwerkzeuge, keine Optimierung.
+- Container mit engen Limits, automatische Skalierung, Serverless und CLI-Tools verschieben das Gewicht zum Start. Entscheide mit zwei Messungen: Zeit bis zur ersten Antwort und Durchsatz nach dem Aufwärmen.
+
+</Block>

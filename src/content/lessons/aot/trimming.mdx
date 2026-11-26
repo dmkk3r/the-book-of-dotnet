@@ -1,0 +1,393 @@
+---
+id: trimming
+title: Trimming und Reflection
+summary: Wie ILLink beim Veröffentlichen alles entfernt, was von Main aus nicht erreichbar ist, warum Reflection diese Analyse aushebelt und wie Annotationen, Warnungen und Source Generators die Lücke schließen.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Trim self-contained deployments and executables (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/trim-self-contained
+  - title: 'Trimming options (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/trimming-options
+  - title: 'Introduction to trim warnings (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/trim-warnings
+  - title: 'Fixing trim warnings (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/fixing-warnings
+  - title: 'Prepare .NET libraries for trimming (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/prepare-libraries-for-trimming
+  - title: 'Trimming incompatibilities (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/incompatibilities
+  - title: 'ILLink: Quellcode und Dokumentation im dotnet/runtime-Repo'
+    url: https://github.com/dotnet/runtime/tree/main/src/tools/illink
+  - title: 'Source generation in System.Text.Json (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/source-generation
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './trimming.steps';
+import annotationsScript from './trimming-annotations.steps';
+import { trimDemoCode } from './trimming-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine self-contained App bringt ihr eigenes .NET mit. Das ist bequem, denn auf dem Zielsystem muss nichts installiert sein, aber es ist auch schwer: Die komplette Klassenbibliothek liegt im Ausgabeordner, mit XML-Parsern, Kryptografie, Netzwerkprotokollen und Tausenden Typen, die deine App nie anfasst. Eine Kommandozeilen-App, die drei Zeilen ausgibt, schleppt so viele Megabyte Framework mit.
+
+Die naheliegende Idee: Beim Veröffentlichen einfach alles weglassen, was nicht gebraucht wird. Genau das tut **Trimming**. Ein Werkzeug namens **ILLink** liest die IL aller Assemblies der App, findet heraus, welche Typen, Methoden und Felder tatsächlich verwendet werden, und schreibt gekürzte Assemblies ohne den Rest. Für Native AOT ist dieser Schritt sogar Pflicht, mehr dazu in der Lektion „Native AOT“.
+
+Der Haken steckt im Wort „verwendet“. ILLink entscheidet beim Build, also ohne das Programm laufen zu lassen. Es sieht nur, was in der IL steht. .NET hat aber eine Eigenschaft, die genau diese Sicht unterläuft: **Reflection**. Mit `Type.GetType("Audit")` wird aus einem String zur Laufzeit ein Typ. Welcher String das ist, kann aus einer Konfigurationsdatei, einer Datenbank oder der Kommandozeile kommen. Für ILLink ist das ein toter Winkel, und was im toten Winkel liegt, wird entfernt.
+
+Diese Lektion zeigt, wie die Analyse arbeitet, an welchen Stellen sie scheitert, wie sie dir das mitteilt und mit welchen Werkzeugen du ihr die fehlenden Informationen gibst.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Stell dir Trimming als **Mark-Phase eines Garbage Collectors** vor, nur über Code statt über Objekte und zur Buildzeit statt zur Laufzeit:
+
+1. **Wurzeln:** Die Analyse beginnt beim Einstiegspunkt der App und bei allem, was du ausdrücklich als Wurzel angibst.
+2. **Markieren:** Von jeder markierten Methode aus folgt ILLink allen Verweisen in ihrer IL: aufgerufene Methoden, erzeugte Typen, gelesene Felder, Basisklassen, Attribute. Was erreicht wird, wird markiert.
+3. **Entfernen:** Was am Ende nicht markiert ist, wird aus den Assemblies gestrichen. Das gilt für ganze Assemblies, aber auch für einzelne Methoden in einem Typ, der sonst bleibt.
+
+Daraus folgt der wichtigste Satz dieser Lektion: **ILLink kennt nur Verbindungen, die in der IL stehen.** Eine Verbindung, die erst zur Laufzeit aus Daten entsteht, existiert für die Analyse nicht. Wenn ILLink eine solche Stelle erkennt, gibt es eine **Trim-Warnung** aus. Die Warnung bedeutet: „Hier kann ich nicht garantieren, dass die App nach dem Kürzen noch funktioniert.“
+
+<Callout kind="fehlannahme">
+  „Trimming wirft nur Assemblies weg, die ich nicht referenziere.“ Nein: ILLink arbeitet auf der
+  Ebene einzelner Typen, Methoden und Felder, auch in deinem eigenen Code und mitten in
+  System.Private.CoreLib. Eine Methode, die nur per Reflection aufgerufen wird, kann verschwinden,
+  obwohl ihre Klasse und ihre Assembly bleiben.
+</Callout>
+
+Zur Einordnung: Trimming gibt es nur für self-contained Apps. Bei einer framework-abhängigen App teilen sich alle Apps das installierte Framework, und das darf niemand für eine einzelne App kürzen. Was self-contained genau bedeutet, erklärt die Lektion „Die Bausteine von .NET“.
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel enthält beides: gewöhnliche Aufrufe, die ILLink verfolgen kann, und einen Typ, der nur über einen String erreicht wird. Achte auf Schritt 6, in dem die Warnung entsteht, und auf Schritt 8, in dem eine Methode eines behaltenen Typs verschwindet.
+
+<StepPlayer script={script} />
+
+Am Ende bleibt eine App, die mit `dotnet run` funktioniert und nach `dotnet publish` abstürzt. Das ist das typische Schadensbild von Trimming: Der Fehler zeigt sich nicht beim Kompilieren, nicht im Debugger und nicht in Unit-Tests, sondern erst in der veröffentlichten Fassung. Die Warnung beim Publish war der einzige Hinweis.
+
+</Block>
+
+<Block n={4} title="Wie ILLink entscheidet">
+
+### Einschalten und Modi
+
+Trimming schaltest du in der Projektdatei ein. Es wirkt nur beim Veröffentlichen, `dotnet build` und `dotnet run` arbeiten weiter mit den vollständigen Assemblies.
+
+```xml
+<PropertyGroup>
+  <PublishTrimmed>true</PublishTrimmed>
+  <!-- full: alle Assemblies kürzen (Standard). partial: nur die, die sich als trimmbar erklären -->
+  <TrimMode>full</TrimMode>
+</PropertyGroup>
+```
+
+Mit `TrimMode` legst du fest, welche Assemblies gekürzt werden. Bei `full` sind es alle, bei `partial` nur die, die sich selbst als trimmbar markiert haben (über `IsTrimmable` in ihrem Projekt). Alles andere wird dann vollständig übernommen und gilt selbst als Wurzel. `partial` ist ein Rückzugsort für Apps mit Abhängigkeiten, die nicht trimmbar sind, spart aber entsprechend weniger.
+
+{/* TODO(verify): TrimMode values full and partial since .NET 7 (previously link and copyused), and that full is the default for PublishTrimmed in .NET 8. */}
+
+Zusätzliche Wurzeln gibst du mit `TrimmerRootAssembly` an, dann bleibt eine ganze Assembly unangetastet. Feiner geht es mit einer XML-Deskriptordatei (`TrimmerRootDescriptor`), in der du einzelne Typen und Member aufführst. Beides ist eine Notlösung, denn ILLink kann nicht prüfen, ob die Liste vollständig ist.
+
+### Was die Analyse verfolgt
+
+ILLink markiert nicht nur Aufrufe. Wird ein Typ markiert, kommen seine Basistypen und implementierten Interfaces mit, sein statischer Konstruktor, wenn statische Member benutzt werden, und die Attribute, die an ihm hängen. Bei virtuellen Methoden wird es feiner: Eine Überschreibung bleibt nur, wenn die Basismethode erreicht ist und der überschreibende Typ tatsächlich erzeugt werden kann. Wird eine Klasse nie instanziiert, braucht niemand ihre Überschreibungen.
+
+{/* TODO(verify): Rules for keeping overrides and interface implementations (only if the type is instantiated and the base slot is marked), see MarkStep.cs in src/tools/illink. */}
+
+### Welche Reflection ILLink versteht
+
+Reflection ist nicht grundsätzlich verboten. ILLink kennt viele Reflection-APIs und analysiert ihre Argumente, solange die Werte **innerhalb der Methode** feststehen. Diese Muster sind sicher:
+
+```csharp
+typeof(Person).GetMethod("Describe");          // Literal: Methode wird behalten
+typeof(Person).GetProperty("Name");            // ebenso für Properties und Felder
+Type.GetType("MyApp.Plugins.Audit");           // Literal: Typ wird aufgelöst
+static T Make<T>() where T : new() => new T(); // Konstruktor jedes T bleibt
+```
+
+Die Analyse verfolgt Werte durch lokale Variablen, aber nicht über Methodengrenzen hinweg. Diese Muster kann sie nicht auflösen:
+
+```csharp
+Type.GetType(config["PluginType"]);            // String aus Daten
+obj.GetType().GetMethods();                    // Typ erst zur Laufzeit bekannt
+Assembly.Load(name).GetTypes();                // ganze Assembly per Name
+typeof(List<>).MakeGenericType(t);             // Generic aus Laufzeittyp
+```
+
+{/* TODO(verify): That ILLink handles new T() with the new() constraint by keeping the parameterless constructor of every instantiation; and that MakeGenericType with a non-constant argument warns (IL2055). */}
+
+### Die Warnungen lesen
+
+Jede Trim-Warnung hat einen Code der Form `IL2xxx`. Einige begegnen dir ständig:
+
+| Code   | Bedeutung                                                                                    |
+| ------ | -------------------------------------------------------------------------------------------- |
+| IL2026 | Aufruf einer Methode mit `[RequiresUnreferencedCode]`                                        |
+| IL2057 | `Type.GetType` mit einem Wert, der beim Build nicht feststeht                                |
+| IL2067 | Parameter ohne Annotation wird an einen annotierten Parameter weitergereicht                 |
+| IL2070 | Reflection auf einem `Type`-Parameter ohne Annotation, etwa `t.GetMethods()`                 |
+| IL2072 | Rückgabewert einer Methode ohne Annotation wird an einen annotierten Parameter übergeben     |
+| IL2075 | Reflection auf einem Rückgabewert ohne Annotation, etwa `Type.GetType(name).GetMethods()`    |
+| IL2104 | Eine Assembly hat Warnungen erzeugt (Sammelwarnung für Abhängigkeiten)                       |
+
+{/* TODO(verify): Meaning of each warning code against the trim warnings reference on Microsoft Learn (IL2026, IL2057, IL2067, IL2070, IL2072, IL2075, IL2104). */}
+
+Die Zahlen muss niemand auswendig kennen. Wichtig ist das Muster dahinter: Fast alle Warnungen sagen „ein Typ fließt von A nach B, und an A fehlt eine Zusicherung, die B verlangt“. Genau diese Zusicherungen sind das Thema des nächsten Abschnitts.
+
+</Block>
+
+<Block n={5} title="Annotationen: der Analyse die Lücke erklären">
+
+### DynamicallyAccessedMembers
+
+Das wichtigste Werkzeug ist `[DynamicallyAccessedMembers]` aus `System.Diagnostics.CodeAnalysis`. Du setzt es an einen Parameter, ein Feld, eine Property, einen Rückgabewert oder einen generischen Typparameter vom Typ `Type` und gibst an, welche Member des Typs gebraucht werden: `PublicParameterlessConstructor`, `PublicMethods`, `NonPublicFields`, `PublicProperties`, `Interfaces` und weitere, kombinierbar als Flags.
+
+Die Annotation wirkt in zwei Richtungen. Innerhalb der Methode erlaubt sie die passende Reflection ohne Warnung. An jeder Aufrufstelle verlangt sie, dass das Argument die Zusicherung erfüllt. Ist das Argument ein bekannter Typ, markiert ILLink dort genau die verlangten Member.
+
+<StepPlayer script={annotationsScript} />
+
+Der letzte Schritt ist der Kern: Annotationen **wandern**. Eine Methode, die einen `Type` nur weiterreicht, muss dieselbe Annotation tragen wie die Methode, an die sie ihn weitergibt. Das setzt sich durch die Aufrufkette fort, bis entweder ein bekannter Typ auftaucht (dann wird markiert) oder ein unbekannter Wert (dann gibt es eine Warnung an genau dieser Stelle). So landet die Warnung dort, wo die Information tatsächlich verloren geht.
+
+### RequiresUnreferencedCode
+
+Manche Methoden lassen sich nicht annotieren, weil sie grundsätzlich mit beliebigen Typen arbeiten, etwa ein Plugin-Lader oder ein reflection-basierter Serialisierer. Für sie gibt es `[RequiresUnreferencedCode("Begründung")]`. Das Attribut sagt: „Diese Methode ist nicht trimmbar.“ Innerhalb der Methode verschwinden die Warnungen, dafür bekommt jeder Aufrufer die Warnung IL2026 mit deinem Text. Das Problem wird also nicht gelöst, sondern sichtbar nach oben gereicht, bis jemand entscheidet, wie damit umzugehen ist.
+
+```csharp
+[RequiresUnreferencedCode("Lädt Plugins per Name aus der Konfiguration.")]
+public static IPlugin LoadPlugin(string typeName) =>
+    (IPlugin)Activator.CreateInstance(Type.GetType(typeName, throwOnError: true)!)!;
+```
+
+### DynamicDependency
+
+Weißt du genau, welche Member eine Methode per Reflection braucht, kannst du sie mit `[DynamicDependency]` an die Methode binden. Wird die Methode behalten, behält ILLink auch die genannten Member:
+
+```csharp
+[DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(AuditPlugin))]
+static void RegisterBuiltIns() { /* erzeugt AuditPlugin per Reflection */ }
+```
+
+Damit ist die Abhängigkeit sicher, aber nicht geprüft: ILLink kontrolliert nicht, ob die Methode wirklich nur diese Member braucht. Die Warnungen in der Methode verschwinden dadurch auch nicht von selbst.
+
+### UnconditionalSuppressMessage
+
+Bist du sicher, dass eine Warnung harmlos ist, kannst du sie unterdrücken. Das normale `[SuppressMessage]` hilft dabei nicht, weil es nicht in die kompilierte Assembly übernommen wird und ILLink es nie sieht. Es braucht `[UnconditionalSuppressMessage]`, das in der IL erhalten bleibt:
+
+```csharp
+[UnconditionalSuppressMessage("Trimming", "IL2026",
+    Justification = "Person ist über DynamicDependency gesichert.")]
+```
+
+{/* TODO(verify): That ILLink only matches the warning id (category is not checked) and that SuppressMessage is not visible to ILLink because it is a conditional attribute (CODE_ANALYSIS). */}
+
+Eine Unterdrückung ist eine Behauptung, die niemand prüft. Ist sie falsch, hast du eine App ohne Warnungen, die trotzdem bricht. Deshalb gehört an jede Unterdrückung eine Begründung, die ein Reviewer nachvollziehen kann.
+
+</Block>
+
+<Block n={6} title="Feature-Schalter: Code, der per Konfiguration verschwindet">
+
+Trimming kann mehr als unerreichbaren Code entfernen. Es kann auch Code entfernen, der zwar erreichbar ist, aber durch eine Einstellung nie ausgeführt wird. Das Mittel dafür sind **Feature-Schalter**: Einstellungen in der Projektdatei, die beim Build als feste Werte in die Analyse eingehen.
+
+```xml
+<PropertyGroup>
+  <InvariantGlobalization>true</InvariantGlobalization>   <!-- keine Kulturdaten -->
+  <UseSystemResourceKeys>true</UseSystemResourceKeys>     <!-- keine Fehlertexte -->
+  <EventSourceSupport>false</EventSourceSupport>          <!-- kein EventSource -->
+</PropertyGroup>
+```
+
+Jede dieser Eigenschaften landet als Schalter in der `runtimeconfig.json`, zum Beispiel `System.Globalization.Invariant`. Die Bibliothek fragt den Schalter über eine statische Property ab. Für ILLink ist hinterlegt, dass diese Property bei gesetztem Schalter einen festen Wert liefert. ILLink ersetzt den Aufruf durch die Konstante, und der Zweig, der nie laufen kann, wird unerreichbar und fällt weg, samt allem, was nur von dort erreichbar war.
+
+{/* TODO(verify): Property names and runtimeconfig keys (InvariantGlobalization -> System.Globalization.Invariant, UseSystemResourceKeys -> System.Resources.UseSystemResourceKeys, EventSourceSupport -> System.Diagnostics.Tracing.EventSource.IsSupported) per the trimming options page. Mechanism: ILLink.Substitutions.xml embedded in the library, and since .NET 9 the FeatureSwitchDefinition attribute. */}
+
+Das ist wichtig, um die Wirkung richtig einzuordnen. Ein Feature-Schalter ist nicht nur eine Laufzeiteinstellung, sondern eine Entscheidung zur Buildzeit. Wer `InvariantGlobalization` setzt, verliert kulturabhängige Formatierung und Sortierung, auch wenn er die Einstellung später in der `runtimeconfig.json` wieder umdreht: Der Code dafür ist nicht mehr in der App. Eigene Bibliotheken können seit .NET 9 ebenfalls solche Schalter definieren.
+
+{/* TODO(verify): FeatureSwitchDefinitionAttribute and FeatureGuardAttribute introduced in .NET 9. */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Es läuft lokal, aber nicht veröffentlicht
+
+Die Analyse läuft nur bei `dotnet publish`. Debugger, `dotnet run` und deine Unit-Tests arbeiten mit ungekürzten Assemblies. Ein Fehler durch Trimming taucht daher erst in der veröffentlichten App auf, oft in einem selten genutzten Pfad. Behandle Trim-Warnungen deshalb wie Compilerfehler, nicht wie Stilhinweise.
+
+### Warnungen aus Paketen sieht man kaum
+
+Für Assemblies aus NuGet-Paketen fasst ILLink die Warnungen standardmäßig zu einer einzigen Sammelwarnung pro Assembly zusammen. Mit `<TrimmerSingleWarn>false</TrimmerSingleWarn>` bekommst du die Einzelwarnungen und siehst, welche Methode einer Bibliothek das Problem verursacht.
+
+{/* TODO(verify): Default of TrimmerSingleWarn (true) and that it applies to non-project assemblies only, producing IL2104. */}
+
+### Ohne Warnung heißt nicht sicher
+
+Die Garantie lautet: Wenn ILLink beim Veröffentlichen der ganzen App **keine** Warnung ausgibt, verhält sich die gekürzte App wie die ungekürzte. Diese Garantie gilt nur, solange niemand Warnungen unterdrückt hat. Jede `UnconditionalSuppressMessage`, jede Deskriptordatei und jedes `NoWarn` in der Projektdatei ist ein Loch in dieser Garantie, das nur so gut ist wie die Begründung dahinter.
+
+### Serialisierung und Dependency Injection
+
+Die meisten Probleme in echten Apps entstehen nicht durch eigenes `Type.GetType`, sondern durch Bibliotheken, die intern Reflection nutzen. Klassisch sind reflection-basierte JSON-Serialisierung (Properties werden per Reflection gefunden, nicht per Code), Konfigurationsbindung an Klassen und Dependency Injection, die Konstruktoren per Reflection aufruft. Viele dieser APIs tragen inzwischen `[RequiresUnreferencedCode]` oder passende Annotationen, sodass du zumindest eine Warnung bekommst.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+### Warnungen früh sehen
+
+Du musst nicht bis zum Publish warten. Ein Roslyn-Analyzer meldet dieselben Warnungen schon beim Bauen in der IDE, allerdings nur für deinen eigenen Code. Die vollständige Analyse über alle Abhängigkeiten liefert weiterhin erst ILLink.
+
+| Eigenschaft                  | Wofür                                                                              |
+| ---------------------------- | ---------------------------------------------------------------------------------- |
+| `PublishTrimmed`             | Trimming beim Veröffentlichen einer App                                            |
+| `EnableTrimAnalyzer`         | Analyzer im Build einschalten, ohne zu trimmen                                     |
+| `IsTrimmable`                | Bibliothek als trimmbar kennzeichnen, schaltet zugleich den Analyzer ein           |
+| `IsAotCompatible`            | Bibliothek für Native AOT vorbereiten, schaltet Trim- und AOT-Analyzer ein         |
+| `TrimmerSingleWarn`          | Einzelwarnungen für Paket-Assemblies statt Sammelwarnung                           |
+| `TreatWarningsAsErrors`      | Warnungen brechen den Build ab                                                     |
+
+{/* TODO(verify): IsAotCompatible available since .NET 8; IsTrimmable also enables EnableTrimAnalyzer; ILLink warnings honor TreatWarningsAsErrors (or need ILLinkTreatWarningsAsErrors). */}
+
+### Bibliotheken vorbereiten
+
+Für eine Bibliothek empfiehlt Microsoft Learn ein kleines Testprojekt: eine Konsolen-App mit `PublishTrimmed`, die deine Bibliothek per `TrimmerRootAssembly` vollständig als Wurzel einbindet. Beim Veröffentlichen analysiert ILLink dann jede öffentliche Methode deiner Bibliothek und meldet alle Warnungen, auch für Methoden, die die Test-App gar nicht aufruft.
+
+### Source Generators statt Reflection
+
+Die gründlichste Lösung ist, Reflection gar nicht erst zu brauchen. **Source Generators** schreiben beim Kompilieren gewöhnlichen C#-Code, der die Typen direkt anspricht. Für ILLink ist das ganz normaler Code mit echten Verweisen, den es vollständig verfolgen kann. Wie Source Generators arbeiten, zeigt die Lektion „Source Generators“, die Kosten der Laufzeit-Variante die Lektion „Wie Reflection arbeitet“.
+
+```csharp
+[JsonSerializable(typeof(Person))]
+internal partial class AppJsonContext : JsonSerializerContext { }
+
+string json = JsonSerializer.Serialize(person, AppJsonContext.Default.Person);
+```
+
+Der Generator erzeugt für `Person` Code zum Lesen und Schreiben jeder Property. Die Überladung mit `JsonTypeInfo` braucht keine Reflection und erzeugt keine Warnung. Dasselbe Prinzip gibt es für Logging (`[LoggerMessage]`), reguläre Ausdrücke (`[GeneratedRegex]`) und die Konfigurationsbindung.
+
+{/* TODO(verify): Configuration binding source generator (EnableConfigurationBindingGenerator) since .NET 8 and that it removes the trim warnings of ConfigurationBinder. */}
+
+### Testen
+
+Teste die veröffentlichte, gekürzte App und nicht nur den Build. Für Web-Apps bedeutet das: Integrationstests oder Smoke-Tests gegen den Publish-Ordner beziehungsweise das Container-Image. Was dort nicht getestet wird, ist mit Trimming ungetestet.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Trimming ist ein Werkzeug des SDK, die Runtime selbst merkt davon nichts: Sie lädt gekürzte Assemblies wie jede andere. Ruft der Code per Reflection einen Typ oder ein Member auf, das entfernt wurde, verhält sich die Runtime so, als hätte es nie existiert. `Type.GetType` liefert `null`, `GetMethod` liefert `null`, und der Aufruf auf diesem Ergebnis wirft.
+
+Die Vorarbeit steckt in den Bibliotheken. Seit .NET 5 und 6 sind die Framework-Assemblies durchgängig annotiert: `Activator.CreateInstance(Type)` verlangt am Parameter die passenden Konstruktoren, `Type.GetMethods()` trägt die Annotation am `this`-Typ, und APIs, die sich nicht absichern lassen, tragen `[RequiresUnreferencedCode]`. Nur deshalb kann ILLink an deiner Aufrufstelle überhaupt sagen, was fehlt.
+
+Native AOT nutzt dieselbe Analyse. Der AOT-Compiler arbeitet mit denselben Annotationen und denselben Warnungscodes und ergänzt eigene Warnungen für Code, der zur Laufzeit neuen Code erzeugen würde. Eine App, die beim Trimmen keine Warnungen hat, ist deshalb schon ein großes Stück auf dem Weg zu „Native AOT“.
+
+<Callout kind="version">
+  Trimming gibt es seit .NET Core 3.0, ausdrücklich unterstützt und mit annotiertem Framework seit
+  .NET 6. Die Modi `full` und `partial` gibt es seit .NET 7, `IsAotCompatible` seit .NET 8,
+  eigene Feature-Schalter per Attribut seit .NET 9. Für Windows Forms und WPF wird Trimming nicht
+  unterstützt.
+</Callout>
+
+{/* TODO(verify): Version history (trimming in .NET Core 3.0 experimental, supported with annotations in .NET 6; RequiresDynamicCode IL3050 for Native AOT) and that WinForms and WPF are unsupported (NETSDK1175). */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+SharpLab kann nicht trimmen, dieses Experiment läuft lokal. Lege ein Konsolenprojekt an, ersetze `Program.cs` und vergleiche `dotnet run` mit der veröffentlichten Fassung. Starte die veröffentlichte App einmal ohne und einmal mit `PLUGIN=Audit`.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht. Lege mit dotnet new console ein Projekt namens TrimDemo an, ersetze Program.cs, veröffentliche mit PublishTrimmed und lies die Warnungen in der Ausgabe von dotnet publish."
+  code={trimDemoCode}
+/>
+
+Erwartetes Ergebnis: `dotnet publish` meldet eine Warnung für `Type.GetType(typeName)` und eine für `JsonSerializer.Serialize`, aber keine für `GetMethod("Describe")`, weil das Literal analysierbar ist. Mit `dotnet run` findet die App den Typ `Audit` und gibt JSON aus. Die veröffentlichte App findet `Audit` nicht mehr, weil nichts im Code auf ihn verweist. `Describe` funktioniert weiterhin. Die JSON-Ausgabe scheitert, weil die reflection-basierte Serialisierung in gekürzten Apps standardmäßig abgeschaltet ist. Ersetze sie durch einen `JsonSerializerContext` wie oben, und die Warnung verschwindet.
+
+{/* TODO(verify): Exact warnings (IL2057, IL2026) and that System.Text.Json disables reflection-based serialization by default in trimmed apps since .NET 8 (JsonSerializerIsReflectionEnabledByDefault), throwing InvalidOperationException. Also compare the publish folder size with and without PublishTrimmed before stating any size. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="trimming"
+  questions={[
+    {
+      q: 'Wann entfernt ILLink eine Methode?',
+      options: [
+        'Wenn ihre Assembly nirgends referenziert wird',
+        'Wenn sie von den Wurzeln aus über Verweise in der IL nicht erreichbar ist',
+        'Wenn sie zur Laufzeit nie aufgerufen wurde',
+      ],
+      correct: 1,
+      explanation:
+        'ILLink analysiert statisch zur Buildzeit. Es entfernt alles, was von Main und den übrigen Wurzeln aus nicht erreichbar ist, auch einzelne Methoden in behaltenen Typen. Laufzeitdaten kennt es nicht.',
+    },
+    {
+      q: 'Welcher Aufruf erzeugt eine Trim-Warnung?',
+      options: [
+        'typeof(Person).GetMethod("Describe")',
+        'Type.GetType(config["PluginType"])',
+        'Type.GetType("MyApp.Audit")',
+      ],
+      correct: 1,
+      explanation:
+        'Literale kann die Analyse auflösen. Ein Wert aus der Konfiguration steht beim Build nicht fest, also kann ILLink nicht wissen, welcher Typ behalten werden muss.',
+    },
+    {
+      q: 'void Run(Type t) => Create(t); und Create verlangt per DynamicallyAccessedMembers einen Konstruktor. Wo entsteht die Warnung?',
+      options: ['In Run, beim Aufruf von Create', 'In Create, bei Activator.CreateInstance'],
+      correct: 0,
+      explanation:
+        'Create ist durch seine Annotation abgesichert. Run reicht einen Type ohne Zusicherung weiter, also verliert sich die Information dort. Die Lösung ist, auch t in Run zu annotieren.',
+    },
+    {
+      q: 'Was bewirkt [RequiresUnreferencedCode] an einer Methode?',
+      options: [
+        'ILLink behält alle Typen, die die Methode brauchen könnte',
+        'Die Warnungen in der Methode verschwinden, jeder Aufrufer bekommt stattdessen IL2026',
+        'Die Methode wird beim Trimmen nie entfernt',
+      ],
+      correct: 1,
+      explanation:
+        'Das Attribut erklärt die Methode für nicht trimmbar und reicht das Problem an die Aufrufer weiter. Es behält keinen zusätzlichen Code.',
+    },
+    {
+      q: 'Warum reicht ein normales [SuppressMessage] nicht, um eine Trim-Warnung zu unterdrücken?',
+      options: [
+        'Es wird nicht in die kompilierte Assembly übernommen, ILLink sieht es nicht',
+        'ILLink ignoriert grundsätzlich alle Unterdrückungen',
+      ],
+      correct: 0,
+      explanation:
+        'SuppressMessage wirkt nur auf Analyzer im Compiler. UnconditionalSuppressMessage bleibt in der IL erhalten und wird von ILLink ausgewertet.',
+    },
+    {
+      q: 'Du setzt InvariantGlobalization auf true und veröffentlichst getrimmt. Später stellst du den Schalter in der runtimeconfig.json zurück. Was passiert?',
+      options: [
+        'Die Kulturunterstützung ist wieder da',
+        'Der Code dafür kann fehlen, weil der Schalter beim Trimmen als Konstante behandelt wurde',
+      ],
+      correct: 1,
+      explanation:
+        'Feature-Schalter fließen beim Build als feste Werte in die Analyse ein. Der Zweig für den abgeschalteten Fall wurde unerreichbar und entfernt.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Trimming (ILLink) läuft beim **Veröffentlichen** einer self-contained App. Es markiert alles, was von den Wurzeln aus über Verweise in der IL erreichbar ist, und entfernt den Rest, auch einzelne Methoden in behaltenen Typen.
+- Verbindungen, die erst zur Laufzeit aus Strings oder Daten entstehen, sieht die Analyse nicht. Erkennt sie so eine Stelle, gibt sie eine **Trim-Warnung** aus.
+- Reflection mit Literalen und bekannten Typen versteht ILLink. Werte, die über Methodengrenzen fließen, brauchen **`[DynamicallyAccessedMembers]`**, und diese Annotation muss weitergereicht werden, bis ein bekannter Typ auftaucht.
+- `[RequiresUnreferencedCode]` reicht das Problem an die Aufrufer weiter, `[DynamicDependency]` bindet Member an eine Methode, `[UnconditionalSuppressMessage]` behauptet ungeprüft, dass alles in Ordnung ist.
+- Feature-Schalter wie `InvariantGlobalization` werden beim Build zu Konstanten, und der abgeschaltete Code verschwindet aus der App.
+- Ohne Warnungen und ohne Unterdrückungen verhält sich die gekürzte App wie die ungekürzte. Source Generators ersetzen Reflection durch normalen Code und sind die gründlichste Lösung.
+- Teste die veröffentlichte Fassung, denn `dotnet run`, Debugger und Unit-Tests trimmen nicht.
+
+</Block>
