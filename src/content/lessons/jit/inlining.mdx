@@ -1,0 +1,338 @@
+---
+id: inlining
+title: Inlining
+summary: Warum das Einbetten von Methoden die wichtigste Optimierung des JIT ist, nach welchen Regeln er entscheidet und warum AggressiveInlining nur ein Wunsch ist.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Inlining Plans (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/inlining-plans.md
+  - title: 'Inlining-Heuristiken im JIT (inlinepolicy.cpp im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/inlinepolicy.cpp
+  - title: 'MethodImplOptions (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.compilerservices.methodimploptions
+  - title: 'Assembly.GetCallingAssembly (Microsoft Learn, Hinweis zu Inlining)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.reflection.assembly.getcallingassembly
+  - title: 'Viewing JIT Dumps (dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/viewing-jit-dumps.md
+  - title: 'Performance Improvements in .NET 8 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+  - title: 'Performance Improvements in .NET 10 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-10/
+  - title: 'ReadyToRun-Kompilierung (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/deploying/ready-to-run
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './inlining.steps';
+import decisionScript from './inlining-decision.steps';
+import { inliningCode, benchmarkCode } from './inlining-verify';
+
+<Block n={1} title="Das Problem">
+
+Guter C#-Code besteht aus vielen kleinen Methoden. Eine Property liefert ein Feld zurück, ein Indexer prüft eine Grenze und liest ein Element, eine Hilfsmethode rechnet zwei Zahlen zusammen. Das ist lesbar und wartbar. Würde jede dieser kleinen Methoden zur Laufzeit wirklich als eigener Aufruf ausgeführt, wäre ein großer Teil der Rechenzeit Verwaltung: Argumente in Register laden, springen, einen Frame anlegen, zurückspringen.
+
+Dieser direkte Aufwand ist allerdings kleiner, als man denkt. Ein direkter Aufruf kostet auf einem modernen Prozessor nur wenige Takte, die Sprungvorhersage erledigt den Rest. Das eigentliche Problem liegt woanders: Ein optimierender Compiler arbeitet Methode für Methode. Für ihn ist ein Aufruf eine **Blackbox**. Er weiß nicht, ob die aufgerufene Methode ein Feld verändert, also muss er es danach neu aus dem Speicher lesen. Er weiß nicht, dass das Ergebnis bei konstantem Argument immer gleich ist, also kann er nichts vorausberechnen. Er weiß nicht, ob ein Objekt, das er übergibt, die Methode verlässt, also kann er es nicht auf den Stack legen.
+
+Jeder Aufruf ist damit eine Grenze, an der die meisten Optimierungen aufhören. **Inlining** beseitigt diese Grenze: Der JIT setzt den Rumpf der aufgerufenen Methode an die Stelle des Aufrufs, bevor er optimiert. Danach sieht er einen einzigen, größeren Codeblock, und alle anderen Optimierungen können darüber hinweg arbeiten. Deshalb gilt Inlining als die wichtigste Optimierung des JIT, nicht wegen des gesparten Aufrufs, sondern wegen allem, was danach möglich wird.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir diese vier Sätze:
+
+1. **Inlining kopiert, bevor optimiert wird.** Der JIT setzt den Rumpf der aufgerufenen Methode in seiner Zwischendarstellung an die Aufrufstelle. Erst danach laufen Optimierungen wie das Vorausberechnen von Konstanten.
+2. **Entschieden wird pro Aufrufstelle.** Dieselbe Methode kann an einer Stelle eingebettet werden und an einer anderen nicht.
+3. **Inlining kostet Platz und Übersetzungszeit.** Deshalb wägt der JIT ab und hält sich an Grenzen und ein Budget pro Methode.
+4. **Nur optimierter Code bettet ein.** Tier 0 und Debug-Builds verzichten darauf, damit die Übersetzung schnell bleibt und der Debugger jede Methode findet.
+
+Wie die übrigen Optimierungen in der Pipeline auf das Inlining folgen, zeigt die Lektion „Die Pipeline von RyuJIT“. Dort sieht man auch, warum Inlining so früh in der Pipeline steht.
+
+<Callout kind="fehlannahme">
+  „`[MethodImpl(MethodImplOptions.AggressiveInlining)]` erzwingt Inlining.“ Das Attribut ist eine
+  Bitte, keine Anweisung. Es schaltet die Abwägung von Größe und Nutzen ab, aber nicht die
+  Prüfungen, ob Inlining überhaupt möglich ist. Ist das Ziel eines Aufrufs unbekannt oder das
+  Budget erschöpft, bleibt der Aufruf ein Aufruf.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel rechnet zweimal dasselbe: einmal über eine Methode, die mit `NoInlining` vom Einbetten ausgeschlossen ist, und einmal über eine gewöhnliche kleine Methode. Die beiden äußeren Methoden tragen ebenfalls `NoInlining`, damit sie nicht ihrerseits in `Main` verschwinden und der Vergleich sichtbar bleibt. Im Reiter „Assembler“ steht das x64-Listing dazu.
+
+<StepPlayer script={script} />
+
+{/* TODO(verify): x64 listing in the step script (ComputeNoInline with call, Compute folded to "mov eax, 50") with SharpLab or DOTNET_JitDisasm on .NET 8+. */}
+
+Schritt 5 ist der Kern der Lektion. Ohne Inlining hätte der JIT `Square(7)` nie vorausberechnen können, denn aus Sicht von `Compute` hätte `Square` alles Mögliche tun können. Mit Inlining sieht er `7 * 7 + 1` und macht daraus `50`. Der gesparte Aufruf ist dagegen fast nebensächlich.
+
+Das Beispiel ist bewusst extrem. In echtem Code bleibt selten die ganze Rechnung übrig, aber dasselbe passiert im Kleinen ständig: Eine Property liefert ein Feld, das der JIT danach im Register behält. Ein Indexer prüft eine Grenze, die der JIT als überflüssig erkennt, weil die Schleife sie schon garantiert (mehr dazu in der Lektion „Bounds-Check-Elimination“). Ein Struct, das als Argument übergeben wurde, zerfällt in einzelne Felder in Registern.
+
+</Block>
+
+<Block n={4} title="Wie der Inliner entscheidet">
+
+Der JIT entscheidet in zwei Etappen. Schon beim Einlesen des IL markiert er Aufrufe als **Kandidaten**, deren Ziel feststeht und bei denen nichts grundsätzlich dagegen spricht. Später liest er das IL jedes Kandidaten, sammelt Beobachtungen darüber und lässt eine **Inlining-Policy** entscheiden. Die Visualisierung fasst beide Etappen in vier Fragen zusammen.
+
+<StepPlayer script={decisionScript} />
+
+### Größe als erste Näherung
+
+Die einfachste Größe, die der JIT kennt, ist die Länge des IL einer Methode in Byte. Zwei Grenzen spielen dabei eine Rolle. Methoden mit sehr wenig IL, laut Quellcode bis 16 Byte, werden praktisch immer eingebettet: Ihr Rumpf ist kaum größer als der Code für den Aufruf selbst, das Einbetten macht den Code also nicht größer, oft sogar kleiner. Methoden mit mehr als 100 Byte IL lehnt der JIT ohne Attribut grundsätzlich ab.
+
+{/* TODO(verify): ALWAYS_INLINE_SIZE = 16 and DEFAULT_MAX_INLINE_SIZE = 100 bytes of IL in src/coreclr/jit/inline.h (configurable via JitInlineSize in checked builds?) for .NET 8, 9, 10. */}
+
+Wie viel 100 Byte IL sind, ist schwer zu schätzen. Eine Property mit `return _field;` hat wenige Byte, eine Methode mit einer kleinen Schleife und zwei Bedingungen schnell 40 oder 50. Ein `throw new ArgumentException(nameof(x))` allein bringt schon ein gutes Dutzend Byte mit. Den genauen Wert zeigt dir SharpLab im IL-Modus.
+
+### Schätzen dazwischen
+
+Zwischen den Grenzen schätzt die Policy Kosten und Nutzen. Die Kosten sind der erwartete Zuwachs an Maschinencode. Den Nutzen schätzt sie aus Beobachtungen über das IL und die Aufrufstelle, etwa:
+
+- Ein Argument ist an der Aufrufstelle eine **Konstante**, und die aufgerufene Methode verzweigt anhand dieses Arguments. Dann fällt nach dem Einbetten vermutlich ein Teil des Codes weg.
+- Die Aufrufstelle liegt in einer **Schleife**, wird also vermutlich oft ausgeführt.
+- Argumente oder Rückgabewert sind **Structs**, die nach dem Einbetten in Register zerlegt werden können.
+- Mit **Dynamic PGO** weiß der JIT, wie oft die Aufrufstelle tatsächlich läuft, und gewichtet heiße Stellen stärker (siehe „Dynamic PGO“).
+
+Aus diesen Beobachtungen ergibt sich ein Faktor, mit dem die Policy den Nutzen hochrechnet. Übersteigt er die geschätzten Kosten, wird eingebettet. Die Gewichte sind Erfahrungswerte, die das JIT-Team mit vielen Benchmarks abgestimmt hat, und sie ändern sich von Version zu Version.
+
+{/* TODO(verify): Observation names and multipliers in DefaultPolicy and ExtendedDefaultPolicy (src/coreclr/jit/inlinepolicy.cpp): constant args feeding branches, call site in loop, struct promotion, profile weight; ExtendedDefaultPolicy default since .NET 6? */}
+
+### Budget und Tiefe
+
+Inlining ist rekursiv: Eine eingebettete Methode kann selbst Aufrufe enthalten, die wieder eingebettet werden. Damit das nicht ausufert, gibt es eine Höchsttiefe für verschachteltes Inlining und ein **Budget** pro übersetzter Methode. Das Budget misst der JIT in geschätzter Übersetzungszeit: Jede eingebettete Methode macht die Übersetzung des Aufrufers teurer, und ab einem Vielfachen der ursprünglichen Schätzung lehnt der JIT weitere Kandidaten ab.
+
+{/* TODO(verify): InlineStrategy time budget (DEFAULT_INLINE_BUDGET = 10, i.e. 10x the root method's estimated time) and maximum inline depth (DEFAULT_MAX_INLINE_DEPTH = 20) in src/coreclr/jit/inline.h. */}
+
+### Was AggressiveInlining und NoInlining tun
+
+`AggressiveInlining` überspringt die Fragen nach Größe und Nutzen. Eine Methode mit 300 Byte IL kann damit eingebettet werden, obwohl die Policy sie sonst sofort abgelehnt hätte. Alle anderen Prüfungen bleiben bestehen: Das Ziel muss bekannt sein, nichts darf das Inlining verbieten, und Tiefe und Budget gelten weiter. `NoInlining` ist dagegen verbindlich, eine so markierte Methode wird nie eingebettet.
+
+</Block>
+
+<Block n={5} title="Wann nicht eingebettet wird">
+
+Manche Aufrufe kann der JIT gar nicht einbetten, egal wie klein die Methode ist und welches Attribut sie trägt. Die wichtigsten Gründe:
+
+**Das Ziel steht nicht fest.** Bei einem virtuellen Aufruf oder einem Interface-Aufruf entscheidet erst der Typ des Objekts zur Laufzeit, welche Methode läuft. Kann der JIT das Ziel nicht beweisen, etwa über eine `sealed`-Klasse oder einen bekannten exakten Typ, gibt es nichts einzubetten. Wie der JIT das Ziel trotzdem herausfinden kann, erklärt die Lektion „Devirtualisierung“. Mit Dynamic PGO kann er zusätzlich auf den häufigsten Typ wetten und hinter einer Typprüfung einbetten.
+
+**Rekursion.** Eine Methode lässt sich nicht in sich selbst einbetten, die Kopie würde ja wieder denselben Aufruf enthalten.
+
+**Bestimmte Konstrukte in der aufgerufenen Methode.** Lange galt: Methoden mit `try`, `catch` oder `finally` werden nicht eingebettet. Ähnliches gilt für Methoden mit `stackalloc` und für Methoden mit `MethodImplOptions.Synchronized`. Neuere JIT-Versionen haben einige dieser Einschränkungen gelockert, laut .NET-Blog zum Beispiel für Ausnahmebehandlung in .NET 10.
+
+{/* TODO(verify): Callees with EH were never inlined before .NET 10; .NET 10 allows inlining of (some) methods with try/catch/finally (Performance Improvements in .NET 10). Current status of localloc/stackalloc callees and Synchronized methods. */}
+
+**Methoden, die nie zurückkehren.** Eine Methode, die immer eine Exception wirft, bettet der JIT nicht ein. Der Wurf ist ohnehin teuer, und eingebettet würde der Code nur den Aufrufer aufblähen. Diese Regel nutzen Bibliotheken bewusst, dazu mehr bei den Stolperfallen.
+
+{/* TODO(verify): Inliner rejects callees that never return (observation CALLEE_DOES_NOT_RETURN) and treats call sites in throw blocks as rarely run. */}
+
+**Zu viele lokale Variablen oder Argumente.** Für das Zusammenführen der Variablen beider Methoden gibt es feste Obergrenzen. Bei normalem Code erreicht man sie selten.
+
+{/* TODO(verify): Limits on locals and arguments for inlinees (MAX_INL_ARGS, MAX_INL_LCLS or the lvaCount limit) in current JIT. */}
+
+### Assembly-Grenzen und vorkompilierter Code
+
+Für den JIT spielen Assembly-Grenzen zur Laufzeit keine Rolle. Er bettet `List<T>.Count` aus dem Framework in deinen Code ein, als stünde die Property in deiner eigenen Assembly. Das funktioniert, weil zur Laufzeit feststeht, welche Version jeder Assembly geladen ist.
+
+Bei vorkompiliertem **ReadyToRun**-Code ist das anders. Wird eine Assembly mit Crossgen vorkompiliert, kennt der Compiler die Version des Frameworks, gegen die später gestartet wird, noch nicht. Bettet er Framework-Code ein und das Framework bekommt ein Update, wäre der eingebettete Code veraltet. Deshalb bettet Crossgen nur innerhalb einer **Version Bubble** ein, standardmäßig also nur innerhalb derselben Assembly. Eine Ausnahme sind Methoden, die das Framework ausdrücklich als unveränderlich markiert, damit etwa einfache Getter auch über Assembly-Grenzen eingebettet werden dürfen. Sobald eine R2R-Methode heiß wird, ersetzt Tier 1 sie ohnehin durch neu übersetzten Code ohne diese Einschränkung. Mehr dazu in der Lektion „ReadyToRun und Crossgen“.
+
+{/* TODO(verify): Version bubble default (single assembly, larger bubbles via --inputbubble), NonVersionableAttribute allowing cross-bubble inlining of selected CoreLib members. */}
+
+### Generischer Code
+
+Für Referenztypen teilt die Runtime den Maschinencode generischer Methoden: `List<string>` und `List<object>` benutzen denselben Code, der den konkreten Typ zur Laufzeit nachschlägt (siehe „Generics zur Laufzeit“). Bettet der JIT eine Methode in solchen geteilten Code ein, muss er diese Nachschlagearbeit mitnehmen. Lange hat er deshalb in geteiltem Code auf manche Kandidaten verzichtet, die so ein Nachschlagen brauchen. Laut .NET-Blog wurde das in .NET 8 gelockert. Bei Werttypen tritt das Problem nicht auf, denn dort bekommt jede Instanziierung eigenen Code.
+
+{/* TODO(verify): Inlining of callees that need a runtime lookup into shared generic code enabled in .NET 8 (Performance Improvements in .NET 8); remaining restrictions. */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Fehlende Frames im Stacktrace
+
+Eingebettete Methoden haben zur Laufzeit keinen eigenen Frame. Ein Stacktrace aus optimiertem Code zeigt deshalb nur die Methode, in die eingebettet wurde. Wirft `Fail` eine Exception und wurde `Fail` in `CallsFail` eingebettet, beginnt der Stacktrace bei `CallsFail`. Das ist kein Fehler der Runtime, sondern die direkte Folge des Modells. In Debug-Builds passiert es nicht, denn dort optimiert der JIT nicht.
+
+Heikler wird es bei APIs, die den Aufrufer bestimmen. Microsoft Learn warnt bei `Assembly.GetCallingAssembly` ausdrücklich: Wird die aufrufende Methode eingebettet, kann ein anderes Ergebnis herauskommen als erwartet. Wer so eine API braucht, markiert die betroffene Methode mit `NoInlining`.
+
+### AggressiveInlining überall
+
+Wer das Attribut großzügig verteilt, verschlechtert oft genau das, was er verbessern will. Große Rümpfe werden an jede Aufrufstelle kopiert, der Code wächst und passt schlechter in den Instruktions-Cache. Außerdem verbrauchen sie das Budget des Aufrufers, sodass später wichtigere Kandidaten nicht mehr eingebettet werden. Sinnvoll ist das Attribut für kleine, heiße Methoden, bei denen die Heuristik nachweislich falsch liegt, und dieser Nachweis gehört zu jeder Verwendung.
+
+### Wurf-Code im heißen Pfad
+
+Eine kleine Methode mit einer Prüfung und einem `throw` ist größer, als sie aussieht: Das Erzeugen der Exception, das Laden des Nachrichtentexts und der Wurf kosten IL und Maschinencode. Bibliotheken lagern den Wurf deshalb in eine eigene Methode aus, die nur wirft:
+
+```csharp
+public int this[int index]
+{
+    get
+    {
+        if ((uint)index >= (uint)_length)
+            ThrowHelper.ThrowIndexOutOfRange();   // eigene Methode, wird nicht eingebettet
+        return _items[index];
+    }
+}
+```
+
+So bleibt der Indexer klein genug für die Heuristik, und der kalte Wurf-Code liegt außerhalb des heißen Pfads. Dieses **ThrowHelper**-Muster findest du überall im Quellcode der Runtime.
+
+### Messen in Tier 0
+
+Tier 0 bettet nichts ein. Misst du eine Methode, bevor sie Tier 1 erreicht hat, siehst du jeden Aufruf als echten Aufruf. Ein Unterschied zwischen zwei Varianten, der nur auf Inlining beruht, verschwindet dann oder kehrt sich um. Ohne Aufwärmen, also ohne BenchmarkDotNet oder etwas Gleichwertiges, sagt eine solche Messung nichts aus.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Die Heuristik ist für normalen Anwendungscode gut abgestimmt. Eingreifen lohnt sich selten, und wenn, dann gemessen.
+
+| Situation                                           | Empfehlung                                                    |
+| --------------------------------------------------- | ------------------------------------------------------------- |
+| Kleine Properties, Getter, einfache Hilfsmethoden   | nichts tun, werden ohnehin eingebettet                        |
+| Heiße Methode knapp über der Grenze, nachgemessen   | `AggressiveInlining` erwägen, Wirkung im Assembler prüfen     |
+| Wurf-Code in kleinen, heißen Methoden               | in eine eigene Methode auslagern (ThrowHelper)                |
+| Methode braucht einen eigenen Frame                 | `NoInlining`, etwa bei `GetCallingAssembly`                   |
+| Interface-Aufruf soll eingebettet werden            | Typ bekannt machen: `sealed`, Generics mit Werttypen          |
+| Benchmark vergleicht Varianten                      | mit BenchmarkDotNet, nie in Tier 0 messen                      |
+
+### Entscheidungen sichtbar machen
+
+Es gibt mehrere Wege, die Entscheidungen des Inliners zu beobachten:
+
+- `DOTNET_JitDisasm=Compute` zeigt den Maschinencode einer Methode. Fehlt der `call` auf die aufgerufene Methode, wurde sie eingebettet. Mit `DOTNET_JitStdOutFile` landet die Ausgabe in einer Datei.
+- `DOTNET_JitPrintInlinedMethods=Compute` gibt den Inlining-Baum einer Methode aus, mit dem Grund für jede Ablehnung. Ob diese Variable in der normalen Runtime wirkt oder einen Checked-Build der Runtime braucht, hängt von der Version ab.
+- Die Runtime meldet jede Inlining-Entscheidung als Event, getrennt nach Erfolg und Ablehnung, bei Ablehnungen mit Begründung. Mit PerfView oder `dotnet-trace` kannst du sie aufzeichnen. BenchmarkDotNet bietet unter Windows einen eigenen Diagnoser dafür.
+
+{/* TODO(verify): DOTNET_JitPrintInlinedMethods availability in release runtime builds (since .NET 7/8?); event names MethodJitInliningSucceeded / MethodJitInliningFailed (JitTracing keyword) per Microsoft Learn "Method ETW events"; BenchmarkDotNet InliningDiagnoser is Windows only. */}
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Der JIT entscheidet nicht allein. Bevor er eine Methode einbettet, fragt er die Runtime über die Schnittstelle zwischen JIT und Execution Engine, ob das erlaubt ist. Die Runtime kann aus Gründen ablehnen, die der JIT nicht sehen kann: Ein angehängter Profiler hat Inlining abgeschaltet, um jeden Methodenaufruf beobachten zu können. Oder beim Vorkompilieren mit Crossgen liegt das Ziel außerhalb der Version Bubble.
+
+{/* TODO(verify): JIT-EE interface call canInline / beginInlining and the runtime-side checks (profiler COR_PRF_DISABLE_INLINING, version bubble in crossgen2) in src/coreclr/vm/jitinterface.cpp. */}
+
+Die Runtime merkt sich außerdem, welche Methoden wohin eingebettet wurden. Das braucht sie zum Beispiel, wenn ein Profiler oder Diagnosewerkzeug eine Methode zur Laufzeit neu übersetzen lässt: Dann müssen auch alle Methoden neu übersetzt werden, in die die alte Fassung eingebettet ist. Für den Debugger zeichnet der JIT zu jedem Stück Maschinencode auf, aus welcher Quellzeile es stammt, auch für eingebetteten Code. So kann ein Debugger in optimiertem Code zumindest grob zeigen, wo er sich befindet.
+
+{/* TODO(verify): Runtime tracks inlinees for ReJIT (inlining tracking, R2R inlining info section); debug info for inlined code (inline tree in debug info, used by debuggers and stack traces in .NET 8+?). */}
+
+Schließlich hängt Inlining eng mit Tiered Compilation zusammen. Weil Tier 0 nicht einbettet, sieht ein frisch gestartetes Programm noch jeden kleinen Aufruf. Erst Tier 1 bettet ein, und mit Dynamic PGO weiß Tier 1 dann auch, welche Aufrufstellen wirklich heiß sind (siehe „Tiered Compilation und OSR“).
+
+<Callout kind="version">
+  Die Inlining-Heuristik ändert sich in fast jeder .NET-Version. Größere Schritte waren laut
+  .NET-Blog die profilgestützte Policy, Inlining in geteiltem generischem Code mit Nachschlagearbeit
+  in .NET 8 und das Einbetten von Methoden mit Ausnahmebehandlung in .NET 10. Ob eine bestimmte
+  Methode eingebettet wird, prüfst du deshalb immer auf der Version, die du einsetzt.
+</Callout>
+
+{/* TODO(verify): Version claims in this callout (.NET 8 shared generic runtime lookup inlining, .NET 10 EH inlining) against the Performance Improvements posts. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Drei Beobachtungen bestätigen das Modell. Die erwarteten Ergebnisse sind Richtwerte, prüfe sie auf deiner Version.
+
+**Die Rechnung verschwindet.** Lass dir den Maschinencode von `Compute` und `ComputeNoInline` zeigen. In `ComputeNoInline` sollte ein `call` stehen, in `Compute` nur das Laden der Konstante `50`. Die Methoden tragen `AggressiveOptimization`, damit sie sofort optimiert übersetzt werden, denn Tier 0 würde nichts einbetten.
+
+**Der Frame fehlt.** Der Stacktrace aus `CallsFail(1)` sollte `Fail` nicht enthalten, wenn der JIT `Fail` eingebettet hat. Markierst du `Fail` zusätzlich mit `NoInlining`, taucht es wieder auf.
+
+**Der Unterschied liegt in der Schleife.** Im Benchmark sollte der Abstand zwischen `Inlined` und `NotInlined` klein sein, ein einzelner Aufruf kostet wenig. Bei `SumInlined` gegen `SumNotInlined` sollte er deutlich größer ausfallen, weil der JIT die eingebettete Rechnung mit der Schleife zusammen optimieren kann.
+
+{/* TODO(verify): Expected outcomes on .NET 8+ x64: Compute folds to a constant, Fail is inlined into CallsFail (it contains a throw on one branch), benchmark ratios. */}
+
+<VerifyCard
+  sharplab="Stelle auf sharplab.io die Ausgabe auf „JIT Asm“ und die Konfiguration auf Release. Vergleiche Compute und ComputeNoInline: Erwartet wird ein call in ComputeNoInline und nur eine Konstante in Compute."
+  code={inliningCode}
+  benchmark={benchmarkCode}
+  note="Der Stacktrace-Versuch braucht einen Release-Build. Im Debug-Modus schaltet der Compiler über ein Assembly-Attribut die Optimierungen des JIT ab, und es wird nichts eingebettet."
+/>
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="inlining"
+  questions={[
+    {
+      q: 'Worin liegt der Hauptgewinn des Inlinings?',
+      options: [
+        'Im gesparten call und ret',
+        'Darin, dass der JIT Aufrufer und aufgerufene Methode gemeinsam optimieren kann',
+      ],
+      correct: 1,
+      explanation:
+        'Ein direkter Aufruf kostet nur wenige Takte. Wichtiger ist, dass die Blackbox verschwindet: Konstanten, Register und Grenzprüfungen lassen sich danach über die frühere Methodengrenze hinweg optimieren.',
+    },
+    {
+      q: 'Eine Methode trägt AggressiveInlining und wird über ein Interface aufgerufen, dessen Implementierung der JIT nicht kennt. Wird sie eingebettet?',
+      options: [
+        'Ja, das Attribut erzwingt es',
+        'Nein, ohne bekanntes Ziel gibt es nichts einzubetten',
+      ],
+      correct: 1,
+      explanation:
+        'Das Attribut überspringt nur die Abwägung von Größe und Nutzen. Die Frage, welche Methode überhaupt aufgerufen wird, muss vorher beantwortet sein, etwa durch Devirtualisierung.',
+    },
+    {
+      q: 'Warum fehlt eine Methode manchmal im Stacktrace einer Exception aus einem Release-Build?',
+      options: [
+        'Weil sie eingebettet wurde und zur Laufzeit keinen eigenen Frame hatte',
+        'Weil die Runtime Stacktraces aus Platzgründen kürzt',
+      ],
+      correct: 0,
+      explanation:
+        'Eingebetteter Code ist Teil des Aufrufers. Der Stacktrace zeigt deshalb nur die Methode, in die eingebettet wurde.',
+    },
+    {
+      q: 'Warum lagert Framework-Code einen throw in eine eigene ThrowHelper-Methode aus?',
+      options: [
+        'Damit die Exception schneller geworfen wird',
+        'Damit die heiße Methode klein genug zum Einbetten bleibt und der kalte Wurf-Code außerhalb liegt',
+      ],
+      correct: 1,
+      explanation:
+        'Erzeugen und Werfen der Exception kosten viel IL. Ausgelagert bleibt der Indexer klein, und die Methode, die nur wirft, wird nicht eingebettet.',
+    },
+    {
+      q: 'Eine Bibliothek ist mit ReadyToRun vorkompiliert. Warum bettet der vorkompilierte Code eine Framework-Methode nicht ein, der JIT später aber schon?',
+      options: [
+        'Weil Crossgen die spätere Framework-Version nicht kennt und nur innerhalb der Version Bubble einbettet',
+        'Weil Framework-Methoden grundsätzlich nicht eingebettet werden dürfen',
+      ],
+      correct: 0,
+      explanation:
+        'Eingebetteter Framework-Code würde bei einem Framework-Update veralten. Der JIT übersetzt zur Laufzeit und kennt die geladene Version, deshalb darf er einbetten.',
+    },
+    {
+      q: 'Du misst zwei Varianten einer Methode mit einer Stoppuhr direkt nach dem Start. Warum kann der Effekt des Inlinings dabei unsichtbar bleiben?',
+      options: [
+        'Weil Tier 0 nichts einbettet und die Messung vor Tier 1 endet',
+        'Weil Inlining erst nach einem Neustart wirkt',
+      ],
+      correct: 0,
+      explanation:
+        'Tier 0 übersetzt schnell und verzichtet auf Inlining. Erst Tier 1 bettet ein, und das passiert erst nach der Aufwärmphase.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- **Inlining** setzt den Rumpf einer Methode an die Aufrufstelle, bevor der JIT optimiert. Der eigentliche Gewinn sind die **Folgeoptimierungen**, nicht der gesparte Aufruf.
+- Der JIT entscheidet **pro Aufrufstelle**: Ist das Ziel bekannt, ist Inlining erlaubt, lohnt es sich, reicht das **Budget**?
+- Sehr kleine Methoden werden fast immer eingebettet, große ohne Attribut nie. Dazwischen schätzt eine **Heuristik**, auch mit Daten aus Dynamic PGO.
+- `AggressiveInlining` überspringt nur die Abwägung von Größe und Nutzen. Unbekannte Ziele, verbotene Konstrukte und das Budget kann es nicht aushebeln. `NoInlining` dagegen ist verbindlich.
+- Virtuelle Aufrufe ohne **Devirtualisierung**, Rekursion und Methoden, die nur werfen, werden nicht eingebettet. Das **ThrowHelper**-Muster nutzt das gezielt.
+- Eingebettete Methoden **fehlen im Stacktrace**. Tier 0 und Debug-Builds betten nichts ein.
+- **ReadyToRun** bettet nur innerhalb der Version Bubble ein, der JIT zur Laufzeit auch über Assembly-Grenzen.
+
+</Block>

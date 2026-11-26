@@ -1122,6 +1122,13 @@ svg.arrows circle {
 .tb-table td {
   font-family: var(--font-mono);
 }
+/* Long cells (descriptions, trees) wrap instead of widening the table; short ones stay on a line. */
+.tb-table td:not(:first-child) {
+  white-space: normal;
+  min-width: 6ch;
+  max-width: 26ch;
+  overflow-wrap: break-word;
+}
 .tb-table tr:last-child td {
   border-bottom: 0;
 }

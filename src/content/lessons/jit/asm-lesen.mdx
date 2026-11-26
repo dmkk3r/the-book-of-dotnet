@@ -1,0 +1,357 @@
+---
+id: asm-lesen
+title: JIT-Assembler lesen
+summary: Wie du an den Maschinencode des JIT kommst, welches Minimum an x64 du zum Lesen brauchst, an welchen Mustern du Bounds-Checks, Allokationen, Write Barriers und Typprüfungen erkennst und warum der Kopf eines Listings wichtiger ist als jede einzelne Zeile.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Viewing JIT disassembly and dumps (viewing-jit-dumps.md, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/viewing-jit-dumps.md
+  - title: 'Book of the Runtime: CLR ABI'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/clr-abi.md
+  - title: 'JIT-Helfer (CorInfoHelpFunc in corinfo.h, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/inc/corinfo.h
+  - title: 'x64-Aufrufkonvention (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
+  - title: 'x64-Softwarekonventionen: Register (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions
+  - title: 'System V Application Binary Interface, AMD64 Supplement'
+    url: https://gitlab.com/x86-psABIs/x86-64-ABI
+  - title: 'Übersicht über ARM64-ABI-Konventionen (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/cpp/build/arm64-windows-abi-conventions
+  - title: 'BenchmarkDotNet: Disassembler'
+    url: https://benchmarkdotnet.org/articles/features/disassembler.html
+  - title: 'Disasmo (Visual-Studio-Erweiterung, GitHub)'
+    url: https://github.com/EgorBo/Disasmo
+  - title: 'Performance Improvements in .NET 7 (.NET Blog, Abschnitt zu JitDisasm)'
+    url: https://devblogs.microsoft.com/dotnet/performance_improvements_in_net_7/
+  - title: 'SharpLab'
+    url: https://sharplab.io/
+updated: 2026-11-26
+---
+
+import { Block, Callout, CodeBlock, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './asm-lesen.steps';
+import tiersScript from './asm-lesen-tiers.steps';
+import { sharplabCode, benchmarkCode, patternsCode } from './asm-lesen-verify';
+
+<Block n={1} title="Das Problem">
+
+Irgendwann reicht C# als Erklärung nicht mehr. Zwei Schleifen sehen fast gleich aus, aber eine ist doppelt so schnell. Ein Benchmark zeigt eine Allokation, die im Quelltext nirgends steht. Ein Kollege behauptet, der JIT entferne hier den Bounds-Check, ein anderer bestreitet es. Das IL hilft dabei kaum, denn die Entscheidungen, um die es geht, fallen erst im JIT: Inlining, Bounds-Checks, Registerzuteilung, Vektorisierung.
+
+Die endgültige Antwort steht im Maschinencode, den der JIT erzeugt. Den kannst du dir ansehen, und zwar ohne Spezialwerkzeuge und ohne die Assembler-Programmierung zu beherrschen. Du musst nicht jeden Befehl der x64-Architektur kennen. Es reichen eine Handvoll Register, die Aufrufkonvention und ein Dutzend wiederkehrender Muster.
+
+Das eigentliche Risiko beim Lesen von JIT-Assembler ist ein anderes: dass du den falschen Code liest. Dieselbe Methode existiert im Lauf eines Prozesses in mehreren Fassungen, und jedes Werkzeug zeigt dir eine davon. Wer daraus Schlüsse über Produktion zieht, muss wissen, welche Fassung er gerade vor sich hat.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Ein JIT-Listing ist eine Momentaufnahme. Merke dir drei Sätze:
+
+1. **Erst den Kopf lesen.** Jedes Listing beginnt mit Kommentarzeilen, die sagen, welche Methode in welcher **Stufe** (Tier0, Tier1, FullOpts, OSR), für welchen Prozessor und mit welchem Frame übersetzt wurde. Ohne diese Angaben ist der Rest nicht einzuordnen.
+2. **Nach Mustern suchen, nicht Befehl für Befehl verstehen.** Ein `call CORINFO_HELP_RNGCHKFAIL` ist ein Bounds-Check, ein `call CORINFO_HELP_NEWSFAST` eine Allokation, ein `call CORINFO_HELP_ASSIGN_REF` eine Write Barrier. Die meisten Fragen beantwortest du, indem du solche Muster findest oder ihr Fehlen bemerkst.
+3. **Assembler zeigt, was passiert, nicht wie lange es dauert.** Weniger Befehle sind meist schneller, aber nicht immer. Speicherzugriffe, Sprungvorhersage und Caches entscheiden mit. Das Listing erklärt einen Benchmark, es ersetzt ihn nicht.
+
+<Callout kind="fehlannahme">
+  „Was SharpLab zeigt, ist das, was in Produktion läuft.“ Nein: SharpLab zeigt eine Fassung der
+  Methode, übersetzt auf einem fremden Server, für dessen Prozessor, mit dessen .NET-Version und
+  ohne die Daten, die Dynamic PGO in einem laufenden Prozess sammelt. In Produktion durchläuft die
+  Methode Tier 0 und Tier 1, wird vielleicht in ihre Aufrufer eingesetzt und nutzt einen anderen
+  Befehlssatz. SharpLab ist ein hervorragendes Mikroskop, aber kein Abbild deines Servers.
+</Callout>
+
+{/* TODO(verify): Which tier/optimization level SharpLab's "JIT Asm" view uses (FullOpts via its own JIT invocation?), whether it reflects static readonly values or PGO, and which OS/CPU the SharpLab server runs on. */}
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ist der kleinste interessante Fall: ein Arrayzugriff. Er enthält einen Prolog, einen Bounds-Check, eine Null-Prüfung, eine Adressrechnung, einen Epilog und einen Aufruf eines Runtime-Helfers. Das Listing zeigt voll optimierten Code für Windows x64, so wie er mit `DOTNET_TieredCompilation=0` entsteht. Der Tab „Assembler“ zeigt das vollständige Listing, die Tabellen darunter die Register und das Array im Speicher.
+
+<StepPlayer script={script} />
+
+Beachte, wie viel in diesen neun Befehlen steckt, das im C#-Code unsichtbar ist: die Prüfung der Grenzen, die Null-Prüfung als Nebeneffekt eines Lesezugriffs, das Layout eines Arrays mit der Länge bei Offset 8 und den Elementen ab Offset 16. Das Layout im Detail erklärt die Lektion „Layout von Arrays und Strings“.
+
+</Block>
+
+<Block n={4} title="Wie du an den Assembler kommst">
+
+Es gibt mehrere Wege, und jeder zeigt eine andere Fassung des Codes. Wähle den Weg nach der Frage, die du hast.
+
+| Werkzeug                         | Was es zeigt                                                    | Gut für                              |
+| -------------------------------- | --------------------------------------------------------------- | ------------------------------------ |
+| SharpLab, Ausgabe „JIT Asm“      | eine Fassung pro Methode, auf dem Server übersetzt               | schnelle Fragen an kleinen Schnipseln |
+| `DOTNET_JitDisasm`               | jede Stufe, die in deinem Prozess entsteht                       | Tier 0 und Tier 1 vergleichen         |
+| `DOTNET_JitDisasmSummary`        | eine Zeile pro übersetzter Methode mit Stufe                     | Überblick, was überhaupt übersetzt wird |
+| BenchmarkDotNet `DisassemblyDiagnoser` | den Code der gemessenen Methode nach dem Aufwärmen        | Messung und Code zusammen             |
+| Disasmo (Visual Studio)          | Listing einer Methode per Rechtsklick, über JitDisasm           | Arbeiten direkt im Editor             |
+
+### DOTNET_JitDisasm
+
+Seit .NET 7 kann die ganz normale Runtime ihren eigenen Maschinencode ausgeben. Du setzt eine Umgebungsvariable mit dem Namen der Methode und startest dein Programm:
+
+```bash
+dotnet build -c Release
+DOTNET_JitDisasm="Get" DOTNET_JitStdOutFile=jit.txt dotnet bin/Release/net8.0/Demo.dll
+```
+
+Der Methodenname darf Platzhalter enthalten (`*Get*`), einen Klassennamen (`C:Get`) oder mehrere Namen mit Leerzeichen dazwischen. `DOTNET_JitStdOutFile` schreibt die Ausgabe in eine Datei, damit sie sich nicht mit der Konsolenausgabe deines Programms mischt. `DOTNET_JitDisasmSummary=1` listet alle übersetzten Methoden mit ihrer Stufe, `DOTNET_JitDisasmDiffable=1` ersetzt Adressen durch feste Platzhalter, damit sich zwei Listings mit einem Diff-Werkzeug vergleichen lassen.
+
+{/* TODO(verify): JitDisasm in release runtimes since .NET 7, JitStdOutFile since .NET 8 (viewing-jit-dumps.md lists JitStdOutFile, JitDisasmDiffable, JitDisasmOnlyOptimized and JitDisasmWithCodeBytes as available in the shipped product). */}
+
+Zwei Fallen dabei: Erstens gelten Umgebungsvariablen bei `dotnet run` auch für MSBuild und den Compiler, deshalb erst bauen, dann die DLL starten. Zweitens erscheint eine Methode, die überall eingesetzt wird, nie mit eigenem Listing. Markiere sie für Experimente mit `[MethodImpl(MethodImplOptions.NoInlining)]`.
+
+### BenchmarkDotNet und Disasmo
+
+Der `DisassemblyDiagnoser` von BenchmarkDotNet zeichnet den Code der Benchmark-Methode auf, nachdem sie aufgewärmt wurde, und optional auch den Code der Methoden, die sie aufruft (`maxDepth`). Die Listings landen als Datei neben den Ergebnissen. Damit hast du Messung und Maschinencode aus demselben Lauf, das ist der beste Schutz gegen Verwechslungen. **Disasmo** ist eine Visual-Studio-Erweiterung von Egor Bogatov aus dem JIT-Team, die das Listing einer Methode per Rechtsklick anzeigt und dafür ebenfalls die Ausgabe des JIT nutzt.
+
+{/* TODO(verify): DisassemblyDiagnoser captures code after warmup (tier 1), supported OS/architectures and output file name (*-asm.md); Disasmo's current mechanism (JitDisasm of the installed runtime vs. locally built checked runtime). */}
+
+</Block>
+
+<Block n={5} title="x64 für JIT-Leser">
+
+### Register
+
+x64 hat 16 allgemeine 64-Bit-Register: `rax`, `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, `rbp`, `rsp` und `r8` bis `r15`. Jedes hat kleinere Namen für seine unteren Teile: `eax` sind die unteren 32 Bit von `rax`, `r8d` die von `r8`. Für ein `int` siehst du deshalb fast immer die 32-Bit-Namen. Eine Besonderheit kommt oft vor: Ein Schreibzugriff auf ein 32-Bit-Register setzt die oberen 32 Bit auf null. Daher das scheinbar sinnlose `mov eax, edx` im Beispiel oben.
+
+Zwei Register haben feste Aufgaben. `rsp` ist der Stackzeiger. `rbp` ist der Framepointer, wenn die Methode einen braucht, sonst ein normales Register. Für Gleitkommazahlen und Vektoren gibt es eigene Register: `xmm0` bis `xmm15` mit 128 Bit, auf neueren Prozessoren `ymm` mit 256 und `zmm` mit 512 Bit.
+
+### Aufrufkonvention
+
+Wo Argumente ankommen und das Ergebnis hingehört, legt die Aufrufkonvention des Betriebssystems fest, und hier unterscheiden sich Windows und Linux:
+
+| Aufgabe                       | Windows x64                      | Linux und macOS (System V)      |
+| ----------------------------- | -------------------------------- | ------------------------------- |
+| Ganzzahl- und Verweisargumente | `rcx`, `rdx`, `r8`, `r9`         | `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` |
+| Rückgabewert                  | `rax`                            | `rax`                           |
+| vom Aufgerufenen zu erhalten  | `rbx`, `rbp`, `rdi`, `rsi`, `r12` bis `r15` | `rbx`, `rbp`, `r12` bis `r15` |
+| Platz vom Aufrufer            | 32 Byte Schattenbereich          | keiner                          |
+
+Bei Instanzmethoden ist `this` das erste Argument, unter Windows also `rcx`. Dasselbe C# erzeugt auf Linux deshalb ein Listing mit anderen Registern. Wie Frames und Konventionen im Detail funktionieren, zeigt „Calling Conventions und Frames“.
+
+### Prolog, Epilog und der Kopf
+
+Der **Prolog** richtet den Frame ein: Register sichern, die der Aufgerufene erhalten muss (`push rbx`), Platz schaffen (`sub rsp, 40`), bei Bedarf einen Framepointer setzen (`push rbp`, `mov rbp, rsp` oder `lea rbp, [rsp+…]`). Der **Epilog** macht das vor jedem `ret` rückwärts. Die Kommentarzeilen am Anfang verraten, was dich erwartet:
+
+- `; Assembly listing for method C:Get(int[],int):int (Tier1)`: Methode mit Signatur und Stufe in Klammern.
+- `; Tier0 code`, `; Tier1 code`, `; FullOpts code`, `; Instrumented Tier0 code`, `; Tier1-OSR code`: die Stufe noch einmal ausgeschrieben. Bei OSR folgt `; OSR variant for entry point 0x…`.
+- `; optimized code` und gegebenenfalls `; optimized using Dynamic PGO`: ob und womit optimiert wurde.
+- `; Emitting BLENDED_CODE for X64 with AVX512 - Windows`: Zielprozessor, verfügbarer Befehlssatz und Betriebssystem.
+- `; rbp based frame` oder `; rsp based frame`, dazu `; fully interruptible` oder `; partially interruptible`: Frame-Art und wie der GC den Code unterbrechen darf (siehe „GC-Info und Safe Points“).
+
+Darunter folgen Blöcke mit Namen wie `G_M000_IG01`. „IG“ steht für Instruction Group, die Einheit, in der der Emitter Befehle verwaltet. Am Ende steht `; Total bytes of code …`, die Größe des erzeugten Codes. In Speicheroperanden markiert der JIT außerdem, was dort liegt: `gword ptr` ist ein Objektverweis, den der GC kennt, `bword ptr` ein verwalteter Zeiger (`ref`), `dword ptr` und `qword ptr` sind einfache 32- und 64-Bit-Werte.
+
+{/* TODO(verify): Header lines as printed by codegencommon.cpp on main ("; %s code", "; OSR variant for entry point", "; optimized using %s", "; %s based frame", "; fully/partially interruptible", "; Total bytes of code %d, prolog size ..."); older versions print fewer details, e.g. no "prolog size" in .NET 7. */}
+
+</Block>
+
+<Block n={6} title="Typische Muster">
+
+Mit diesen Mustern beantwortest du die meisten Fragen an ein Listing. Alle Beispiele sind x64 unter Windows und gekürzt.
+
+### Bounds-Check
+
+```text
+cmp      edx, dword ptr [rcx+0x08]
+jae      SHORT G_M000_IG04
+...
+G_M000_IG04:
+call     CORINFO_HELP_RNGCHKFAIL
+```
+
+Ein Vergleich mit der Länge (Offset 8 im Array, bei `Span<T>` ein Register), ein vorzeichenloser Sprung `jae` und ein Block am Ende mit dem Helfer, der die Exception wirft. Fehlt dieses Muster in einer Schleife, hat der JIT den Check entfernt. Wann er das kann, erklärt „Bounds-Check-Elimination“.
+
+### Null-Prüfung durch Zugriff
+
+Eine eigene Prüfung auf null siehst du selten. Der JIT verlässt sich darauf, dass ein Zugriff über einen Null-Verweis auf eine gesperrte Speicherseite trifft und die Runtime die Zugriffsverletzung in eine `NullReferenceException` übersetzt. Braucht er die Prüfung, ohne sonst etwas zu lesen, erzeugt er einen Lesezugriff nur um seiner selbst willen, etwa `cmp byte ptr [rcx], cl`. Wo der Wert schon bewiesen nicht null ist, fehlt jede Spur davon.
+
+{/* TODO(verify): Explicit null check pattern on x64 (cmp byte ptr [reg], reg vs. test byte ptr) in current JIT output. */}
+
+### Allokation, Write Barrier, Typprüfung
+
+<CodeBlock code={patternsCode} lang="asm" />
+
+- **Allokation:** Ein `call` auf einen Helfer wie `CORINFO_HELP_NEWSFAST` (Objekte) oder `CORINFO_HELP_NEWARR_1_VC` (Arrays von Werttypen), vorher die MethodTable als Konstante in `rcx`. Sieht du das in einer heißen Schleife, hast du deine Allokation gefunden. Wie der Helfer arbeitet, zeigt „Allokation und Allocation Contexts“.
+- **Write Barrier:** Jeder Verweis, der in ein Feld eines Heap-Objekts geschrieben wird, läuft über `CORINFO_HELP_ASSIGN_REF` oder `CORINFO_HELP_CHECKED_ASSIGN_REF`, wenn das Ziel nicht sicher im Heap liegt. Warum der GC das braucht, steht in „Write Barriers und Card Tables“.
+- **Typprüfung:** Das erste Feld jedes Objekts ist der MethodTable-Zeiger. Bei einer versiegelten Klasse genügt ein Vergleich von `[rcx]` mit einer Konstanten. Bei anderen Typen ruft der JIT oft einen Helfer wie `CORINFO_HELP_ISINSTANCEOFCLASS`.
+
+### Aufrufe: eingesetzt oder nicht
+
+Ein `call` auf eine verwaltete Methode erscheint mit ihrem Namen, etwa `call [C:Square(int):int]`. Die eckigen Klammern bedeuten einen indirekten Aufruf über eine Speicherzelle, durch die die Runtime den Einstiegspunkt später umstellen kann. Fehlt der Aufruf und steht stattdessen der Rumpf der Methode im Code, wurde sie eingesetzt. Ein Aufruf über `[rax+0x…]` nach dem Laden der MethodTable ist dagegen ein virtueller Aufruf. Wie der JIT solche Aufrufe auflöst, zeigt „Devirtualisierung“.
+
+{/* TODO(verify): Format of direct and indirect managed calls in JitDisasm output ("call [C:Square(int):int]" vs. "call C:Square(int):int") and virtual call pattern on .NET 8+. */}
+
+### Schleifen und Vektoren
+
+Eine Schleife erkennst du an einem Sprung zurück zu einer früheren Instruction Group. Davor steht manchmal ein `align`-Pseudobefehl, mit dem der JIT den Schleifenanfang im Speicher ausrichtet. Vektorisierter Code fällt durch die breiten Register auf: `vmovups ymm0, ymmword ptr [...]`, `vpaddd`, `vpcmpeqb`. Typisch ist eine Hauptschleife, die mehrere Elemente pro Durchlauf verarbeitet, gefolgt von einem skalaren Rest für die letzten Elemente. Mehr dazu in „Hardware-Intrinsics und SIMD“.
+
+{/* TODO(verify): Format of the loop alignment pseudo-instruction in JitDisasm ("align [N bytes for IG..]") and since which version loop alignment is on by default (.NET 6). */}
+
+### Ein Blick auf ARM64
+
+Auf ARM64 sehen die Muster anders aus, die Ideen bleiben gleich. Argumente kommen in `x0` bis `x7` an, das Ergebnis geht in `x0`, `w0` ist die 32-Bit-Hälfte. Der Prolog sichert Framepointer und Rücksprungadresse mit `stp fp, lr, [sp, #-0x10]!`, der Bounds-Check ist ein `cmp` mit anschließendem `b.hs` (bei `hs`, also vorzeichenlos größer oder gleich). Lies auch hier zuerst den Kopf, dort steht `ARM64` statt `X64`.
+
+{/* TODO(verify): ARM64 JitDisasm syntax for prolog (stp fp, lr, [sp, #-0x10]!), bounds check (cmp + bhs vs b.hs) and the "Emitting ... for arm64" header line. */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Tier 0 für bare Münze nehmen
+
+Die häufigste Verwechslung: Du startest ein Programm mit `DOTNET_JitDisasm`, siehst den ersten Eintrag und erschrickst über den Code. Das ist fast immer Tier 0. Das folgende Beispiel zeigt dieselbe Methode in beiden Fassungen, so wie sie untereinander in der Ausgabe erscheinen.
+
+<StepPlayer script={tiersScript} />
+
+Tier 0 ist kein schlechter Tier-1-Code, sondern bewusst schnell übersetzter Code. Wenn du nur optimierte Fassungen sehen willst, hilft `DOTNET_JitDisasmOnlyOptimized=1`. Warum es überhaupt mehrere Fassungen gibt, erklärt „Tiered Compilation und OSR“, wie die Pipeline in Tier 0 abgespeckt wird, steht in „Die Pipeline von RyuJIT“.
+
+### Die Methode allein betrachten
+
+Ein Listing zeigt eine Methode für sich. In Produktion ist eine kleine Methode aber meist in ihre Aufrufer eingesetzt, und dort sieht ihr Code anders aus: Konstanten des Aufrufers werden eingefaltet, Prüfungen fallen weg, weil der Aufrufer sie schon gemacht hat. Ein Bounds-Check in `Get` sagt also nichts darüber, ob er in der Schleife des Aufrufers noch existiert.
+
+### Einen anderen Prozessor lesen
+
+Der JIT übersetzt für den Prozessor, auf dem er läuft. Auf einem Rechner mit AVX-512 kann eine Methode `zmm`-Register nutzen, auf einem mit AVX2 nur `ymm`, auf ARM64 ganz andere Befehle. Ein Listing von deinem Laptop beschreibt deinen Server nur, wenn beide denselben Befehlssatz haben. Die Zeile `; Emitting … for X64 with …` verrät, wofür übersetzt wurde.
+
+### Dynamic PGO übersehen
+
+Tier-1-Code in einem echten Prozess nutzt die Daten, die Dynamic PGO in der instrumentierten Stufe gesammelt hat. Dadurch können Typprüfungen mit direkten Aufrufen entstehen, die es in SharpLab oder mit abgeschaltetem Tiering nicht gibt. Der Kopf verrät es mit `; optimized using Dynamic PGO`. Was dahintersteckt, beschreibt „Dynamic PGO“.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Wenn du eine konkrete Frage an den Code hast, geh in dieser Reihenfolge vor:
+
+1. **Richtige Fassung besorgen.** Release-Build, Methode mit `NoInlining` markieren, wenn du sie einzeln sehen willst, Programm lange genug laufen lassen oder gleich BenchmarkDotNet mit `DisassemblyDiagnoser` verwenden.
+2. **Kopf prüfen.** Stufe, Befehlssatz, Betriebssystem. Passt das zu der Umgebung, über die du eine Aussage machen willst?
+3. **Größe ansehen.** `Total bytes of code` ist ein grobes, aber schnelles Signal. Ein Sprung von 40 auf 400 Byte nach einer kleinen Änderung lohnt einen zweiten Blick.
+4. **Alle `call`-Befehle durchgehen.** Helfer für Allokation, Write Barrier, Typprüfung und Exceptions verraten mehr als jede arithmetische Zeile. Aufrufe verwalteter Methoden zeigen, was nicht eingesetzt wurde.
+5. **Schleifen finden.** Rücksprünge suchen, dann im Schleifenrumpf nach Bounds-Checks, Allokationen und Aufrufen schauen. Dort zählt jeder Befehl.
+6. **Mit einer Messung abgleichen.** Eine Vermutung aus dem Listing ist erst bestätigt, wenn ein Benchmark sie trägt.
+
+Zum Vergleichen zweier Varianten setzt du `DOTNET_JitDisasmDiffable=1` und vergleichst die beiden Ausgabedateien mit einem Diff-Werkzeug. So siehst du sofort, welche Befehle eine Änderung im C#-Code tatsächlich bewirkt hat.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Listings, die du liest, stammen direkt aus dem JIT. `DOTNET_JitDisasm` gibt nicht die fertigen Bytes durch einen fremden Disassembler aus, sondern druckt die Befehle aus der internen Darstellung des Emitters. Deshalb kennt das Listing Dinge, die ein normaler Disassembler nicht wissen kann: die Namen der Runtime-Helfer statt nackter Adressen, die Namen aufgerufener Methoden, `gword` für Objektverweise und die Instruction Groups.
+
+Die Helfer selbst gehören der Runtime. Der JIT kennt nur ihre Nummern aus der Aufzählung `CorInfoHelpFunc` und fragt über die JIT/EE-Schnittstelle nach ihrer Adresse. Welche Implementierung hinter `CORINFO_HELP_NEWSFAST` oder `CORINFO_HELP_ASSIGN_REF` steckt, entscheidet die Runtime beim Start, etwa abhängig vom GC-Modus oder vom Prozessor. Im Listing siehst du deshalb immer den Namen, nie den Code des Helfers.
+
+{/* TODO(verify): Which helpers the runtime selects or patches at startup (write barrier variants depending on GC mode, regions, software write watch; allocation helper variants) on .NET 8+. */}
+
+Auch die Stufe im Kopf kommt aus dem JIT. Er druckt, was die Runtime verlangt hat, und vermerkt, wenn er davon abgewichen ist. Eine Methode mit Schleife, für die OSR nicht möglich ist, kann trotz Tier-0-Anforderung als „Tier-0 switched to FullOpts“ erscheinen, eine riesige Methode trotz Tier-1-Anforderung mit „MinOpts“ im Namen.
+
+<Callout kind="version">
+  Vor .NET 7 gab es die Ausgabe des Maschinencodes nur mit einem selbst gebauten Checked-JIT oder
+  über Umwege wie Debugger und Werkzeuge mit eigenem Disassembler. Seit .NET 7 genügt die normale
+  Runtime. Das Format des Kopfes hat sich seitdem erweitert, ältere Versionen drucken zum Beispiel
+  weniger Angaben am Ende des Listings.
+</Callout>
+
+{/* TODO(verify): JitDisasm in release builds since .NET 7 (Performance Improvements in .NET 7); exact long tiering names "Tier-0 switched to FullOpts" (compGetTieringName) and when they appear (loops without OSR support, explicit tail calls). */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Drei Experimente: die Muster in SharpLab finden, Tier 0 und Tier 1 lokal vergleichen und Messung und Code mit BenchmarkDotNet verbinden.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „JIT Asm“. Suche in Get das cmp mit [rcx+0x08] und den Aufruf von CORINFO_HELP_RNGCHKFAIL. Prüfe in SumAll, ob in der Schleife noch ein Bounds-Check steht. Finde in Create den Allokations-Helfer, in Store die Write Barrier und in IsLeaf den Vergleich mit der MethodTable von Leaf. Lies dabei zuerst den Kopf jedes Listings."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  note="Der DisassemblyDiagnoser legt die Listings neben den Ergebnissen ab. Vergleiche SumFor und SumLinq: Achte auf Aufrufe, Bounds-Checks und breite Vektorregister. Welche Fassung gemessen wurde, steht wieder im Kopf."
+/>
+
+Für den Vergleich der Stufen startest du ein kleines Programm, das `Get` einige Sekunden lang aufruft, mit `DOTNET_JitDisasm=Get`. Du solltest zuerst ein Listing mit `Tier0` im Kopf sehen, mit `rbp`-Frame und Speicherzugriffen auf die Argumente, und später eines mit `Tier1`, das dem Durchspielen oben entspricht. Mit `DOTNET_TieredCompilation=0` erscheint nur ein Listing mit `FullOpts`.
+
+{/* TODO(verify): Expected listings for Get, SumAll (bounds check removed in the for loop over a.Length), Create, Store and IsLeaf on .NET 8+ x64; whether SumLinq shows vectorized code via Enumerable.Sum for int[] (.NET 8). */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="asm-lesen"
+  questions={[
+    {
+      q: 'Du siehst in einem Listing für arr[i] die Befehle cmp edx, dword ptr [rcx+0x08] und jae zu einem Block mit CORINFO_HELP_RNGCHKFAIL. Was ist das?',
+      options: ['Eine Null-Prüfung', 'Ein Bounds-Check', 'Eine Typprüfung'],
+      correct: 1,
+      explanation:
+        'Bei Offset 8 liegt die Länge des Arrays. Ist der Index vorzeichenlos größer oder gleich, springt der Code zum Helfer, der die IndexOutOfRangeException wirft.',
+    },
+    {
+      q: 'Warum genügt ein einziger vorzeichenloser Sprung jae, um auch negative Indizes abzufangen?',
+      options: [
+        'Weil C# negative Indizes schon beim Kompilieren verbietet',
+        'Weil eine negative Zahl vorzeichenlos betrachtet größer ist als jede gültige Länge',
+      ],
+      correct: 1,
+      explanation:
+        'Im Zweierkomplement hat eine negative Zahl das oberste Bit gesetzt. Als vorzeichenlose Zahl gelesen ist sie riesig, also greift derselbe Vergleich.',
+    },
+    {
+      q: 'Das erste Listing von DOTNET_JitDisasm zeigt viele Zugriffe auf [rbp+…] und keine eingesetzten Aufrufe. Was schließt du daraus?',
+      options: [
+        'Der JIT kann diese Methode nicht optimieren',
+        'Wahrscheinlich ist es Tier-0-Code, der Kopf des Listings bestätigt das',
+      ],
+      correct: 1,
+      explanation:
+        'Tier 0 übersetzt ohne Inlining und hält Argumente und Locals im Frame. Die optimierte Fassung erscheint später als zweites Listing mit Tier1 im Kopf.',
+    },
+    {
+      q: 'Unter Linux steht dasselbe Argument in einem anderen Register als unter Windows. Warum?',
+      options: [
+        'Weil der JIT unter Linux schlechter optimiert',
+        'Weil die Aufrufkonventionen verschieden sind: Windows nutzt rcx, rdx, r8, r9, System V rdi, rsi, rdx, rcx, r8, r9',
+      ],
+      correct: 1,
+      explanation:
+        'Der JIT hält sich an die Aufrufkonvention der Plattform. Der Rest des Codes kann deshalb ebenfalls leicht anders aussehen.',
+    },
+    {
+      q: 'In einer heißen Schleife steht call CORINFO_HELP_NEWSFAST. Was bedeutet das?',
+      options: [
+        'In jedem Durchlauf wird ein Objekt auf dem Heap alloziert',
+        'Die Schleife wird gerade neu übersetzt',
+        'Hier wird ein Feld mit einem Verweis beschrieben',
+      ],
+      correct: 0,
+      explanation:
+        'NEWSFAST ist der Allokations-Helfer für kleine Objekte. Für Verweise in Feldern stünde dort eine Write Barrier wie CORINFO_HELP_ASSIGN_REF.',
+    },
+    {
+      q: 'SharpLab zeigt für deine Methode keinen Bounds-Check. Darfst du daraus schließen, dass er in Produktion fehlt?',
+      options: [
+        'Ja, der JIT erzeugt überall denselben Code',
+        'Nicht sicher: Version, Prozessor, Stufe, PGO und der Aufrufkontext können abweichen',
+      ],
+      correct: 1,
+      explanation:
+        'SharpLab zeigt eine Fassung auf einem fremden Server. In Produktion entscheiden Tier, PGO-Daten, Befehlssatz und Inlining in den Aufrufer mit. Prüfe im Zweifel mit JitDisasm oder dem DisassemblyDiagnoser in deiner Umgebung.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Lies immer zuerst den **Kopf** eines Listings: Methode, Stufe (`Tier0`, `Tier1`, `FullOpts`, `Tier1-OSR`, `Instrumented Tier0`), Befehlssatz, Betriebssystem und Frame-Art.
+- `DOTNET_JitDisasm` zeigt seit .NET 7 mit der normalen Runtime jede Stufe einer Methode, `DOTNET_JitStdOutFile` schreibt sie in eine Datei, der `DisassemblyDiagnoser` verbindet Code und Messung.
+- Für x64 reichen wenige Grundlagen: Register und ihre 32-Bit-Namen, die **Aufrufkonvention** (Windows `rcx`, `rdx`, `r8`, `r9`, System V `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, Ergebnis in `rax`), Prolog und Epilog.
+- Muster erkennen statt Befehle übersetzen: `cmp` plus `jae` zu `CORINFO_HELP_RNGCHKFAIL` ist ein **Bounds-Check**, `CORINFO_HELP_NEWSFAST` eine **Allokation**, `CORINFO_HELP_ASSIGN_REF` eine **Write Barrier**, ein Vergleich mit `[rcx]` eine Typprüfung über die MethodTable.
+- Null-Prüfungen stecken meist in einem ohnehin nötigen Speicherzugriff, die Runtime macht aus der Zugriffsverletzung eine `NullReferenceException`.
+- Was SharpLab oder ein einzelnes Listing zeigt, ist **eine** Fassung. Stufe, PGO, Prozessor, Betriebssystem und Inlining in Aufrufer können in Produktion anderen Code ergeben.
+- Assembler erklärt Messungen, ersetzt sie aber nicht.
+
+</Block>

@@ -944,6 +944,62 @@
       "aliases": ["Sprungtabellen"],
       "definition": "Die IL-Instruktion switch: ein Index wählt direkt ein Sprungziel aus einer Liste. Der Compiler nutzt sie für dichte Ganzzahl-Fälle in switch-Anweisungen.",
       "lesson": "pattern-matching"
+    },
+    {
+      "id": "minopts",
+      "term": "MinOpts",
+      "aliases": [],
+      "definition": "Übersetzungsmodus des JIT ohne die meisten Optimierungen. Er ist schnell und wird für Tier 0, Debug-Code und sehr große Methoden genutzt.",
+      "lesson": "jit-pipeline"
+    },
+    {
+      "id": "ryujit",
+      "term": "RyuJIT",
+      "aliases": [],
+      "definition": "Der JIT-Compiler von CoreCLR. Er übersetzt IL über mehrere Phasen (Import, Inlining, Optimierung, Registerzuteilung) in Maschinencode.",
+      "lesson": "jit-pipeline"
+    },
+    {
+      "id": "loop-cloning",
+      "term": "Loop Cloning",
+      "aliases": [],
+      "definition": "JIT-Optimierung: Eine Schleife wird verdoppelt. Eine Prüfung vorab entscheidet, ob die schnelle Kopie ohne Bounds-Checks laufen darf oder die langsame mit Prüfungen.",
+      "lesson": "bounds-checks"
+    },
+    {
+      "id": "bounds-check",
+      "term": "Bounds-Check",
+      "aliases": ["Bounds-Checks", "Bereichsprüfung"],
+      "definition": "Prüfung, ob ein Index innerhalb eines Arrays oder Spans liegt, bevor zugegriffen wird. Schlägt sie fehl, wird eine IndexOutOfRangeException geworfen. Der JIT entfernt sie, wo er beweisen kann, dass sie nie fehlschlägt.",
+      "lesson": "bounds-checks"
+    },
+    {
+      "id": "simd",
+      "term": "SIMD",
+      "aliases": ["Single Instruction, Multiple Data"],
+      "definition": "Eine Prozessorinstruktion verarbeitet mehrere Werte gleichzeitig, etwa vier int in einem 128-Bit-Register. In .NET über Vector<T>, Vector128<T> und die Hardware-Intrinsics nutzbar.",
+      "lesson": "simd"
+    },
+    {
+      "id": "hardware-intrinsic",
+      "term": "Hardware-Intrinsic",
+      "aliases": ["Hardware-Intrinsics"],
+      "definition": "Methode, die der JIT direkt in eine bestimmte Prozessorinstruktion übersetzt, etwa aus System.Runtime.Intrinsics.X86 oder .Arm. Vorher wird mit IsSupported geprüft, ob die CPU sie kennt.",
+      "lesson": "simd"
+    },
+    {
+      "id": "stack-allokation",
+      "term": "Stack-Allokation",
+      "aliases": ["Object Stack Allocation"],
+      "definition": "Optimierung der Escape Analysis: Ein Objekt, das die Methode nicht verlässt, wird im Stack-Frame statt auf dem Heap angelegt und belastet den GC nicht.",
+      "lesson": "escape-analysis"
+    },
+    {
+      "id": "klassenprofil",
+      "term": "Klassenprofil",
+      "aliases": [],
+      "definition": "Von Dynamic PGO gesammelte Statistik, welche Typen an einer virtuellen oder Interface-Aufrufstelle tatsächlich vorkommen. Grundlage für Guarded Devirtualization.",
+      "lesson": "pgo"
     }
   ]
 }

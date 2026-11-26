@@ -1,0 +1,303 @@
+---
+id: escape-analysis
+title: Escape Analysis
+summary: Wie der JIT beweist, dass ein Objekt seine Methode nie verlässt, warum es dann im Stack-Frame oder ganz in Registern landen kann und warum das ohne Inlining fast nie gelingt.
+status: draft
+dotnetVersion: '9+'
+sources:
+  - title: 'Object Stack Allocation (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/object-stack-allocation.md
+  - title: 'ObjectAllocator im JIT (objectalloc.cpp im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/objectalloc.cpp
+  - title: 'Konfigurationswerte des JIT (jitconfigvalues.h im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/jitconfigvalues.h
+  - title: "What's new in the .NET 9 runtime: Object stack allocation for boxes (Microsoft Learn)"
+    url: https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-9/runtime
+  - title: "What's new in the .NET 10 runtime: Stack allocation, Escape analysis (Microsoft Learn)"
+    url: https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-10/runtime
+  - title: 'Performance Improvements in .NET 10 (.NET Blog, Abschnitt Object Stack Allocation)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-10/
+  - title: 'De-Abstraktion in .NET 10 (Tracking-Issue dotnet/runtime#108913)'
+    url: https://github.com/dotnet/runtime/issues/108913
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './escape-analysis.steps';
+import decisionScript from './escape-analysis-decision.steps';
+import delegateScript from './escape-analysis-delegate.steps';
+import { escapeCode, benchmarkCode } from './escape-analysis-verify';
+
+<Block n={1} title="Das Problem">
+
+Moderner C#-Code erzeugt viele kleine Objekte, die nur einen Augenblick leben. Ein Hilfsobjekt, das zwei Werte bündelt. Ein Enumerator für ein `foreach` über ein `IEnumerable<T>`. Ein Delegate für ein Lambda, das sofort aufgerufen wird. Eine Box, weil eine Methode `object` erwartet. Ein Array aus einer Collection Expression, das gleich wieder vergessen wird.
+
+Jedes dieser Objekte kostet. Die Allokation selbst ist billig, wie „Allokation und Allocation Contexts“ zeigt: Die Runtime schiebt einen Zeiger weiter und nullt den Speicher. Teuer wird die Menge. Jedes Objekt belegt Platz in Gen0, und je schneller sich Gen0 füllt, desto öfter muss der GC laufen. Dazu kommen Header und MethodTable-Zeiger, die bei einem Objekt mit zwei `int`-Feldern mehr Platz brauchen als die Daten selbst.
+
+Dabei wäre der Heap für solche Objekte gar nicht nötig. Der Heap existiert, damit Objekte länger leben können als die Methode, die sie erzeugt hat. Ein Objekt, das seine Methode nie verlässt, braucht diese Eigenschaft nicht. Es könnte genauso gut im Stack-Frame liegen und mit ihm verschwinden, ganz ohne GC.
+
+Genau das versucht **Escape Analysis**: Der JIT prüft für jede Allokation, ob das Objekt aus der Methode „entkommen“ kann. Kann es das nachweislich nicht, legt er es auf den Stack. Oft geht er danach noch einen Schritt weiter und zerlegt das Objekt in seine Felder, die dann einfach in Registern liegen.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Vier Sätze tragen den Rest der Lektion:
+
+1. **Entkommen heißt: Ein Verweis kann den Frame überleben.** Wird er in ein Feld geschrieben, zurückgegeben oder an Code übergeben, den der JIT nicht sieht, gilt das Objekt als entkommen.
+2. **Der JIT muss beweisen, nicht vermuten.** Die Analyse ist konservativ. Alles, was sie nicht versteht, zählt als Entkommen. Im Zweifel landet das Objekt auf dem Heap.
+3. **Der Beweis gilt nur innerhalb einer Methode.** Der JIT analysiert die Methode, die er gerade übersetzt, und sonst nichts. Erst das Inlining holt aufgerufene Methoden in diesen Sichtbereich.
+4. **Stack-Allokation ist oft nur der erste Schritt.** Liegt das Objekt erst im Frame, kann der JIT es wie einen lokalen Struct behandeln und in einzelne Werte zerlegen. Am Ende bleibt häufig gar kein Objekt übrig.
+
+Escape Analysis ist eine Optimierung des JIT. Sie hat nichts mit den Regeln zu tun, mit denen der C#-Compiler bei `ref struct` und `scoped` prüft, wohin ein Verweis entkommen darf. Die Lektion „ref struct, ref-Locals und scoped“ beschreibt diese Sprachregeln. Der Unterschied ist grundsätzlich: Der Compiler lehnt falschen Code ab, der JIT optimiert stillschweigend, wenn er kann, und lässt es sonst bleiben.
+
+<Callout kind="fehlannahme">
+  „Der JIT legt alle kurzlebigen Objekte automatisch auf den Stack.“ Nein: Entscheidend ist nicht,
+  wie lange ein Objekt lebt, sondern ob der JIT beweisen kann, dass kein Verweis darauf die Methode
+  verlässt. Ein Objekt, das an eine nicht eingebettete Methode geht, landet auf dem Heap, auch wenn
+  es eine Nanosekunde später tot ist. Und in Tier 0, in Schleifen und oberhalb einer Größengrenze
+  findet gar keine Stack-Allokation statt.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ist die kleinste sinnvolle Allokation: ein `Point` mit zwei Feldern, der nur gebaut wird, um daraus eine Zahl zu berechnen. Die ersten Schritte zeigen den Weg ohne Escape Analysis, danach dieselbe Methode mit Stack-Allokation und Promotion. Der letzte Schritt zeigt, wie wenig nötig ist, damit alles wieder auf dem Heap landet.
+
+<StepPlayer script={script} />
+
+{/* TODO(verify): Asm listings in the step script (see TODO there). */}
+
+Beachte Schritt 5: Das Objekt im Frame hat einen MethodTable-Zeiger, aber keinen Object Header. Der JIT fragt die Runtime nach der Größe der Instanz ohne Header, also nach dem MethodTable-Zeiger plus Feldern. Für `Point` sind das 16 statt 24 Byte. Den MethodTable-Zeiger braucht das Objekt trotzdem, denn für den Rest des Codes soll es aussehen wie jedes andere Objekt, etwa für einen Typtest oder einen virtuellen Aufruf, den der JIT nicht wegoptimieren konnte.
+
+Im Tab „Assembler“ siehst du beide Enden des Wegs. In Variante A steht ein `call CORINFO_HELP_NEWSFAST`, der Allokations-Helfer. In Variante B fehlt er, und mit ihm jede Spur des Objekts.
+
+</Block>
+
+<Block n={4} title="Was als Entkommen zählt">
+
+Der JIT führt die Analyse auf seiner Zwischendarstellung aus, nachdem das Inlining abgeschlossen ist. Er betrachtet jede Allokation, die einem lokalen Wert zugewiesen wird, und verfolgt, wohin dieser Verweis fließt. Dafür baut er einen **Verbindungsgraphen**: Wird ein Local in einen anderen kopiert, bekommt der Graph eine Kante. Wird ein Local auf eine Weise benutzt, die der JIT nicht modellieren kann, markiert er ihn als entkommen. Am Ende breitet sich diese Markierung über die Kanten aus. Entkommt `q` und wurde `p` irgendwann nach `q` kopiert, entkommt auch das Objekt hinter `p`.
+
+Typische Wege nach draußen:
+
+| Verwendung                                              | Entkommt? | Warum                                                    |
+| ------------------------------------------------------- | --------- | -------------------------------------------------------- |
+| Felder lesen und schreiben, Länge lesen, Null-Vergleich | nein      | Der Verweis selbst wird nicht weitergegeben              |
+| Kopie in einen anderen lokalen Wert                     | hängt ab  | Kante im Graphen, entscheidend ist der andere Wert       |
+| Speichern in ein Feld eines Heap-Objekts oder in `static` | ja      | Von außen erreichbar                                     |
+| `return`                                                | ja        | Der Aufrufer bekommt den Verweis                         |
+| Argument eines nicht eingebetteten Aufrufs, auch `this` | ja        | Der JIT sieht nicht, was die Methode damit tut           |
+| Einfangen in einem Lambda                               | ja        | Die Variable wird ein Feld der Closure auf dem Heap      |
+| Speichern in ein Feld eines lokalen Structs             | ab .NET 10 nein | Sofern der Struct selbst nicht entkommt            |
+
+Die Tabelle zeigt auch, warum die Analyse so streng ist. Sie muss nicht nur den häufigen Fall richtig behandeln, sondern jeden. Ein Objekt im Frame, auf das nach dem Ende der Methode noch ein Verweis existiert, wäre ein Zeiger in überschriebenen Stack-Speicher: ein Fehler, der irgendwann später und an ganz anderer Stelle zuschlägt. Deshalb gilt in jedem unklaren Fall „entkommt“.
+
+Neben dem Entkommen prüft der JIT weitere Bedingungen. Der folgende Graph zeigt die Entscheidung für eine einzelne Allokation, durchgespielt an sechs kleinen Methoden.
+
+<StepPlayer script={decisionScript} />
+
+Zwei Regeln aus dem Graphen verdienen eine Begründung. **Schleifen:** Ein Bereich im Frame hat eine feste Adresse. Alloziert eine Schleife in jedem Durchlauf, müsste derselbe Bereich für mehrere Objekte stehen, und der JIT müsste beweisen, dass das Objekt aus dem letzten Durchlauf schon tot ist. Das tut er derzeit nicht, er lehnt Allokationen in Blöcken ab, die in einer Schleife liegen können. **Größe:** Ein Thread-Stack ist klein und lässt sich nicht vergrößern. In .NET 10 liegt die Obergrenze pro Objekt standardmäßig bei 528 Byte, einstellbar über `JitObjectStackAllocationSize`. Bei Arrays muss die Länge außerdem zur Übersetzungszeit feststehen.
+
+{/* TODO(verify): Default JitObjectStackAllocationSize 528 bytes in release/10.0 (jitconfigvalues.h); .NET 9 used a fixed limit of 0x2000 bytes (s_StackAllocMaxSize in objectalloc.h, release/9.0). */}
+
+Objekte mit Verweisfeldern sind übrigens kein Ausschlussgrund. Die Felder eines Stack-Objekts meldet der JIT dem GC genauso wie die Verweisfelder eines lokalen Structs. Mehr dazu weiter unten.
+
+</Block>
+
+<Block n={5} title="Ohne Inlining keine Escape Analysis">
+
+Die Analyse sieht nur eine Methode. Fast jedes Objekt wird aber an irgendeine Methode übergeben, und sei es nur an seinen eigenen Konstruktor oder an eine Property. Ohne Inlining würde der erste Aufruf jedes Objekt entkommen lassen. Das Design-Dokument nennt das ausdrücklich: Am teuersten ist die Annahme, dass `this` an jeder nicht eingebetteten Aufrufstelle entkommt.
+
+Die Reihenfolge in der Pipeline ist deshalb kein Zufall. Wie „Die Pipeline von RyuJIT“ zeigt, kommt das Inlining früh. Erst danach läuft die Phase, die über Stack-Allokation entscheidet. Alles, was eingebettet wurde, ist für die Analyse sichtbar, alles andere ist eine Blackbox. Welche Methoden eingebettet werden, erklärt die Lektion „Inlining“. Für Escape Analysis folgt daraus eine einfache Regel: Ein Objekt bleibt nur dann im Frame, wenn **jede** Methode, die es zu sehen bekommt, eingebettet wurde oder dem JIT als harmlos bekannt ist.
+
+Mit „harmlos bekannt“ sind Sonderfälle gemeint. Bestimmte Helfer der Runtime und einige Intrinsics, etwa das Kopieren von Span-Inhalten, lassen ihre Argumente nachweislich nicht entkommen. .NET 10 hat diese Liste erweitert, unter anderem um den Aufruf eines Delegates. Das zeigt das nächste Beispiel aus der .NET-10-Dokumentation.
+
+<StepPlayer script={delegateScript} />
+
+Interessant ist die Arbeitsteilung. Den Delegate rettet nicht das Inlining des Lambdas, denn der Lambda-Rumpf wird weiter normal aufgerufen. Den Ausschlag gibt, dass der JIT den Aufruf von `Invoke` selbst versteht: Er weiß, wohin der Delegate springt, und er weiß, dass `Invoke` sich den Delegate nicht merkt. Die Closure dagegen geht als Argument an den Lambda-Rumpf, und dort endet der Sichtbereich. Damit hängt auch dieses Beispiel an der Frage, welche Aufrufe der JIT durchschauen kann. Wie er unbekannte Ziele überhaupt erst bekannt macht, zeigen „Devirtualisierung“ und „Dynamic PGO“.
+
+</Block>
+
+<Block n={6} title="Vom Stack-Objekt zu einzelnen Werten">
+
+Ein Objekt im Frame spart die Allokation und die Arbeit des GC. Der größere Gewinn kommt oft danach. Für den JIT ist das Stack-Objekt ein lokaler Wert mit bekanntem Layout, im Grunde ein Struct mit einem zusätzlichen MethodTable-Zeiger vorne. Auf lokale Structs kann er eine Optimierung anwenden, die er ohnehin beherrscht: **Promotion**. Dabei wird jedes Feld zu einem eigenen lokalen Wert, und diese Werte kann die Registerzuteilung in Register legen. Wird der MethodTable-Zeiger nirgends gelesen, entfällt sogar das Schreiben dieses Zeigers.
+
+Am Ende steht, was andere Compiler **Scalar Replacement** nennen: Das Objekt existiert nur noch als Idee im Quelltext. Im Maschinencode stehen zwei Register mit `X` und `Y`. Die .NET-10-Dokumentation beschreibt genau diesen Zusammenhang: Nach der Stack-Allokation kann der JIT erwägen, das Objekt vollständig durch seine skalaren Werte zu ersetzen.
+
+Promotion gibt es für Werttypen schon länger, und sie hat ihre eigenen Grenzen. Wird die Adresse des Structs genommen und an eine Methode übergeben, die der JIT nicht sieht, muss der Struct als zusammenhängender Speicher im Frame bleiben. Neuere Versionen haben die Promotion deutlich verallgemeinert, die Dokumentation spricht von **Physical Promotion**. Für Escape Analysis heißt das: Je besser die Promotion, desto öfter verschwindet ein Stack-Objekt ganz.
+
+{/* TODO(verify): Physical promotion introduced in .NET 8 (Performance Improvements in .NET 8); name of the old scheme ("old promotion" / struct promotion) in the JIT docs. */}
+
+Das erklärt auch den Fall aus der .NET-9-Dokumentation, bei dem `Compare(3, 4)` mit zwei geboxten Zahlen aufgerufen wird. Nach dem Inlining entkommen die beiden Boxen nicht, sie landen im Frame, werden zerlegt, und der JIT erkennt, dass er `3.Equals(4)` schon beim Übersetzen ausrechnen kann. Die ganze Methode schrumpft auf `mov eax, 100` und `ret`. Wie solche Boxen überhaupt entstehen, zeigt „Boxing und Unboxing“.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+**Tier 0 alloziert immer.** Die Phase läuft nur, wenn der JIT optimiert. Die ersten Aufrufe einer Methode laufen aber in Tier 0, siehe „Tiered Compilation und OSR“. Ein Programm, das eine Methode nur ein paarmal aufruft, sieht deshalb nie einen Effekt. Benchmarks ohne Aufwärmphase und Debug-Builds ebenso wenig.
+
+**Eine kleine Änderung kippt die Entscheidung.** Ein zusätzliches `Console.WriteLine(p)`, ein Logging-Aufruf, eine Methode, die über das Inlining-Budget rutscht: Schon entkommt das Objekt. Escape Analysis ist kein Vertrag. Code, der heute nicht alloziert, kann nach einer harmlosen Änderung wieder allozieren, ohne dass sich das Verhalten des Programms ändert.
+
+**Bedingtes Entkommen.** Oft entkommt ein Objekt nur auf einem seltenen Pfad, etwa im Fehlerfall. Lange reichte das, um es auf den Heap zu schicken. .NET 10 kann in einigen Mustern, die aus Guarded Devirtualization entstehen, den Code klonen: Der schnelle Pfad bekommt das Objekt im Frame, der langsame Pfad alloziert auf dem Heap. Das betrifft vor allem Enumeratoren, die hinter einer Typprüfung stecken. Allgemeine partielle Escape Analysis, bei der ein Objekt erst kurz vor dem Entkommen auf den Heap kopiert wird, beherrscht der JIT dagegen nicht. Der Quellcode nennt sie ausdrücklich als mögliche spätere Erweiterung.
+
+{/* TODO(verify): Conditional escape analysis in .NET 10 (dotnet/runtime#111473 and follow-ups) is limited to GDV-guarded uses and enumerator patterns; "partial escape analysis" mentioned only as a future idea in objectalloc.cpp comments. */}
+
+**Messen auf der falschen Version.** Was in .NET 10 im Frame liegt, kann in .NET 9 noch auf dem Heap liegen und umgekehrt nach einer Änderung an den Heuristiken auch einmal wieder. Eine Zahl aus einem Blogpost gilt für die Version und die Maschine, auf der sie gemessen wurde.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Escape Analysis ist eine Optimierung, auf die du hoffen, aber nicht bauen solltest. Für die meisten Anwendungen ist sie ein stiller Gewinn: weniger Gen0-Collections, ohne dass jemand etwas tun musste. Für heiße Pfade, deren Allokationen du wirklich loswerden musst, bleiben die bekannten Werkzeuge der sichere Weg: Structs statt Klassen, `Span<T>` und `stackalloc` statt kleiner Arrays, wiederverwendete Puffer. Siehe „stackalloc“ und „Wert- und Referenztypen“.
+
+Dazwischen gibt es Code, den du so schreiben kannst, dass die Analyse eher gelingt:
+
+- **Kleine, einbettbare Helfer.** Ein Objekt, das an eine kurze Methode geht, überlebt die Analyse, wenn die Methode eingebettet wird. Ein Objekt, das an eine große Methode geht, nicht.
+- **Konkrete Typen, wo es nichts kostet.** Ein `foreach` über ein Array als `int[]` braucht gar keinen Enumerator. Über `IEnumerable<int>` braucht es einen, und ob der im Frame landet, hängt von Devirtualisierung und bedingtem Entkommen ab.
+- **Lambdas ohne Einfangen.** Ein Lambda, das nichts einfängt, braucht keine Closure. Bleibt nur der Delegate, kann .NET 10 ihn unter Umständen ganz entfernen.
+- **Keine Verrenkungen.** Code nur deshalb umzubauen, damit ein Objekt eventuell im Frame landet, lohnt sich selten. Erst messen, dann entscheiden.
+
+Ein Vergleich hilft bei der Einordnung. Auch die HotSpot-JVM von Java betreibt Escape Analysis, dort mit Scalar Replacement als wichtigster Folge. Für Java ist die Optimierung wichtiger als für .NET, weil Java keine eigenen Werttypen hat: Jeder kleine Datenbehälter ist dort ein Objekt. In C# schreibst du für solche Fälle meist ohnehin ein `struct`. Das Design-Dokument der Runtime weist genau darauf hin.
+
+{/* TODO(verify): HotSpot C2 performs escape analysis with scalar replacement (and lock elision), not true stack allocation of objects. */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Phase heißt im JIT `ObjectAllocator`. Sie läuft nach dem Inlining und den frühen Optimierungen, sucht alle Knoten für `newobj`, `newarr` und `box` und entscheidet für jeden, ob er zu einem Aufruf des Allokations-Helfers oder zu einem lokalen Bereich im Frame wird.
+
+Die Runtime ist dabei nur einmal gefragt: Über `canAllocateOnStack` sagt sie, ob ein Typ überhaupt in Frage kommt. Die Antwort ist nein für Typen mit Finalizer und für COM-Objekte. Die Größe holt sich der JIT mit `getHeapClassSize`, also MethodTable-Zeiger plus Felder, ohne Header.
+
+Spannender ist, was danach passiert. Ein Verweis auf ein Stack-Objekt ist kein gewöhnlicher Objektverweis mehr, denn er zeigt nicht in den GC-Heap. Der JIT ändert deshalb den Typ jedes lokalen Werts, der auf ein solches Objekt zeigen kann:
+
+- Zeigt ein Wert **sicher** auf ein Stack-Objekt, wird er zu einem gewöhnlichen Zeiger, den der GC ignoriert.
+- Kann ein Wert **je nach Pfad** auf den Heap oder den Stack zeigen, wird er zu einem **byref**, wie ein `ref`-Local. Der GC kommt mit byrefs zurecht, die auf den Stack zeigen.
+- Die **Verweisfelder im Stack-Objekt** meldet der JIT dem GC so, wie er die Verweisfelder eines lokalen Structs meldet. Ein Stack-Objekt kann also Heap-Objekte am Leben halten.
+- **Write Barriers** entfallen für Schreibzugriffe in ein sicheres Stack-Objekt. Bei unklarem Ziel kommt eine prüfende Variante zum Einsatz. Was Write Barriers leisten, steht in „Write Barriers und Card Tables“.
+
+{/* TODO(verify): Write barrier selection for possibly-stack-pointing destinations (checked barrier) in current .NET, per object-stack-allocation.md "GC reporting" and objectalloc.cpp. */}
+
+Für Experimente gibt es Schalter. `DOTNET_JitObjectStackAllocation=0` schaltet die Stack-Allokation ab und ist seit .NET 9 auch in normalen Release-Builds der Runtime wirksam. Weitere Schalter steuern einzelne Fälle und die Größengrenze. Welche davon in Release-Builds wirken, unterscheidet sich zwischen den Versionen, schau im Zweifel in `jitconfigvalues.h` der passenden Version nach.
+
+<Callout kind="version">
+  Der Code für Stack-Allokation steckt seit Jahren im JIT, war bis einschließlich .NET 8 aber
+  standardmäßig aus. .NET 9 schaltet ihn ein, für Klassenobjekte und für Boxen. .NET 10 erweitert
+  die Analyse deutlich: kleine Arrays mit konstanter Länge (mit Werttyp- und mit
+  Verweis-Elementen), Delegates, Objekte, auf die Felder lokaler Structs zeigen, und bedingtes
+  Entkommen hinter Typprüfungen. Neuere Versionen bauen das weiter aus. Prüfe deshalb immer, auf
+  welcher Version du misst.
+</Callout>
+
+{/* TODO(verify): JitObjectStackAllocation default 0 and debug-only (CONFIG_INTEGER) in release/8.0, RELEASE_CONFIG_INTEGER default 1 in release/9.0 and release/10.0 (src/coreclr/jit/jitconfigvalues.h); class objects (JitObjectStackAllocationRefClass=1) really stack allocated in .NET 9 and not only boxes. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Wege führen zum Beweis. Der erste schaut in den Maschinencode: Steht in der Methode ein Aufruf von `CORINFO_HELP_NEWSFAST` oder `CORINFO_HELP_NEWARR_1_VC`, wird auf dem Heap alloziert. Fehlt er, hat die Analyse gegriffen. Mit `DOTNET_JitObjectStackAllocation=0` erzeugst du zum Vergleich die Fassung ohne Stack-Allokation. Wie du solche Listings liest, zeigt „JIT-Assembler lesen“.
+
+Der zweite Weg misst die Allokationen. BenchmarkDotNet mit `MemoryDiagnoser` wärmt jede Methode auf, bis sie in Tier 1 läuft, und zeigt die Bytes pro Aufruf.
+
+{/* TODO(verify): Expected allocations on .NET 10 x64: Local none, Stored 24 B, PassedOn 24 B, SmallArray none (int[3] would be 40 B on the heap). */}
+
+<VerifyCard
+  sharplab="Stelle auf sharplab.io die Ausgabe auf „JIT Asm“, die Konfiguration auf Release und eine aktuelle .NET-Version ein. In Local sollte kein Allokations-Helfer stehen, in Stored und PassedOn schon."
+  code={escapeCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'Local', allocated: 'keine' },
+    { method: 'Stored', allocated: '24 B' },
+    { method: 'PassedOn', allocated: '24 B' },
+    { method: 'SmallArray', allocated: 'keine' },
+  ]}
+  note="Erwartete Werte für .NET 10 auf x64. Unter .NET 9 alloziert SmallArray noch ein Array auf dem Heap, unter .NET 8 alloziert auch Local."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="escape-analysis"
+  questions={[
+    {
+      q: 'Wann darf der JIT ein Objekt auf den Stack legen?',
+      options: [
+        'Wenn das Objekt nur kurz lebt',
+        'Wenn er beweisen kann, dass kein Verweis darauf die Methode verlässt',
+        'Wenn das Objekt kleiner als 85.000 Byte ist',
+      ],
+      correct: 1,
+      explanation:
+        'Lebensdauer allein zählt nicht. Der JIT muss nachweisen, dass das Objekt nicht entkommt, und dazu noch Bedingungen wie Größe, Typ und Lage außerhalb einer Schleife erfüllen.',
+    },
+    {
+      q: 'var p = new Point(1, 2); Log(p); return p.X; Log ist mit NoInlining markiert. Wo landet p?',
+      options: ['Im Stack-Frame', 'Auf dem Heap'],
+      correct: 1,
+      explanation:
+        'Log ist für den JIT eine Blackbox. Er muss annehmen, dass Log sich den Verweis merkt, also gilt p als entkommen.',
+    },
+    {
+      q: 'Warum ist Inlining für Escape Analysis so wichtig?',
+      options: [
+        'Weil eingebettete Methoden schneller laufen',
+        'Weil die Analyse nur eine Methode sieht und jeder nicht eingebettete Aufruf mit dem Objekt als Argument zum Entkommen führt',
+        'Weil der GC eingebettete Methoden nicht kennt',
+      ],
+      correct: 1,
+      explanation:
+        'Schon der Konstruktor bekommt das Objekt als this. Nur wenn er und alle anderen beteiligten Methoden eingebettet sind, kann der JIT beweisen, dass nichts entkommt.',
+    },
+    {
+      q: 'Eine Methode alloziert in jedem Schleifendurchlauf ein kleines Objekt, das nie entkommt. Was macht .NET 10?',
+      options: [
+        'Ein Bereich im Frame wird in jedem Durchlauf wiederverwendet',
+        'Die Allokation bleibt auf dem Heap',
+      ],
+      correct: 1,
+      explanation:
+        'Allokationen in Blöcken, die in einer Schleife liegen können, lehnt der JIT ab. Er müsste sonst beweisen, dass das Objekt des vorigen Durchlaufs schon tot ist.',
+    },
+    {
+      q: 'Was unterscheidet ein Stack-Objekt von einem Heap-Objekt desselben Typs?',
+      options: [
+        'Es hat keinen MethodTable-Zeiger',
+        'Es hat keinen Object Header, aber einen MethodTable-Zeiger',
+        'Nichts, es liegt nur an einer anderen Adresse',
+      ],
+      correct: 1,
+      explanation:
+        'Der JIT reserviert MethodTable-Zeiger und Felder. Den Header vor dem Objekt legt er nicht an. Oft verschwindet das Objekt durch Promotion danach ganz.',
+    },
+    {
+      q: 'Du rufst eine Methode dreimal auf und misst mit GC.GetAllocatedBytesForCurrentThread Allokationen, obwohl SharpLab keinen Allokations-Helfer zeigt. Wahrscheinlichste Erklärung?',
+      options: [
+        'Die Methode läuft noch in Tier 0, wo keine Stack-Allokation stattfindet',
+        'Stack-Allokation funktioniert nur unter Linux',
+      ],
+      correct: 0,
+      explanation:
+        'Die Phase läuft nur in optimiertem Code. Die ersten Aufrufe laufen in Tier 0 und allozieren normal. Miss nach einer Aufwärmphase oder mit BenchmarkDotNet.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Escape Analysis beweist, dass ein Objekt seine Methode **nicht verlässt**. Dann kann der JIT es im Stack-Frame anlegen und spart Allokation und GC-Arbeit.
+- **Entkommen** heißt: in ein Feld oder `static` geschrieben, zurückgegeben, eingefangen oder an eine nicht eingebettete Methode übergeben. Im Zweifel gilt ein Objekt als entkommen.
+- Die Analyse sieht nur eine Methode. Ohne **Inlining** von Konstruktor und Helfern gelingt sie fast nie.
+- Ein Stack-Objekt hat MethodTable-Zeiger und Felder, aber keinen Header. Durch **Promotion** zerfällt es oft in einzelne Werte in Registern.
+- Keine Stack-Allokation in **Tier 0**, in **Schleifen**, für **große** Objekte, Arrays ohne konstante Länge und Typen mit **Finalizer**.
+- Seit **.NET 9** standardmäßig aktiv, in **.NET 10** stark erweitert um Arrays, Delegates und bedingtes Entkommen. Verlass dich nicht darauf, sondern miss mit `MemoryDiagnoser` oder `JitDisasm`.
+
+</Block>

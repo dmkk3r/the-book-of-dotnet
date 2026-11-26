@@ -1,0 +1,310 @@
+---
+id: bounds-checks
+title: Bounds-Check-Elimination
+summary: Warum jeder Zugriff auf Arrays, Spans und Strings geprüft wird, wann der JIT diese Prüfung beweisbar entfernen kann und wie du Code so schreibst, dass er es auch tut.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'RyuJIT Overview (dotnet/runtime-Repo, Abschnitte zu Morph, Assertion Propagation und Range Check)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/ryujit-overview.md
+  - title: 'Range-Check-Analyse im JIT (rangecheck.cpp im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/rangecheck.cpp
+  - title: 'Loop Cloning im JIT (loopcloning.cpp im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/loopcloning.cpp
+  - title: 'Performance Improvements in .NET 8 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+  - title: 'Performance Improvements in .NET 9 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-9/
+  - title: 'Performance Improvements in .NET 10 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-10/
+  - title: 'MemoryMarshal.GetArrayDataReference (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.interopservices.memorymarshal.getarraydatareference
+  - title: 'CollectionsMarshal.AsSpan (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.interopservices.collectionsmarshal.asspan
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './bounds-checks.steps';
+import cloningScript from './bounds-checks-cloning.steps';
+import fieldScript from './bounds-checks-field.steps';
+import { boundsCode, benchmarkCode } from './bounds-checks-verify';
+
+<Block n={1} title="Das Problem">
+
+In C und C++ ist `a[i]` nichts weiter als Zeigerarithmetik: Startadresse plus `i` mal Elementgröße, dann lesen. Ist `i` zu groß oder negativ, liest das Programm einfach, was dort im Speicher liegt. Mit etwas Pech sind das die Daten eines anderen Objekts, mit noch mehr Pech schreibt es darüber. Solche Pufferüberläufe gehören seit Jahrzehnten zu den häufigsten Sicherheitslücken überhaupt.
+
+.NET schließt diese Fehlerklasse grundsätzlich aus. Jeder Zugriff auf ein Element eines Arrays, eines `Span<T>` oder eines Strings wird geprüft. Liegt der Index außerhalb, gibt es eine `IndexOutOfRangeException`, und zwar bevor auch nur ein Byte falsch gelesen oder geschrieben wurde. Diese **Bounds-Checks** sind ein Grundpfeiler der Speichersicherheit von verwaltetem Code, zusammen mit der Typprüfung und dem Garbage Collector.
+
+Sicherheit hat ihren Preis. Eine Schleife, die ein Array mit einer Million Elementen summiert, macht neben einer Million Additionen auch eine Million Vergleiche. Würde der JIT jeden davon wirklich ausführen, wäre .NET in engen Schleifen spürbar langsamer als C. Ist es aber in den typischen Fällen nicht, weil der JIT einen großen Teil dieser Prüfungen gar nicht erst erzeugt. Er **beweist**, dass sie nie fehlschlagen können, und lässt sie weg. Wann ihm dieser Beweis gelingt und wann nicht, ist das Thema dieser Lektion.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir diese vier Sätze:
+
+1. **Jeder Indexzugriff beginnt mit einer Prüfung.** Der JIT setzt sie beim Übersetzen vor den Zugriff, im IL steht davon nichts.
+2. **Entfernt wird nur, was beweisbar nie fehlschlägt.** Der JIT braucht für den Index eine untere und eine obere Grenze, die er aus dem Code ableiten kann. Eine Wahrscheinlichkeit reicht nicht.
+3. **Das Verhalten bleibt exakt gleich.** Eine Prüfung, die fehlschlagen könnte, darf der JIT weder entfernen noch an eine andere Stelle verschieben, denn die Ausnahme muss genau dort auftreten, wo sie im Quelltext entsteht.
+4. **Du kannst dem Beweis helfen.** Wer Grenzen über die Länge, über Slices oder über eine vorgezogene Prüfung ausdrückt, bekommt Code ohne Prüfungen, ganz ohne `unsafe`.
+
+<Callout kind="fehlannahme">
+  „In C# wird man Bounds-Checks nur mit `unsafe` los.“ In den häufigsten Schleifen entfernt der JIT
+  sie von selbst, und für viele andere Fälle genügt es, die Grenze so auszudrücken, dass er sie
+  beweisen kann. `unsafe` oder `Unsafe.Add` sind der letzte Ausweg, nicht der erste.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Die klassische Schleife über ein Array: von `0` bis `a.Length`, jedes Element einmal lesen. Die linke Tabelle zeigt den Schleifenrumpf im Maschinencode, die rechte, was der JIT über `i` weiß. Der erste Teil des Assembler-Reiters ist gedacht, er zeigt den Rumpf mit Prüfung, bevor die Optimierung greift. Der zweite Teil ist das optimierte x64-Listing.
+
+<StepPlayer script={script} />
+
+{/* TODO(verify): Optimized x64 listing of Sum on .NET 8+ (loop shape, registers, strength reduction in .NET 9/10) with SharpLab or DOTNET_JitDisasm. */}
+
+Zwei Dinge machen den Beweis möglich. Erstens ist `i` eine einfache Zählvariable: Sie startet bei `0`, wird nur hochgezählt und sonst nirgends verändert. Zweitens ist `a` eine lokale Variable, also ein Parameter, den die Schleife nicht neu zuweist. Da die Länge eines Arrays nach der Erzeugung nie wieder geändert werden kann, bleibt `a.Length` über die ganze Schleife gleich. Fehlt eine der beiden Zutaten, wird es schwieriger, wie der Abschnitt „Stolperfallen“ zeigt.
+
+</Block>
+
+<Block n={4} title="Was ein Bounds-Check kostet">
+
+Ein Bounds-Check auf x64 besteht aus zwei Instruktionen: einem `cmp`, der den Index mit dem Längenfeld des Arrays vergleicht, und einem bedingten Sprung `jae` zu einem Block, der einen Helfer der Runtime aufruft und die Ausnahme wirft. Der Vergleich ist **vorzeichenlos**. Ein negativer Index wird dabei als sehr große Zahl gelesen und fällt ebenfalls durch, eine einzige Prüfung deckt so beide Grenzen ab.
+
+{/* TODO(verify): Bounds check codegen on x64: cmp idx, [arr+8] / jae to a throw block calling CORINFO_HELP_RNGCHKFAIL; throw blocks shared per method and placed at the end (consistent with asm-lesen.steps.ts). */}
+
+Für sich genommen ist das billig. Der Sprung wird praktisch nie genommen, die Sprungvorhersage des Prozessors liegt also fast immer richtig, und die Länge liegt nach dem ersten Zugriff im Cache. In einer Schleife, die sonst nur eine Addition macht, sind zwei zusätzliche Instruktionen pro Durchlauf trotzdem ein messbarer Anteil.
+
+Schwerer wiegt, was die Prüfung dem Optimierer verbaut. Jeder Bounds-Check ist eine Stelle, an der die Schleife mit einer Ausnahme enden könnte, und alles, was vorher sichtbar passiert ist, muss dann passiert sein, und nichts danach. Der JIT darf deshalb Speicherzugriffe nicht frei über die Prüfung hinweg verschieben und Schleifen nicht frei umbauen. Neuere JIT-Versionen formen Schleifen zum Beispiel so um, dass sie mit einem fortlaufenden Zeiger statt mit einem Index arbeiten. Solche Umbauten setzen voraus, dass die Zugriffe ohne Prüfung auskommen.
+
+{/* TODO(verify): Induction variable widening and strength reduction of array index to pointer increments added to RyuJIT in .NET 9 (Performance Improvements in .NET 9), and that remaining bounds checks prevent them. */}
+
+Ein verbreiteter Gedanke ist, dass Bounds-Checks die automatische Vektorisierung verhindern. Für .NET trifft das so nicht zu: RyuJIT vektorisiert gewöhnliche Schleifen grundsätzlich nicht von selbst. Wer SIMD nutzen will, schreibt es mit `Vector<T>` oder `Vector128<T>` ausdrücklich hin, siehe „Hardware-Intrinsics und SIMD“. Die Bibliotheken der Runtime tun genau das, etwa in `IndexOf` auf Spans.
+
+{/* TODO(verify): RyuJIT has no general loop auto-vectorizer as of .NET 10. */}
+
+</Block>
+
+<Block n={5} title="Wann der JIT Prüfungen entfernt">
+
+### Schleifen bis zur Länge
+
+Das Grundmuster ist `for (int i = 0; i < a.Length; i++)` mit `a[i]` im Rumpf, wobei `a` ein Array, ein `Span<T>`, ein `ReadOnlySpan<T>` oder ein `string` sein kann. Auch `foreach` über ein Array oder einen Span fällt darunter, denn der C#-Compiler übersetzt es genau in diese Form mit Zählvariable und `Length`. Mehr dazu in der Lektion „foreach, using und lock“.
+
+{/* TODO(verify): C# lowers foreach over arrays and spans to an index loop up to Length (no enumerator), and the JIT removes the checks for string indexers in this pattern as well. */}
+
+### Bekannte Längen und Konstanten
+
+Kennt der JIT die Länge, braucht er keine Schleife für den Beweis. Nach `var a = new int[4];` ist `a[2]` beweisbar gültig. Dasselbe gilt für einen Span über einen `stackalloc` mit fester Größe oder über konstante Daten wie ein UTF-8-Literal `"abc"u8`, dessen Länge zur Übersetzungszeit feststeht.
+
+{/* TODO(verify): Constant index on a span/array of known constant length (new int[4], stackalloc of constant size, u8 literals, ReadOnlySpan<byte> over static data) gets no bounds check in .NET 8+. */}
+
+### Frühere Prüfungen
+
+Der JIT merkt sich, was frühere Prüfungen bewiesen haben, und nutzt das für spätere Zugriffe. Dieses Wissen heißt im JIT **Assertion**: Nach einem erfolgreichen Zugriff auf `a[i]` ist klar, dass `i` gültig ist, ein zweites `a[i]` braucht keine Prüfung. Gleiches gilt für eigene Bedingungen. Steht `if ((uint)i < (uint)a.Length)` vor dem Zugriff, erkennt der JIT darin den Bounds-Check wieder und lässt den eigenen weg. Die Runtime schreibt solche Prüfungen deshalb an vielen Stellen genau in dieser Form, mit beiden Seiten als `uint`.
+
+Daraus folgt ein beliebter Trick: eine Prüfung bewusst vorziehen.
+
+```csharp
+static int First4(int[] a)
+{
+    _ = a[3];                           // eine Prüfung: wirft, wenn a.Length < 4
+    return a[0] + a[1] + a[2] + a[3];   // danach ohne Prüfung
+}
+```
+
+Gelingt der Zugriff auf `a[3]`, ist die Länge mindestens 4, und die vier folgenden Zugriffe sind bewiesen. Statt vier Prüfungen bleibt eine. Wichtig ist die Reihenfolge: zuerst der höchste Index. Ein `if (a.Length >= 4)` vor den Zugriffen wirkt genauso, ohne Ausnahme im Fehlerfall.
+
+{/* TODO(verify): _ = a[3] (and if (a.Length >= 4)) removes the checks of a[0..3] in .NET 8+; whether the order of the four reads matters (assertion for the highest index). */}
+
+### Loop Cloning
+
+Manchmal läuft eine Schleife bis zu einer Grenze, die mit der Arraylänge nichts zu tun hat, etwa einem Parameter `n`. Ohne weitere Information kann der JIT dann nichts beweisen. Für solche Schleifen hat er einen zweiten Weg: Er **klont** die Schleife und prüft einmal vorab, ob alle Zugriffe gültig sein werden.
+
+<StepPlayer script={cloningScript} />
+
+{/* TODO(verify): Cloning conditions for this loop and the profitability rules for cloning in .NET 8+ (loopcloning.cpp). */}
+
+Die Visualisierung zeigt auch, warum der JIT nicht einfach eine einzige Prüfung vor die Schleife setzen und den Rest entfernen darf. Die ursprüngliche Schleife hätte vor der Ausnahme schon Elemente verändert. Eine vorgezogene Prüfung würde früher werfen und dieses Verhalten ändern. Loop Cloning umgeht das Problem: Im fehlerfreien Fall läuft die schnelle Kopie, im Fehlerfall die originalgetreue langsame.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Kleiner-gleich statt kleiner
+
+`for (int i = 0; i <= a.Length; i++)` ist ein Fehler im Programm, aber kein seltener. Im letzten Durchlauf ist `i == a.Length`, die Prüfung muss bleiben und wirft dort. Wie im Durchspielen zu sehen, entfernt der JIT nur, was nie fehlschlagen kann. Ähnlich ist `a[i + 1]` in einer Schleife bis `a.Length`: Beim letzten `i` liegt der Index außerhalb, die Prüfung bleibt.
+
+### Arrays in Feldern
+
+Die Schleife liest `_data.Length` und `_data[i]` aus einem Feld, und im Rumpf steht ein Aufruf. Für den JIT kann jeder Aufruf, den er nicht einbettet, das Feld verändern. Dann gilt der Beweis aus der Bedingung nicht mehr für den Zugriff.
+
+<StepPlayer script={fieldScript} />
+
+{/* TODO(verify): Without calls or stores in the loop body, the JIT may load the field once and remove the check; with a non-inlined call it must reload and keep the check. */}
+
+Die Lösung ist fast immer eine lokale Kopie: `int[] data = _data;` vor der Schleife. Sie macht den Code schneller und, wie der letzte Schritt zeigt, auch das Verhalten eindeutiger: Die Schleife arbeitet garantiert auf genau einem Array. Dasselbe Muster findest du überall im Quellcode der Runtime.
+
+### List&lt;T&gt; prüft doppelt
+
+Der Indexer von `List<T>` prüft zuerst gegen die Anzahl der Elemente der Liste und liest dann aus dem internen Array. Dieses Array ist meist größer als die Liste, und der JIT kann nicht beweisen, dass die Anzahl höchstens seine Länge ist. In einer `for`-Schleife über eine `List<T>` bleibt deshalb mindestens eine Prüfung pro Element stehen. In heißem Code hilft `CollectionsMarshal.AsSpan(list)`: Der Span hat genau die Länge der Liste, und eine Schleife über ihn ist wieder das Grundmuster. Während du den Span benutzt, darfst du die Liste nicht verändern.
+
+{/* TODO(verify): List<T> indexer: (uint)index >= (uint)_size check plus a remaining array bounds check on _items in a for loop over a list (.NET 8+). */}
+
+### Grenzen aus anderen Variablen
+
+Läuft die Schleife bis `n`, `count` oder `end`, hängt alles davon ab, ob der JIT die Schleife klont. Das tut er nur in optimiertem Code und nur für Schleifen, deren Form er erkennt. Verlässlicher ist es, die Grenze in den Typ zu legen: `ReadOnlySpan<int> s = a.AsSpan(0, n);` prüft einmal beim Erzeugen des Slices, ob `n` passt. Danach ist `s.Length` die Grenze, und die Schleife bis `s.Length` braucht keine Prüfung mehr.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Die Faustregel lautet: Formuliere Grenzen so, dass sie sich auf die Länge des Objekts beziehen, auf das du zugreifst. Die folgende Tabelle fasst die häufigsten Fälle zusammen.
+
+| Code                                             | Prüfung im Rumpf?                  | Besser                                         |
+| ------------------------------------------------ | ---------------------------------- | ---------------------------------------------- |
+| `for (i = 0; i < a.Length; i++) a[i]`             | nein                               |                                                |
+| `foreach (var x in a)` über Array oder Span       | nein                               |                                                |
+| `for (i = 0; i < n; i++) a[i]`                    | nur ohne Loop Cloning              | `a.AsSpan(0, n)` und bis `s.Length`            |
+| `for (i = 0; i <= a.Length; i++)`                 | ja, und wirft                      | Fehler beheben                                 |
+| Feld-Array mit Aufruf im Rumpf                    | ja                                 | lokale Kopie vor der Schleife                  |
+| `for` über `List<T>`                              | ja                                 | `CollectionsMarshal.AsSpan`                    |
+| feste Indizes `a[0]` bis `a[3]`                    | je Zugriff                         | `_ = a[3];` oder Längenprüfung vorab           |
+
+{/* TODO(verify): Each row of this table on .NET 8+ x64 with DOTNET_JitDisasm. */}
+
+### Wenn wirklich nichts anderes hilft
+
+Es gibt Fälle, in denen der JIT nicht beweisen kann, was du weißt: Indizes aus einer Nachschlagetabelle, Sprünge um variable Abstände, Zugriffe auf zwei Arrays mit gemeinsamer Länge. Dann bleiben `MemoryMarshal.GetArrayDataReference(a)` und `Unsafe.Add(ref r, i)`. Sie liefern einen `ref` auf das erste Element und rechnen von dort ohne jede Prüfung weiter. Damit übernimmst du die Verantwortung, die sonst die Runtime trägt: Ein falscher Index liest oder überschreibt fremden Speicher, ohne Ausnahme. Wie diese APIs funktionieren und was dabei schiefgehen kann, zeigt die Lektion „Unsafe und MemoryMarshal“.
+
+Prüfe vorher im Assembler, ob die Prüfung überhaupt noch da ist. Oft hat der JIT sie längst entfernt, und der unsichere Code bringt nur Risiko, aber keinen Gewinn.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Bounds-Checks entstehen im JIT, nicht im C#-Compiler. Das IL für `a[i]` ist schlicht `ldelem`, und die Prüfung gehört zu dessen Semantik. Beim **Morph** zerlegt der JIT den Zugriff in einen eigenen Prüfknoten und die eigentliche Adressrechnung. Ab da ist die Prüfung ein normaler Knoten, den spätere Phasen entfernen dürfen, wenn sie beweisen, dass er überflüssig ist. Wo das in der Pipeline passiert, zeigt die Lektion „Die Pipeline von RyuJIT“.
+
+Drei Phasen arbeiten daran. **Loop Cloning** läuft früh, solange die Schleifen noch gut erkennbar sind, und legt die schnelle Kopie mit ihren Vorbedingungen an. Die **Assertion Propagation** sammelt Fakten wie „`i` ist kleiner als `a.Length`“ aus Bedingungen und früheren Prüfungen und streicht Prüfungen, die durch solche Fakten bereits abgedeckt sind. Die **Range-Check-Analyse** schließlich arbeitet auf der SSA-Form und berechnet für jeden Index einen Wertebereich, etwa für eine Zählvariable aus Startwert, Schrittweite und Schleifenbedingung. Liegt der Bereich sicher innerhalb der Länge, fällt die Prüfung weg.
+
+{/* TODO(verify): Phase names and order (loop cloning before SSA, assertion propagation, range check phase on SSA/VN) per compphases.h and ryujit-overview.md. */}
+
+Bleibt eine Prüfung stehen, erzeugt der JIT für ihren Fehlerfall einen Block, der den Helfer der Runtime aufruft. Laut Quellcode teilen sich alle Prüfungen einer Methode einen solchen Block, und er liegt hinter dem heißen Code. Die Runtime erzeugt darin die `IndexOutOfRangeException`, die du am Ende siehst.
+
+{/* TODO(verify): Shared throw helper blocks per method (fgUseThrowHelperBlocks) placed at the end of the method in optimized code. */}
+
+<Callout kind="version">
+  Die Analyse wird in jeder Version etwas klüger. Laut .NET-Blog erkennt der JIT seit .NET 8 und 9
+  deutlich mehr Muster, unter anderem mehr Formen von Schleifen und Vergleichen, und .NET 9 hat
+  Schleifen mit Zeigerinkrementen statt Indizes eingeführt. Ob eine Prüfung auf deiner Version
+  wegfällt, zeigt nur der Assembler.
+</Callout>
+
+{/* TODO(verify): Concrete list of bounds check elimination improvements in .NET 8, 9 and 10 (Performance Improvements posts, sections "Bounds Checking"). */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Zwei Experimente machen die Prüfungen sichtbar.
+
+**Die Prüfungen zählen.** Lass dir den Assembler der fünf Methoden zeigen. Ein Bounds-Check ist ein Vergleich mit dem Speicher bei Offset `0x08` des Arrays, gefolgt von einem `jae` zu einem Block mit `CORINFO_HELP_RNGCHKFAIL`. In `Sum`, `SumSpan` und `GetOrZero` sollte im Schleifenrumpf beziehungsweise im heißen Pfad kein solcher Vergleich stehen. `SumN` enthält entweder eine Prüfung pro Durchlauf oder zwei Fassungen der Schleife. `First4` sollte genau eine Prüfung enthalten. Beim Slice in `SumSpan` steht die Prüfung einmal vor der Schleife, beim Erzeugen des Spans.
+
+**Die Kosten messen.** Der Benchmark vergleicht die Schleife bis zur Länge mit einer Schleife bis zu einer lokalen Grenze und mit einem Slice. Erwartung: Alle drei liegen nah beieinander, solange der JIT die zweite Schleife klont. Liegt `ToLocalN` deutlich zurück, hat er es nicht getan, und der Assembler verrät es.
+
+{/* TODO(verify): Expected asm for the five methods and benchmark results on .NET 8+ x64. */}
+
+<VerifyCard
+  sharplab="Stelle auf sharplab.io die Ausgabe auf „JIT Asm“ und die Konfiguration auf Release. Suche nach jae und dem Helfer CORINFO_HELP_RNGCHKFAIL, jede Stelle davon ist eine verbliebene Prüfung."
+  code={boundsCode}
+  benchmark={benchmarkCode}
+  note="Loop Cloning und die Entfernung der Prüfungen gibt es nur in optimiertem Code. Miss deshalb mit BenchmarkDotNet, das vor der Messung aufwärmt."
+/>
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="bounds-checks"
+  questions={[
+    {
+      q: 'Warum genügt bei einem Bounds-Check ein einziger Vergleich für beide Grenzen?',
+      options: [
+        'Weil Indizes in .NET nie negativ sein können',
+        'Weil vorzeichenlos verglichen wird und ein negativer Index dabei zu einer sehr großen Zahl wird',
+      ],
+      correct: 1,
+      explanation:
+        'Als uint gelesen ist -1 gleich 4294967295 und damit größer als jede Länge. Deshalb schreibt auch die Runtime ihre Prüfungen als (uint)i < (uint)a.Length.',
+    },
+    {
+      q: 'for (int i = 0; i < a.Length; i++) sum += a[i]; mit einem lokalen Array a. Was macht der JIT in Tier 1 mit dem Bounds-Check?',
+      options: [
+        'Er entfernt ihn, weil i beweisbar zwischen 0 und a.Length - 1 liegt',
+        'Er lässt ihn stehen, nur unsafe-Code kommt ohne aus',
+      ],
+      correct: 0,
+      explanation:
+        'Zählvariable ab 0, nur hochgezählt, Bedingung gegen a.Length und eine unveränderliche Arraylänge: Das reicht für den Beweis.',
+    },
+    {
+      q: 'Eine Schleife läuft bis n statt bis a.Length und schreibt in a[i]. Warum darf der JIT nicht einfach einmal vor der Schleife prüfen und danach alle Prüfungen weglassen?',
+      options: [
+        'Weil die Ausnahme dann zu früh käme, bevor die gültigen Elemente verändert wurden',
+        'Weil eine Prüfung vor der Schleife langsamer ist als viele in der Schleife',
+      ],
+      correct: 0,
+      explanation:
+        'Das sichtbare Verhalten muss gleich bleiben. Loop Cloning löst das mit zwei Kopien: einer schnellen ohne Prüfung und einer langsamen, originalgetreuen.',
+    },
+    {
+      q: 'Im Rumpf einer Schleife über ein Feld-Array steht ein Aufruf, der nicht eingebettet wird. Warum bleibt der Bounds-Check?',
+      options: [
+        'Weil der Aufruf das Feld durch ein kürzeres Array ersetzen könnte',
+        'Weil Felder grundsätzlich nie optimiert werden',
+      ],
+      correct: 0,
+      explanation:
+        'Die Bedingung hat nur die Länge des alten Arrays geprüft. Eine lokale Kopie vor der Schleife macht den Beweis wieder möglich.',
+    },
+    {
+      q: 'Was bewirkt _ = a[3]; vor return a[0] + a[1] + a[2] + a[3];?',
+      options: [
+        'Nichts, der Zugriff wird wegoptimiert',
+        'Eine einzige Prüfung, nach der die vier Zugriffe als gültig bewiesen sind',
+      ],
+      correct: 1,
+      explanation:
+        'Gelingt a[3], ist die Länge mindestens 4. Der JIT merkt sich das und spart die Prüfungen der folgenden Zugriffe.',
+    },
+    {
+      q: 'Wie bringst du eine Schleife bis zu einem Parameter n am zuverlässigsten ohne unsafe auf Code ohne Prüfungen?',
+      options: [
+        'Mit einem Slice a.AsSpan(0, n) und einer Schleife bis s.Length',
+        'Mit [MethodImpl(MethodImplOptions.AggressiveOptimization)]',
+      ],
+      correct: 0,
+      explanation:
+        'Der Slice prüft n einmal beim Erzeugen. Danach ist die Grenze die Länge des Spans, und das ist wieder das Grundmuster.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Jeder Zugriff auf Arrays, Spans und Strings wird geprüft. Diese **Bounds-Checks** sind Teil der Speichersicherheit von .NET.
+- Ein Bounds-Check ist ein **vorzeichenloser Vergleich** mit der Länge und ein Sprung zu einem Wurf-Block. Er ist billig, behindert aber Schleifenoptimierungen.
+- Der JIT entfernt Prüfungen nur, wenn er **beweisen** kann, dass sie nie fehlschlagen: Schleifen bis `Length`, `foreach`, bekannte Längen, frühere Prüfungen.
+- Das Verhalten bleibt exakt gleich. Deshalb gibt es **Loop Cloning** statt einer vorgezogenen Prüfung.
+- `<=` statt `<`, Feld-Arrays mit Aufrufen im Rumpf, `List<T>` und fremde Grenzen verhindern den Beweis.
+- Du hilfst dem JIT mit lokalen Kopien, Slices, `CollectionsMarshal.AsSpan` und Prüfungen wie `_ = a[3]` oder `(uint)i < (uint)a.Length`.
+- `MemoryMarshal.GetArrayDataReference` und `Unsafe.Add` sind der letzte Ausweg und nur sinnvoll, wenn der Assembler zeigt, dass eine Prüfung wirklich bleibt.
+
+</Block>

@@ -1,0 +1,327 @@
+---
+id: jit-pipeline
+title: Die Pipeline von RyuJIT
+summary: Was zwischen dem ersten Aufruf einer Methode und ihrem Maschinencode passiert, welche Phasen RyuJIT durchläuft, wie der Evaluation Stack dabei verschwindet und warum Tier-0-Code so anders aussieht als optimierter Code.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'JIT Compiler Structure (ryujit-overview.md, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/ryujit-overview.md
+  - title: 'RyuJIT Tutorial (ryujit-tutorial.md, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/ryujit-tutorial.md
+  - title: 'Linear Scan Register Allocation: Details (lsra-detail.md, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/lsra-detail.md
+  - title: 'Viewing JIT disassembly and dumps (viewing-jit-dumps.md, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/viewing-jit-dumps.md
+  - title: 'Book of the Runtime: Method Descriptor (Precode und Prestub)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/method-descriptor.md
+  - title: 'JIT/EE-Schnittstelle: corinfo.h (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/inc/corinfo.h
+  - title: 'JIT/EE-Schnittstelle: corjit.h (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/inc/corjit.h
+  - title: 'Phasenliste des JIT: compphases.h (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/compphases.h
+  - title: 'Performance Improvements in .NET 8 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+updated: 2026-11-26
+---
+
+import { Block, Callout, CodeBlock, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './jit-pipeline.steps';
+import importerScript from './jit-pipeline-importer.steps';
+import minoptsScript from './jit-pipeline-minopts.steps';
+import { sharplabCode, consoleCode } from './jit-pipeline-verify';
+
+<Block n={1} title="Das Problem">
+
+Wenn du eine Methode zum ersten Mal aufrufst, existiert für sie noch kein Maschinencode. In der Assembly steht nur IL, eine kompakte Beschreibung für eine gedachte Stackmaschine. Irgendwer muss daraus Befehle für deinen konkreten Prozessor machen, und zwar jetzt, während dein Programm darauf wartet. Dieser Irgendwer ist **RyuJIT**, der JIT-Compiler von .NET, der als eigene Bibliothek (`clrjit.dll` unter Windows, `libclrjit.so` unter Linux) neben der Runtime geladen wird.
+
+Damit steckt der JIT in einer unbequemen Lage. Er soll Code erzeugen, der mit dem eines klassischen optimierenden Compilers mithalten kann: Inlining, Registerzuteilung, Bounds-Checks entfernen, Schleifen umbauen. Gleichzeitig zählt jede Millisekunde, die er dafür braucht, als Wartezeit der Anwendung. Ein C++-Compiler darf sich für eine große Datei Sekunden nehmen. Der JIT übersetzt beim Start einer ASP.NET-Core-Anwendung Tausende Methoden, und jede einzelne verzögert den ersten Request.
+
+Um zu verstehen, warum der Maschinencode einer Methode so aussieht, wie er aussieht, warum Tier-0-Code so anders wirkt als Tier-1-Code und wo Optimierungen wie Inlining oder Bounds-Check-Elimination überhaupt ansetzen, brauchst du ein Bild davon, was im JIT passiert. Diese Lektion geht die Pipeline einmal von vorn bis hinten durch, an einer Methode, die so klein ist, dass du jede Phase im Kopf behalten kannst.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+RyuJIT ist ein ganz gewöhnlicher optimierender Compiler, nur eben zur Laufzeit. Merke dir vier Sätze:
+
+1. **Erst eine eigene Darstellung, dann Maschinencode.** Der JIT liest das IL einmal ein und baut daraus seine interne Darstellung: Basisblöcke mit Statements, jedes Statement ein Baum aus `GenTree`-Knoten. Der Evaluation Stack des IL verschwindet dabei vollständig.
+2. **Frontend auf Bäumen, Backend auf Listen.** Die Optimierungen (Inlining, Morph, Schleifen, SSA, Wertnummern, CSE, Bounds-Checks) arbeiten auf Bäumen, der sogenannten HIR. Ab der Rationalisierung werden daraus Listen von Knoten in Ausführungsreihenfolge, die LIR. Auf ihr laufen Lowering, Registerzuteilung und Codegenerierung.
+3. **Der JIT fragt ständig nach.** Was ein Token im IL bedeutet, wie groß ein Struct ist, an welchem Offset ein Feld liegt, wie eine Methode aufgerufen wird: All das weiß nur die Runtime. Der JIT fragt sie über eine feste Schnittstelle, die **JIT/EE-Schnittstelle**.
+4. **Heraus kommt mehr als Code.** Neben den Befehlsbytes liefert der JIT Tabellen, ohne die die Runtime den Code nicht sicher ausführen könnte: GC-Info, Unwind-Info, Exception-Tabellen und Debug-Info.
+
+<Callout kind="fehlannahme">
+  „Der JIT übersetzt IL Instruktion für Instruktion in Maschinencode.“ Nein: Ein `ldarg` wird nicht
+  zu einem `mov`, ein `add` nicht zu einem `add`. Der Importer baut aus dem IL zuerst Bäume, und erst
+  ganz am Ende der Pipeline entstehen Befehle. Aus sechs IL-Instruktionen können drei
+  Maschinenbefehle werden oder dreißig, je nachdem, was die Phasen dazwischen tun. Selbst Tier 0
+  geht diesen Weg, nur mit weniger Phasen.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Unser Beispiel ist bewusst winzig: `SumSquares` ruft zweimal `Square` auf und addiert die Ergebnisse. Die Visualisierung zeigt eine optimierende Übersetzung, wie sie in Tier 1 oder mit abgeschaltetem Tiering entsteht, auf Windows x64. Achte bei jedem Schritt auf die Zeile „Darstellung“: Sie zeigt, in welcher Form die Methode gerade im JIT existiert.
+
+<StepPlayer script={script} />
+
+Die Phasennamen stammen aus der Übersicht im dotnet/runtime-Repository. Die vollständige Liste ist länger: Zwischen den großen Phasen laufen kleinere wie Struct Promotion, Forward Substitution, If Conversion oder die Optimierung von Induktionsvariablen. Für das Verständnis reichen die elf Stationen oben. Die exakte Reihenfolge findest du in `compphases.h` im Quellcode des JIT.
+
+{/* TODO(verify): Phase order in compphases.h / compCompile of the current main branch matches the simplified order above (in particular that loop finding and cloning run before SSA/VN). */}
+
+Zwei Dinge sind an diesem Durchlauf wichtig. Erstens: Viele Phasen tun bei einer konkreten Methode nichts. Das ist kein Leerlauf, sondern der Normalfall, denn jede Phase sucht nach einem bestimmten Muster. Zweitens: Die wirklich folgenreiche Entscheidung fiel früh, beim Inlining. Ohne sie hätte keine spätere Phase die beiden Aufrufe wegbekommen.
+
+</Block>
+
+<Block n={4} title="Der Importer: Bäume statt Stack">
+
+Die Lektion „IL und der Evaluation Stack“ hat gezeigt, wie IL auf einem gedachten Stack rechnet. Der Importer nimmt dieses Modell wörtlich, aber mit einem Trick: Er führt beim Lesen einen eigenen Stack, auf dem keine Werte liegen, sondern **Baumknoten**. `ldarg.0` legt den Knoten „Argument 0“ ab, `add` nimmt zwei Knoten und hängt sie unter einen neuen `ADD`-Knoten. Am Ende einer Anweisung wird der fertige Baum als Statement an den Basisblock gehängt.
+
+<StepPlayer script={importerScript} />
+
+Ein paar Details erklären, warum das so gut funktioniert:
+
+- **Ein Durchgang genügt.** IL ist so gebaut, dass Typ und Tiefe des Stacks an jeder Stelle eindeutig feststehen. Der Importer muss also nie zurückspringen oder raten.
+- **Statements halten die Reihenfolge fest.** Innerhalb eines Baums gilt eine feste Auswertungsreihenfolge, zwischen Statements die Reihenfolge der Liste. Hat ein Teilausdruck Seiteneffekte, die vor einem späteren Ausdruck passieren müssen, lagert der Importer ihn in eine temporäre Variable aus. Im Dump heißen solche Variablen `tmp0`, `tmp1` und so weiter.
+- **Platzhalter für Inline-Kandidaten.** Für Aufrufe, die eingesetzt werden könnten, legt der Importer nur einen Platzhalter (`RET_EXPR`) auf den Stack. Der Inliner ersetzt ihn später durch den Baum der aufgerufenen Methode oder, wenn das Inlining scheitert, durch das Ergebnis eines normalen Aufrufs.
+- **Bedingungen ohne neue Blöcke.** Braucht ein Ausdruck eine Verzweigung, etwa für einen bedingten Wert, erzeugt der Importer zunächst einen `QMARK`-Knoten im Baum. Erst später, am Ende von Morph, werden daraus echte Basisblöcke.
+
+{/* TODO(verify): Temp naming "tmpN" in JitDump output; QMARK expansion at end of morph per ryujit-overview.md "Eliminate Qmarks". */}
+
+Für die Locals gilt dasselbe wie für den Stack. Jedes Argument und jeder Local bekommt einen Eintrag in einer Tabelle (`LclVarDsc`), im Dump `V00`, `V01` und so weiter. Ob dieser Local später in einem Register landet, im Stack-Frame oder ganz wegoptimiert wird, entscheidet sich erst viel später.
+
+</Block>
+
+<Block n={5} title="Optimieren auf Bäumen">
+
+Zwischen Importer und Rationalisierung liegt das, was man das Frontend des JIT nennt. Die Phasen bauen aufeinander auf, und es lohnt sich, ihre Rollen zu kennen, weil die übrigen Lektionen dieses Kapitels jeweils eine davon genauer ansehen.
+
+### Inlining und Morph
+
+Das **Inlining** kommt direkt nach dem Import. Für jeden Kandidaten schätzt der JIT anhand des IL, wie groß der eingesetzte Code würde und ob sich das lohnt. Fällt die Entscheidung positiv aus, importiert er die aufgerufene Methode mit einem eigenen Compiler-Objekt und setzt ihre Bäume ein. Inlining ist so wichtig, weil es alle folgenden Phasen über Methodengrenzen hinweg blicken lässt. Die Heuristiken erklärt die Lektion „Inlining“.
+
+**Morph** ist eine Sammlung lokaler Umformungen. Ein Teil davon ist Pflicht: Feld- und Arrayzugriffe werden zu Zeigerarithmetik, ein `arr[i]` bekommt dabei seinen Bounds-Check als eigenen Knoten. Der andere Teil sind einfache Optimierungen wie das Falten konstanter Ausdrücke. Morph läuft auch in Tier 0, weil ohne diese Normalisierung kein Code erzeugt werden kann.
+
+### Flussgraph und Schleifen
+
+Danach betrachtet der JIT den **Flussgraphen**, also die Basisblöcke und die Sprünge zwischen ihnen. Er sucht natürliche Schleifen und bringt sie in eine feste Form, unter anderem mit einem eigenen Block direkt vor der Schleife, dem Preheader. Dorthin können spätere Phasen Code verschieben, der nur einmal statt bei jedem Durchlauf laufen muss. Schleifen können außerdem geklont werden: eine schnelle Version ohne Prüfungen und eine langsame für den Fall, dass eine Vorbedingung nicht hält. Kleine Schleifen mit fester Anzahl Durchläufe rollt der JIT vollständig aus.
+
+### SSA, Wertnummern und was darauf aufbaut
+
+Für die wichtigsten Optimierungen baut der JIT die **SSA-Form**: Jede Zuweisung an einen Local bekommt einen eigenen Namen, sodass jede Verwendung genau eine Definition hat. Darauf vergibt die **Value Numbering** jedem Ausdruck eine Wertnummer. Zwei Ausdrücke mit gleicher Nummer liefern garantiert denselben Wert, auch wenn sie im Quelltext völlig verschieden aussehen. Auf diesem Fundament stehen:
+
+- **Loop Invariant Code Hoisting:** Ausdrücke, deren Wertnummer sich in der Schleife nicht ändert, wandern in den Preheader.
+- **CSE** (Common Subexpression Elimination): Gleiche Wertnummer an zwei Stellen, also einmal berechnen und in einer Temp-Variable merken.
+- **Assertion Propagation:** Der JIT sammelt Fakten wie „`x` ist nicht null“ oder „`i` ist kleiner als `arr.Length`“ und nutzt sie, um Prüfungen wegzulassen.
+- **Range Analysis:** Sie entfernt Bounds-Checks, deren Index beweisbar im gültigen Bereich liegt. Mehr dazu in „Bounds-Check-Elimination“.
+- **Redundant Branch Optimization:** Verzweigungen, deren Ausgang bereits feststeht, fallen weg.
+
+Wertnummern sind teuer, weil sie für jeden Ausdruck berechnet werden. Deshalb begrenzt der JIT die Zahl der Locals, die er in der Datenflussanalyse verfolgt. Locals über dieser Grenze behandelt er wie Speicherplätze im Frame, sie nehmen an den Optimierungen und an der Registerzuteilung nicht teil.
+
+{/* TODO(verify): Current limit for tracked locals (lclMAX_TRACKED / JitMaxLocalsToTrack, historically 1024) and that untracked locals are never enregistered. */}
+
+</Block>
+
+<Block n={6} title="Vom Baum zum Maschinencode">
+
+Mit der **Rationalisierung** beginnt das Backend. Die Statements und die Baumstruktur verschwinden, jeder Basisblock wird zu einer doppelt verketteten Liste von Knoten, die genau in Listenreihenfolge ausgeführt werden. Diese LIR ist näher an der Maschine: Ein Knoten entspricht ungefähr einer Operation, und die Reihenfolge ist eindeutig.
+
+**Lowering** passt die Liste an den Zielprozessor an. Hier entstehen Adressierungsarten wie `[rcx+4*rax+16]`, hier wird ein `switch` zur Sprungtabelle oder zu einer Kette von Vergleichen, und hier markiert der JIT Knoten als „contained“: Eine Konstante oder ein Speicheroperand erzeugt keinen eigenen Befehl, sondern wird Teil des Befehls ihres Nutzers. Danach steht für jeden Knoten fest, wie viele Register er braucht und welche Einschränkungen gelten.
+
+Die **Registerzuteilung** verwendet Linear Scan, intern **LSRA** genannt. Sie baut für jeden Local und jeden Zwischenwert ein Intervall seiner Lebensdauer und verteilt die Intervalle in einem Durchgang auf die physischen Register. Passt nicht alles hinein, wird ein Wert in den Stack-Frame ausgelagert (Spill) und später zurückgeladen. Feste Vorgaben kommen von außen: Die Aufrufkonvention bestimmt, in welchen Registern Argumente ankommen und das Ergebnis zurückgeht, und ein Aufruf zerstört bestimmte Register. Mehr dazu in „Calling Conventions und Frames“.
+
+Die **Codegenerierung** legt zuerst den Frame fest: wie viel Platz für nicht registrierte Locals und Spills nötig ist und ob ein Framepointer (`rbp`) gebraucht wird. Dann erzeugt sie Block für Block die Befehle, zuletzt Prolog und Epilog. Der **Emitter** kodiert die Befehle in Bytes. Während er das tut, verfolgt er, in welchen Registern und Stack-Slots gerade Objektverweise liegen. Daraus entsteht die **GC-Info**, mit der der GC später an einem angehaltenen Thread alle lebenden Verweise findet (siehe „GC-Info und Safe Points“). Die **Unwind-Info** beschreibt, wie der Prolog den Stack verändert hat, damit Exceptions und Stack Walks den Frame wieder abbauen können. Die **Debug-Info** ordnet IL-Offsets den Maschinencode-Adressen zu.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Tier 0 ist dieselbe Pipeline mit weniger Phasen
+
+Wer zum ersten Mal den Maschinencode einer frisch gestarteten Anwendung ansieht, ist oft erschrocken: Jedes Argument wird in den Speicher geschrieben und wieder gelesen, kein Aufruf ist eingesetzt. Das liegt nicht an einem zweiten, primitiven Compiler. Für Tier 0 schaltet RyuJIT in den Modus **MinOpts** und überspringt die teuren Phasen.
+
+<StepPlayer script={minoptsScript} />
+
+Daraus folgt: Was du in Tier-0-Code siehst, sagt nichts darüber, was der JIT optimieren **kann**. Ein fehlendes Inlining in Tier 0 ist kein Hinweis auf ein Problem. Erst der Tier-1-Code zeigt, was im Dauerbetrieb wirklich läuft.
+
+### Riesige Methoden fallen auf MinOpts zurück
+
+MinOpts ist nicht nur für Tier 0 da. Weil viele Analysen mit der Größe einer Methode mehr als linear wachsen, schaltet der JIT bei sehr großen Methoden selbst dann auf MinOpts, wenn optimierter Code verlangt war. Im Quellcode stehen dafür Grenzen wie 60.000 Byte IL, 20.000 IL-Instruktionen, 2.000 Basisblöcke oder 2.000 Locals. Generierter Code, etwa riesige Zustandsautomaten oder Initialisierungsmethoden mit Tausenden Zeilen, kann so dauerhaft unoptimiert laufen. Im Kopf der Disassembly steht dann statt „Tier1“ eine Stufe, die „MinOpts“ im Namen trägt.
+
+{/* TODO(verify): Thresholds DEFAULT_MIN_OPTS_CODE_SIZE 60000, INSTR_COUNT 20000, BB_COUNT 2000, LV_NUM_COUNT 2000, LV_REF_COUNT 8000 are from compiler.h on main; check for the .NET version you target. Exact short tier name printed for a Tier 1 request that switched to MinOpts (compGetTieringName prints "Tier0-MinOpts"/"MinOpts" variants). */}
+
+### Debug-Builds und angehängte Debugger
+
+Ein Debug-Build trägt das `DebuggableAttribute`, das den JIT anweist, Code zum Debuggen zu erzeugen. Auch dann läuft MinOpts, zusätzlich bleiben alle Locals über ihre ganze Lebensdauer sichtbar. Wer Maschinencode aus einem Debug-Build oder unter einem Debugger mit abgeschalteter Optimierung betrachtet, sieht also wieder nicht den Code aus Produktion.
+
+### Das IL ist kein Maß für den Maschinencode
+
+Die Pipeline erklärt auch, warum die Länge des IL kaum etwas über die Geschwindigkeit aussagt. Ein Aufruf kostet im IL fünf Byte, kann aber eingesetzt werden und verschwinden. Ein harmloses `arr[i]` kostet im IL wenige Byte und bringt im Maschinencode einen Bounds-Check mit, oder eben nicht, wenn die Range Analysis ihn entfernt.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Du musst den JIT nicht selbst debuggen, um seine Arbeit zu sehen. Ab .NET 7 kann die normale Runtime ausgeben, was der JIT erzeugt hat. Die wichtigsten Schalter, alle als Umgebungsvariable:
+
+| Umgebungsvariable              | Wirkung                                                                 |
+| ------------------------------ | ----------------------------------------------------------------------- |
+| `DOTNET_JitDisasmSummary=1`    | eine Zeile pro übersetzter Methode, mit Stufe (`Tier0`, `Tier1`, …)     |
+| `DOTNET_JitDisasm=SumSquares`  | Assembler der genannten Methoden, für jede Stufe einzeln                |
+| `DOTNET_JitStdOutFile=jit.txt` | Ausgabe des JIT in eine Datei statt auf die Konsole                     |
+| `DOTNET_JitDisasmOnlyOptimized=1` | nur optimierten Code ausgeben, Tier 0 ausblenden                     |
+| `DOTNET_JitDump=SumSquares`    | vollständiges Protokoll aller Phasen, nur mit einem Checked-Build des JIT |
+
+{/* TODO(verify): JitDisasm and JitDisasmSummary available in release runtimes since .NET 7; JitStdOutFile and JitDisasmOnlyOptimized in release builds since which version (viewing-jit-dumps.md lists them as available in the shipped product today). */}
+
+Der `JitDump` ist das eigentliche Fenster in die Pipeline: Er zeigt nach jeder Phase die Bäume beziehungsweise die LIR, mit Wertnummern, Registern und Entscheidungen des Inliners. Dafür brauchst du einen JIT aus einem selbst gebauten dotnet/runtime-Repository in der Konfiguration Checked oder Debug. Für den Alltag reicht der Assembler, und den liest die Lektion „JIT-Assembler lesen“ Zeile für Zeile.
+
+Drei praktische Regeln, wenn du eine Methode im JIT untersuchen willst:
+
+- **Inlining kontrollieren.** Markiere die Methode, die du ansehen willst, mit `[MethodImpl(MethodImplOptions.NoInlining)]`. Sonst verschwindet sie im optimierten Code ihres Aufrufers, und du findest keine eigene Ausgabe.
+- **Lange genug laufen lassen.** Tier-1-Code entsteht erst, wenn die Methode heiß ist. Ein Programm, das nach 50 ms endet, zeigt dir nur Tier 0.
+- **Nicht mit `dotnet run` messen.** Die Umgebungsvariablen gelten sonst auch für MSBuild und den Compiler. Erst bauen, dann die fertige DLL mit gesetzten Variablen starten.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+### Wann der JIT läuft
+
+Jede Methode hat einen Einstiegspunkt, der vor der ersten Übersetzung auf einen kleinen Codeschnipsel der Runtime zeigt, den **Precode**. Der erste Aufruf landet dort, springt in den **Prestub** der Runtime, und diese ruft `compileMethod` auf, den einzigen Einstieg in den JIT. Das passiert synchron auf dem Thread, der die Methode aufruft. Rufen zwei Threads gleichzeitig dieselbe neue Methode auf, sorgt die Runtime dafür, dass nur eine Übersetzung gewinnt. Wie der Einstiegspunkt später auf Tier-1-Code umgestellt wird, beschreibt die Lektion „Tiered Compilation und OSR“.
+
+{/* TODO(verify): Whether both threads may run the JIT concurrently and one result is discarded, or the second thread waits (ryujit-overview.md only says the EE "has the necessary synchronization to ensure there is a single JIT compiled copy"). */}
+
+### Die JIT/EE-Schnittstelle
+
+Der JIT kennt keine Metadaten, keine MethodTables und keinen GC. Alles, was er über das Programm wissen muss, erfragt er über die Schnittstelle `ICorJitInfo`, die die Runtime implementiert. Einige typische Fragen:
+
+- `resolveToken`: Welcher Typ, welches Feld oder welche Methode steckt hinter diesem Token im IL?
+- `getCallInfo`: Wie wird diese Methode aufgerufen, direkt, virtuell oder über einen Stub?
+- `getFieldInfo` und `getFieldOffset`: Wo liegt dieses Feld, und braucht der Zugriff einen Helfer?
+- `getClassSize` und die Layout-Abfragen: Wie groß ist ein Struct, und wo liegen seine Verweise?
+- `getHelperFtn`: Wo liegt der Allokations- oder Exception-Helfer der Runtime?
+
+Am Ende reicht der JIT sein Ergebnis über dieselbe Schnittstelle zurück. Mit `allocMem` lässt er sich Speicher für den Code geben, mit `allocUnwindInfo` meldet er die Unwind-Info, mit `setBoundaries` und `setVars` die Debug-Info. Diese strikte Trennung hat einen großen Vorteil: Derselbe JIT übersetzt auch für **crossgen2** (ReadyToRun) und für den Native-AOT-Compiler, dort beantwortet eben ein anderer Partner die Fragen. Mehr dazu in „ReadyToRun und Crossgen“.
+
+<Callout kind="version">
+  Die Pipeline verändert sich mit jeder .NET-Version. Physical Promotion für Structs, die Optimierung
+  von Induktionsvariablen und die Stack-Allokation von Objekten durch Escape Analysis sind Beispiele
+  für Phasen, die in den letzten Versionen hinzugekommen oder deutlich ausgebaut worden sind. Die
+  grobe Gliederung in Importer, Optimierungen auf Bäumen, LIR, Registerzuteilung und
+  Codegenerierung ist dagegen seit vielen Jahren stabil.
+</Callout>
+
+{/* TODO(verify): Versions: physical promotion (.NET 8), induction variable optimization with strength reduction (.NET 9), object stack allocation enabled by default (.NET 9 / .NET 10), per the Performance Improvements posts. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente zeigen die Wirkung der Pipeline: SharpLab für den schnellen Blick und ein kleines Programm mit `DOTNET_JitDisasm` für Tier 0 und Tier 1 nebeneinander.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „JIT Asm“. Vergleiche SumSquares mit SumSquaresNoInline: In der ersten Methode sollten keine call-Befehle mehr stehen, in der zweiten zwei Aufrufe von SquareNoInline. Schalte danach auf „IL“ um: Dort sehen beide Methoden fast gleich aus, der Unterschied entsteht erst im JIT."
+  code={sharplabCode}
+/>
+
+Für das zweite Experiment baust du das folgende Programm im Release-Modus und startest es mit gesetzten Umgebungsvariablen:
+
+<CodeBlock code={consoleCode} />
+
+```bash
+dotnet build -c Release
+DOTNET_JitStdOutFile=jit.txt DOTNET_JitDisasmSummary=1 DOTNET_JitDisasm=SumSquares \
+  dotnet bin/Release/net8.0/Demo.dll
+```
+
+In `jit.txt` erwartest du `SumSquares` mindestens zweimal: zuerst als `Tier0` mit Speicherzugriffen über `rbp` und zwei `call`-Befehlen, später als `Tier1` mit wenigen Befehlen ohne Aufruf. Mit aktivem Dynamic PGO kann dazwischen eine Fassung `Instrumented Tier0` auftauchen. Setzt du zusätzlich `DOTNET_TieredCompilation=0`, erscheint die Methode nur einmal, als `FullOpts`.
+
+{/* TODO(verify): Expected summary lines and both listings on .NET 8 x64 (Windows and Linux); whether SharpLab's JIT Asm view shows FullOpts code for both methods; project/DLL name in the command is an example. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="jit-pipeline"
+  questions={[
+    {
+      q: 'Was legt der Importer auf seinen Stack, wenn er ldarg.0 liest?',
+      options: [
+        'Den Wert von Argument 0',
+        'Einen Baumknoten, der für Argument 0 steht',
+        'Einen mov-Befehl für das Register von Argument 0',
+      ],
+      correct: 1,
+      explanation:
+        'Der Importer simuliert den Evaluation Stack mit Baumknoten. Werte gibt es zur Übersetzungszeit nicht, und Maschinenbefehle entstehen erst ganz am Ende der Pipeline.',
+    },
+    {
+      q: 'In welcher Phase entscheidet sich, ob ein Local in einem Register oder im Stack-Frame liegt?',
+      options: ['Im Importer', 'In der Registerzuteilung (LSRA)', 'Im C#-Compiler'],
+      correct: 1,
+      explanation:
+        'Bis zur Registerzuteilung sind Locals nur Einträge in einer Tabelle. Erst LSRA verteilt sie auf Register oder lagert sie in den Frame aus.',
+    },
+    {
+      q: 'Warum ist Inlining für die späteren Optimierungen so wichtig?',
+      options: [
+        'Weil der eingesetzte Code danach für CSE, Assertion Propagation und Range Analysis sichtbar ist',
+        'Weil eingesetzter Code nicht mehr von der Registerzuteilung behandelt werden muss',
+      ],
+      correct: 0,
+      explanation:
+        'Die Phasen nach dem Inlining arbeiten innerhalb einer Methode. Erst wenn der Code der aufgerufenen Methode eingesetzt ist, können sie Wissen über Aufrufgrenzen hinweg nutzen.',
+    },
+    {
+      q: 'Du siehst in Tier-0-Code, dass ein winziger Getter nicht eingesetzt wurde. Was folgt daraus?',
+      options: [
+        'Der Getter ist zu groß für den Inliner',
+        'Nichts Besonderes: Tier 0 läuft in MinOpts und setzt grundsätzlich nichts ein',
+      ],
+      correct: 1,
+      explanation:
+        'In MinOpts überspringt der JIT das Inlining und die meisten Optimierungen. Ob der Getter eingesetzt wird, zeigt erst der Tier-1-Code.',
+    },
+    {
+      q: 'Woher weiß der JIT, an welchem Offset ein Feld in einem Objekt liegt?',
+      options: [
+        'Er liest die Metadaten der Assembly selbst',
+        'Er fragt die Runtime über die JIT/EE-Schnittstelle',
+        'Das Offset steht im IL der Methode',
+      ],
+      correct: 1,
+      explanation:
+        'Das Layout von Typen kennt nur die Runtime. Der JIT fragt sie über ICorJitInfo, etwa mit getFieldInfo oder getFieldOffset.',
+    },
+    {
+      q: 'Wozu erzeugt der JIT neben dem Maschinencode eine GC-Info?',
+      options: [
+        'Damit der GC weiß, wie viel Speicher die Methode alloziert',
+        'Damit der GC an einem angehaltenen Thread findet, in welchen Registern und Stack-Slots Verweise liegen',
+      ],
+      correct: 1,
+      explanation:
+        'Der GC muss alle lebenden Verweise kennen, auch die in Registern. Die GC-Info beschreibt für Stellen im Code, wo diese Verweise gerade liegen.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- RyuJIT ist ein vollwertiger optimierender Compiler, der beim ersten Aufruf einer Methode über Precode und Prestub synchron auf dem aufrufenden Thread läuft.
+- Der **Importer** liest das IL einmal und ersetzt den Evaluation Stack durch **Bäume** aus `GenTree`-Knoten. IL wird nie Instruktion für Instruktion übersetzt.
+- Das **Frontend** optimiert auf Bäumen: Inlining, Morph, Schleifen, dann SSA und **Wertnummern** als Grundlage für CSE, Assertion Propagation und Range Analysis.
+- Das **Backend** arbeitet auf der linearen **LIR**: Lowering für den Zielprozessor, Registerzuteilung per **Linear Scan**, Codegenerierung mit Prolog und Epilog.
+- Neben dem Code liefert der JIT **GC-Info**, **Unwind-Info** und Debug-Info. Alles, was er über Typen und Methoden wissen muss, erfragt er über die **JIT/EE-Schnittstelle**.
+- **Tier 0** nutzt dieselbe Pipeline im Modus **MinOpts** ohne Inlining und ohne die teuren Optimierungen. Auch sehr große Methoden fallen auf MinOpts zurück.
+- Mit `DOTNET_JitDisasm` und `DOTNET_JitDisasmSummary` siehst du das Ergebnis ab .NET 7 ohne Spezialbuild, den vollständigen `JitDump` nur mit einem Checked-JIT.
+
+</Block>

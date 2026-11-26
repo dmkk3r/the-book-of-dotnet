@@ -1,0 +1,345 @@
+---
+id: pgo
+title: Dynamic PGO
+summary: Wie der JIT im laufenden Prozess misst, welche Zweige und Typen wirklich vorkommen, und daraus Typprüfungen mit Inlining, ein besseres Codelayout und klügere Entscheidungen macht.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Performance Improvements in .NET 8 (.NET Blog, Abschnitt „Tiering and Dynamic PGO“)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+  - title: 'Performance Improvements in .NET 7 (.NET Blog, Abschnitt „PGO“)'
+    url: https://devblogs.microsoft.com/dotnet/performance_improvements_in_net_7/
+  - title: 'Performance Improvements in .NET 6 (.NET Blog, Abschnitt „PGO“)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-6/
+  - title: 'Guarded Devirtualization (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/GuardedDevirtualization.md
+  - title: 'Dynamic PGO und instrumentierte Tiers (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/DynamicPgo-InstrumentedTiers.md
+  - title: 'Tiered Compilation (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/tiered-compilation.md
+  - title: 'Laufzeitkonfiguration: Kompilierung (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/runtime-config/compilation
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './pgo.steps';
+import profileScript from './pgo-profile.steps';
+import gdvScript from './pgo-gdv.steps';
+import { pgoCode, benchmarkCode } from './pgo-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein optimierender Compiler trifft ständig Entscheidungen, für die ihm eine Information fehlt: wie sich das Programm zur Laufzeit tatsächlich verhält. Welcher Zweig eines `if` ist der häufige? Welche konkrete Klasse steckt hinter einem `IShape`, wenn `s.Area()` aufgerufen wird? Lohnt es sich, eine Methode einzubetten, die in einer Schleife liegt, die vielleicht nie läuft? Aus dem Quelltext allein lässt sich das nicht ablesen.
+
+Ohne diese Information muss der Compiler raten oder vorsichtig sein. Ein Interface-Aufruf bleibt ein Interface-Aufruf, auch wenn in Wirklichkeit 99 von 100 Objekten dieselbe Klasse haben. Der seltene Fehlerpfad liegt mitten im heißen Code und verdrängt nützliche Instruktionen aus dem Cache. Und eine kleine Methode wird nicht eingebettet, weil der Compiler nicht weiß, dass ihr Aufruf das Herz der Anwendung ist.
+
+Die klassische Antwort heißt **Profile-Guided Optimization** (PGO): Man lässt das Programm in einem Trainingslauf mit Messcode laufen, speichert die Messwerte und übersetzt es dann ein zweites Mal mit diesem Wissen. C++-Compiler machen das seit Jahrzehnten. Der Haken liegt auf der Hand: Der Trainingslauf muss repräsentativ sein, er muss gepflegt werden, und er beschreibt die Vergangenheit, nicht die Last, die in Produktion tatsächlich ankommt.
+
+Ein JIT hat eine bessere Ausgangslage. Er übersetzt ohnehin während das Programm läuft, und mit Tiered Compilation übersetzt er heiße Methoden sogar zweimal. Warum also nicht in der ersten Runde messen und in der zweiten Runde das Gemessene nutzen? Genau das ist **Dynamic PGO**.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir diese vier Sätze:
+
+1. **Messen gehört zum Tiering.** Bevor eine heiße Methode in Tier 1 übersetzt wird, läuft sie eine Weile in einer **instrumentierten** Fassung, die mitzählt.
+2. **Gezählt wird, was der JIT braucht.** Wie oft Blöcke und Zweige laufen, welche Typen an virtuellen Aufrufstellen ankommen, bei manchen Methoden auch typische Werte wie eine Länge.
+3. **Tier 1 rechnet mit Wahrscheinlichkeiten, nicht mit Gewissheiten.** Der JIT optimiert den häufigen Fall und lässt für alle anderen Fälle einen korrekten, langsameren Weg stehen.
+4. **Das Profil wird einmal gesammelt.** Der Tier-1-Code enthält keine Zähler mehr. Was danach passiert, beeinflusst den Code nicht.
+
+Wie Tier 0 und Tier 1 grundsätzlich zusammenspielen, Aufrufzählung, Hintergrund-Thread und Umstellen des Einstiegspunkts, erklärt die Lektion „Tiered Compilation und OSR“. Hier geht es um die zusätzliche Stufe und um das, was der JIT mit den Daten anfängt.
+
+<Callout kind="fehlannahme">
+  „PGO braucht einen Trainingslauf vor dem Deployment.“ Das gilt für **statisches** PGO. Dynamic
+  PGO misst in deinem Prozess, mit deiner echten Last, ohne dass du etwas vorbereitest. Seit .NET 8
+  ist es standardmäßig eingeschaltet, du nutzt es also vermutlich schon.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ist eine Methode, die bei jeder Anfrage aufgerufen wird. Sie enthält zwei Stellen, an denen ein Profil hilft: einen Zweig, der fast nie genommen wird, und einen Interface-Aufruf, hinter dem in der Praxis fast immer dieselbe Klasse steckt. Die Methode hat keine Schleife, sie startet deshalb in gewöhnlichem Tier 0.
+
+<StepPlayer script={script} />
+
+Beachte zwei Dinge. Erstens kostet die instrumentierte Phase etwas: Sie ist unoptimiert wie Tier 0 und schreibt zusätzlich bei jedem Durchlauf in Zähler. Weil sie nur für heiße Methoden und nur für eine kurze Zeit läuft, fällt das im Dauerbetrieb nicht ins Gewicht. Zweitens sieht die Instrumentierung nur, was in diesem Zeitfenster passiert. Der letzte Schritt zeigt die Kehrseite: Das Profil ist danach eingefroren.
+
+{/* TODO(verify): Whether the instrumented phase uses the same call count threshold and call counting delay as the first phase (tiered-compilation.md, DynamicPgo-InstrumentedTiers.md). */}
+
+</Block>
+
+<Block n={4} title="Was die Instrumentierung sammelt">
+
+### Blockzähler
+
+Der JIT zerlegt jede Methode in **Basisblöcke**: Folgen von Instruktionen ohne Sprung hinein oder hinaus. Die einfachste Form der Instrumentierung zählt, wie oft jeder Block läuft. Daraus ergibt sich, welche Seite eines `if` die häufige ist, wie viele Durchläufe eine Schleife typischerweise hat und welche Blöcke praktisch nie laufen.
+
+Ganz so naiv macht es der JIT nicht. Laut .NET-Blog zählt er seit .NET 7 an ausgewählten **Kanten** zwischen Blöcken und rekonstruiert die übrigen Werte, denn was in einen Block hineinfließt, muss auch wieder herausfließen. So braucht er deutlich weniger Zähler und damit weniger Zusatzarbeit in der instrumentierten Phase.
+
+{/* TODO(verify): Edge-based instrumentation on a spanning tree with count reconstruction introduced in .NET 7 (Performance Improvements in .NET 7, "efficient edge instrumentation"). */}
+
+### Klassenprofile an virtuellen Aufrufstellen
+
+Für Optimierungen besonders wertvoll ist die Frage, welche konkreten Typen an einer virtuellen Aufrufstelle oder Interface-Aufrufstelle ankommen. Dazu setzt der JIT eine **Klassenprobe** vor den Aufruf: Sie liest den MethodTable-Zeiger des Objekts, also genau den Wert, an dem die Runtime den Typ eines Objekts erkennt (siehe „Virtuelle Aufrufe und Interface-Dispatch“). Die Probe legt diesen Zeiger in einer kleinen Tabelle pro Aufrufstelle ab.
+
+Diese Tabelle ist kein vollständiges Histogramm. Sie hat nur wenige Plätze und wird nach einem **Stichprobenverfahren** gefüllt, das alle ankommenden Typen fair repräsentiert. Was der JIT später daraus liest, sind also Anteile, keine exakten Zahlen. Für die Frage „Dominiert ein Typ?“ reicht das völlig.
+
+{/* TODO(verify): Class profile table uses reservoir sampling with a small fixed number of entries (8?), see Performance Improvements in .NET 7 and the class profile helpers in src/coreclr/vm/jithelpers.cpp. */}
+
+Dasselbe Prinzip gibt es für **Delegate-Aufrufe**: Hier merkt sich die Probe, welche Zielmethode hinter dem Delegate steckt. Für Typprüfungen mit `is`, `as` und Casts sammelt der JIT ebenfalls Typinformationen, um den häufigen Typ schnell zu prüfen.
+
+{/* TODO(verify): Delegate call profiling and delegate GDV introduced in .NET 7, cast profiling (isinst/castclass) in .NET 8, per the respective Performance Improvements posts. */}
+
+<StepPlayer script={profileScript} />
+
+### Wertprofile
+
+Eine dritte, jüngere Art von Probe zeichnet **Werte** auf, nicht Typen. Das lohnt sich nur an wenigen, gezielt gewählten Stellen. Ein Beispiel aus dem .NET-Blog: Bei Kopier- und Vergleichsoperationen auf Speicherblöcken merkt sich die Probe die typische Länge. Ist sie fast immer gleich, kann der Tier-1-Code für genau diese Länge eine ausgerollte Fassung ohne Schleife enthalten, wieder geschützt durch eine Prüfung.
+
+{/* TODO(verify): Value probes for Buffer.Memmove and SequenceEqual lengths, introduced in .NET 8 (Performance Improvements in .NET 8). Which other call sites get value probes. */}
+
+</Block>
+
+<Block n={5} title="Was der JIT mit dem Profil macht">
+
+### Guarded Devirtualization
+
+Die bekannteste Optimierung ist die **Guarded Devirtualization** (GDV). Dominiert an einer Aufrufstelle ein Typ, setzt der JIT eine billige Typprüfung davor: Stimmt der MethodTable-Zeiger mit dem erwarteten Typ überein, ruft der Code dessen Methode direkt auf, und weil das Ziel jetzt bekannt ist, kann er sie meist sogar einbetten. Stimmt er nicht, bleibt der ursprüngliche virtuelle Aufruf als Rückfallweg.
+
+<StepPlayer script={gdvScript} />
+
+Die Visualisierung zeigt, warum GDV nie falsch sein kann: Die Vermutung wird bei jedem Aufruf geprüft. Ein unerwarteter Typ macht den Aufruf nur langsamer, nie fehlerhaft. Der eigentliche Gewinn ist dabei nicht der gesparte indirekte Sprung, sondern das Inlining dahinter. Erst wenn `Circle.Area` im Code von `AreaOf` steht, kann der JIT Konstanten weiterreichen, Speicherzugriffe zusammenfassen und Werte in Registern halten. Wie Devirtualisierung ohne Profil funktioniert, etwa bei `sealed`-Klassen, und wann der JIT mehrere Typen prüft, behandelt die Lektion „Devirtualisierung“.
+
+{/* TODO(verify): Minimum likelihood the dominant class needs for GDV and the default number of guarded types per call site in .NET 8, 9 and 10 (JitGuardedDevirtualizationMaxTypeChecks, JitGuardedDevirtualizationChainLikelihood or similar). */}
+
+### Layout von heißen und kalten Blöcken
+
+Der Prozessor arbeitet am schnellsten, wenn der häufige Ablauf geradeaus durch den Code läuft. Jeder genommene Sprung kostet etwas, und Code, der selten läuft, aber zwischen heißen Instruktionen liegt, belegt Platz im Instruktions-Cache. Mit Blockzählern weiß der JIT, welche Blöcke heiß sind. Er ordnet sie so an, dass der häufige Pfad durchfällt, und schiebt kalte Blöcke wie Fehlerbehandlung oder den `null`-Fall ans Ende der Methode.
+
+Ohne Profil muss der JIT dafür Faustregeln verwenden, etwa dass ein Block, der eine Exception wirft, selten läuft. Mit Profil kennt er die tatsächliche Verteilung, auch für Zweige, die keine Faustregel erfasst. Laut .NET-Blog wurde die Blockanordnung in den letzten Versionen grundlegend überarbeitet und nutzt die Profildaten deutlich konsequenter.
+
+{/* TODO(verify): Block layout rework in .NET 9 and .NET 10 (new layout algorithm based on profile weights, 3-opt), per Performance Improvements in .NET 9/10. */}
+
+### Bessere Inlining-Entscheidungen
+
+Ob der JIT eine Methode einbettet, entscheidet eine Kosten-Nutzen-Schätzung. Das Profil verschiebt diese Schätzung: Eine Aufrufstelle, die laut Profil sehr oft läuft, verdient mehr Einsatz, eine in einem kalten Block weniger. So landet das Budget für Inlining dort, wo es tatsächlich Zeit spart. Wie die Schätzung grundsätzlich funktioniert, zeigt die Lektion „Inlining“.
+
+{/* TODO(verify): Profile-driven inlining boosts in ExtendedDefaultPolicy (call site weight relative to method entry), src/coreclr/jit/inlinepolicy.cpp. */}
+
+Dazu kommen kleinere Nutzer der Daten: Die Registerzuteilung verteilt teure Speicherzugriffe bevorzugt auf kalte Blöcke, und Optimierungen an Schleifen orientieren sich an den gemessenen Durchlaufzahlen.
+
+{/* TODO(verify): LSRA uses block weights from PGO for spill placement; loop cloning and loop optimizations use profile weights. */}
+
+</Block>
+
+<Block n={6} title="ReadyToRun, statisches PGO und Native AOT">
+
+### Vorkompilierter Code misst nicht
+
+Große Teile des Frameworks liegen als **ReadyToRun**-Code (R2R) vorkompiliert vor. Dieser Code enthält keine Probes. Würde eine heiße R2R-Methode direkt durch Tier 1 ersetzt, hätte Tier 1 kein Profil. Würde sie stattdessen in instrumentiertes Tier 0 übersetzt, würde sie während der Messung spürbar langsamer als der optimierte R2R-Code vorher.
+
+Laut .NET-Blog wählt die Runtime deshalb einen eigenen Weg: Eine heiße R2R-Methode wird zuerst **optimiert und instrumentiert** übersetzt, und erst nach einer weiteren Runde in die endgültige Tier-1-Fassung mit Profil. Mehr zum vorkompilierten Code steht in der Lektion „ReadyToRun und Crossgen“.
+
+{/* TODO(verify): Hot R2R methods go R2R -> Tier1 instrumented -> Tier1 by default in .NET 8 (Performance Improvements in .NET 8, DynamicPgo-InstrumentedTiers.md). */}
+
+### Statisches PGO steckt schon im Framework
+
+Statisches PGO ist nicht verschwunden, es arbeitet nur an anderer Stelle. Das .NET-Team lässt Trainingsszenarien laufen, sammelt daraus Profildaten und übergibt sie beim Vorkompilieren des Frameworks an Crossgen. Der R2R-Code, mit dem dein Prozess startet, ist also bereits nach Profilen angeordnet. Dynamic PGO ergänzt das um Daten aus deiner Anwendung.
+
+{/* TODO(verify): Framework assemblies are compiled by crossgen2 with static PGO data (.mibc files from the dotnet/optimization pipeline); whether apps can feed their own .mibc via the PublishReadyToRun tooling. */}
+
+### Native AOT hat keinen JIT
+
+Bei Native AOT gibt es zur Laufzeit keinen JIT, also auch keine zweite Übersetzung und kein Dynamic PGO. Der Code ist fertig, bevor das Programm startet. Wer Native AOT einsetzt, tauscht schnellen Start und kleinen Speicherbedarf gegen diese Möglichkeit ein. Die Abwägung beschreibt die Lektion „Startzeit gegen Spitzenleistung“.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Phasenwechsel
+
+Das Profil beschreibt das kurze Zeitfenster der instrumentierten Phase. Verhält sich ein Programm am Anfang anders als später, landet das Verhalten vom Anfang im Code. Ein Beispiel: Beim Start lädt ein Dienst Daten und verarbeitet dabei fast nur Objekte vom Typ `CachedEntry`, im Betrieb kommen fast nur `RemoteEntry`. Wird die Verarbeitungsmethode in der Startphase heiß, bekommt sie eine Typprüfung auf den falschen Typ. Jeder Aufruf zahlt dann für eine Prüfung, die fast immer fehlschlägt, plus den normalen Aufruf.
+
+Die Runtime instrumentiert Tier-1-Code nach heutigem Stand nicht erneut. Der Effekt ist meistens klein, denn eine fehlschlagende Prüfung kostet wenig. Er erklärt aber, warum ein Benchmark und eine Produktionsmessung manchmal verschiedene Dinge sehen.
+
+{/* TODO(verify): No re-instrumentation or re-jitting of Tier 1 code based on changed behavior in current .NET (8, 9, 10). */}
+
+### Megamorphe Aufrufstellen
+
+Kommen an einer Aufrufstelle viele Typen ohne klaren Favoriten an, hilft das Profil wenig. Der JIT erzeugt dann keine Typprüfung, denn sie träfe zu selten. Solche **megamorphen** Stellen sind typisch für sehr allgemeinen Code: ein `IHandler`, hinter dem zwanzig Implementierungen stehen, oder ein `object.Equals` in einer Collection mit gemischten Typen. Hier hilft nur, den Code so zu gestalten, dass der Typ statisch bekannt ist, etwa über Generics mit Werttypen oder `sealed`-Klassen.
+
+Ein verwandter Fall: Eine Methode wird von vielen Stellen aus aufgerufen, und ihr Profil vermischt alles. Die Klassenprobe gehört zu der Methode, in der der virtuelle Aufruf steht, nicht zu deren Aufrufern. Ein gemeinsames Hilfsmittel, das von zehn Stellen mit verschiedenen Typen benutzt wird, sieht deshalb wie eine megamorphe Stelle aus, auch wenn jeder einzelne Aufrufer monomorph ist.
+
+### Benchmarks sind oft zu ordentlich
+
+Ein Microbenchmark füttert eine Methode typischerweise mit immer demselben Typ und denselben Größen. Dynamic PGO macht daraus perfekten Code, und das Ergebnis sieht großartig aus. In Produktion kommen gemischte Typen und schwankende Größen an, und der Vorteil schrumpft. Wenn du Code mit virtuellen Aufrufen misst, miss auch eine realistische Typverteilung, so wie der Benchmark weiter unten. Allgemeine Regeln für saubere Messungen stehen in der Lektion „BenchmarkDotNet richtig nutzen“.
+
+### AggressiveOptimization schaltet PGO ab
+
+Eine Methode mit `[MethodImpl(MethodImplOptions.AggressiveOptimization)]` wird sofort voll optimiert und überspringt das Tiering. Damit durchläuft sie auch keine instrumentierte Phase und bekommt kein Profil. Für heiße Methoden mit virtuellen Aufrufen kann das Attribut deshalb langsameren Code bedeuten als gar nichts.
+
+{/* TODO(verify): AggressiveOptimization methods are not instrumented and get no Dynamic PGO data (consistent with tiered.mdx). */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Für die allermeisten Anwendungen gilt: nichts tun. Dynamic PGO ist seit .NET 8 eingeschaltet und braucht keine Pflege. Wichtig ist eher, zu wissen, was es kann und was nicht, damit du Messungen richtig deutest.
+
+| Situation                                 | Wirkung von Dynamic PGO                              | Was hilft                                      |
+| ----------------------------------------- | ---------------------------------------------------- | ---------------------------------------------- |
+| Interface mit einer dominanten Klasse     | Typprüfung plus Inlining, oft deutlich schneller     | nichts tun                                     |
+| Interface mit vielen gleich häufigen Typen | kaum Wirkung, normaler Interface-Aufruf              | Typ statisch bekannt machen                    |
+| Fehlerpfade im heißen Code                | landen ans Ende der Methode                          | nichts tun                                     |
+| Start anders als Dauerbetrieb             | Profil vom Start kann im Code bleiben                | im Zweifel messen, Aufwärmlast realistisch     |
+| Kurzlebiger Prozess                       | erreicht Tier 1 oft nie, PGO wirkt kaum              | ReadyToRun, Native AOT                         |
+| Native AOT                                | kein JIT, kein Dynamic PGO                           | sealed, Generics, bewusstes Design             |
+
+### Schalter
+
+| Umgebungsvariable           | MSBuild-Eigenschaft                 | Wirkung                                                |
+| --------------------------- | ----------------------------------- | ------------------------------------------------------ |
+| `DOTNET_TieredPGO`          | `TieredPGO`                         | Dynamic PGO ein (`1`) oder aus (`0`)                   |
+| `DOTNET_TieredCompilation`  | `TieredCompilation`                 | ohne Tiering keine instrumentierte Stufe, also kein PGO |
+| `DOTNET_ReadyToRun`         | keine                               | mit `0` wird auch Framework-Code in Tier 0 instrumentiert |
+
+{/* TODO(verify): TieredPGO MSBuild property and runtimeconfig knob System.Runtime.TieredPGO per Microsoft Learn compilation page; behavior of DOTNET_ReadyToRun=0 combined with PGO (all methods start in Tier 0 and can be instrumented there). */}
+
+In .NET 6 und 7 war Dynamic PGO noch ein Opt-in. Damals wurde oft empfohlen, zusätzlich `DOTNET_TC_QuickJitForLoops=1` und `DOTNET_ReadyToRun=0` zu setzen, um möglichst viel Code zu instrumentieren. Ab .NET 8 ist das meist nicht mehr nötig: Methoden mit Schleifen laufen dank OSR ohnehin durch Tier 0, und heiße R2R-Methoden bekommen ihre eigene instrumentierte Stufe. `ReadyToRun=0` macht den Start dagegen spürbar langsamer.
+
+### Beobachten
+
+Mit `DOTNET_JitDisasm=AreaOf` gibt die Runtime jede Fassung der Methode aus, die der JIT erzeugt. Du siehst dann nacheinander Tier 0, die instrumentierte Fassung mit ihren Zählern und schließlich Tier 1. Der Kopf jeder Ausgabe nennt die Stufe und bei Tier 1, ob Profildaten verwendet wurden. Im Tier-1-Code erkennst du GDV an einem Vergleich mit einer festen Adresse, dem MethodTable-Zeiger, direkt vor dem eingebetteten Code. Wie man solche Listings liest, zeigt die Lektion „JIT-Assembler lesen“.
+
+{/* TODO(verify): Exact JitDisasm header lines in .NET 8+ (e.g. "; Tier0 code", "; Instrumented Tier0 code", "; Tier1 code", "; optimized using Dynamic PGO", "; with Dynamic PGO: edge weights are valid"). */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Dynamic PGO ist Teamarbeit zwischen JIT und Runtime. Der JIT entscheidet beim Übersetzen der instrumentierten Fassung, welche Probes er braucht, und beschreibt sie in einem **Schema**: welche Art von Probe an welcher IL-Stelle. Die Runtime reserviert dafür Speicher, der zur Methode gehört, und gibt dem JIT die Adressen zurück. Der instrumentierte Code schreibt dann direkt in diesen Speicher.
+
+Übersetzt der JIT später die Tier-1-Fassung, fragt er die Runtime nach den gesammelten Daten für genau diese Methode und bekommt Schema und Werte zurück. Daraus berechnet er Gewichte für alle Blöcke und Wahrscheinlichkeiten für Zweige und Typen. Ab da arbeiten die übrigen Phasen der Pipeline mit diesen Gewichten, siehe „Die Pipeline von RyuJIT“.
+
+{/* TODO(verify): JIT-EE interface methods allocPgoInstrumentationBySchema and getPgoInstrumentationResults, runtime side in src/coreclr/vm/pgo.cpp (PgoManager). */}
+
+Weil viele Threads gleichzeitig dieselbe instrumentierte Methode ausführen können, sind die Zähler ein mögliches Nadelöhr: Alle schreiben auf dieselbe Cache-Line. Laut .NET-Blog verwendet die Runtime deshalb seit .NET 8 bei Bedarf **skalierbare Zähler**, die ab einer gewissen Größe nur noch mit einer Wahrscheinlichkeit erhöhen und das Ergebnis hochrechnen. Für Profile reicht diese Genauigkeit, denn der JIT braucht Verhältnisse, keine exakten Zahlen.
+
+{/* TODO(verify): Scalable (approximate) profile counters in .NET 8 to reduce contention (Performance Improvements in .NET 8), and their default. */}
+
+<Callout kind="version">
+  .NET 6 brachte Dynamic PGO als Opt-in. .NET 7 hat es stark ausgebaut, unter anderem mit OSR,
+  Kanten-Instrumentierung und Profilen für Delegates. Seit .NET 8 ist es standardmäßig an. Die
+  Details, etwa welche Stellen Wertprofile bekommen oder wie viele Typen GDV prüft, ändern sich mit
+  jeder Version. Prüfe sie im Zweifel mit `DOTNET_JitDisasm` auf der Version, die du einsetzt.
+</Callout>
+
+{/* TODO(verify): Version list: .NET 6 opt-in, .NET 7 improvements including delegate profiling, .NET 8 default on (Performance Improvements in .NET 6/7/8). */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente machen Dynamic PGO sichtbar. Die erwarteten Ergebnisse sind Richtwerte, die du auf deiner Maschine nachprüfen solltest.
+
+**Die Fassungen ansehen.** Starte das Programm mit `DOTNET_JitDisasm=AreaOf`. Du solltest `AreaOf` mehrfach sehen: als Tier 0, als instrumentierte Fassung mit zusätzlichen Zählerinstruktionen und als Tier 1. Im Tier-1-Code sollte ein Vergleich mit dem MethodTable-Zeiger von `Circle` stehen, gefolgt von der eingebetteten Berechnung. Mit `DOTNET_TieredPGO=0` fehlt die instrumentierte Fassung, und Tier 1 enthält einen normalen Interface-Aufruf.
+
+**Monomorph gegen megamorph.** Der Benchmark misst dieselbe Schleife einmal mit 90 Prozent `Circle` und einmal mit vier gleich häufigen Typen, jeweils mit und ohne Dynamic PGO. Erwartung: Mit PGO ist der fast monomorphe Fall deutlich schneller als ohne. Beim megamorphen Fall sollte sich PGO kaum auswirken.
+
+{/* TODO(verify): Expected outcomes of both experiments on .NET 8+ x64 (instrumented code visible in JitDisasm output, GDV guard in Tier 1, benchmark ratios). */}
+
+<VerifyCard
+  sharplab="SharpLab zeigt im Modus „JIT Asm“ eine einzelne Übersetzung ohne Laufzeitprofil. Guarded Devirtualization aus Dynamic PGO siehst du dort nicht. Führe das Programm lokal mit den Umgebungsvariablen aus dem Kommentar aus."
+  code={pgoCode}
+  benchmark={benchmarkCode}
+  note="Die Umgebungsvariablen gelten nur für den gestarteten Prozess. Ohne Aufwärmen misst du Tier 0 und die instrumentierte Fassung, BenchmarkDotNet wärmt deshalb vor der Messung auf."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="pgo"
+  questions={[
+    {
+      q: 'Woher stammen die Daten, die Dynamic PGO für Tier 1 verwendet?',
+      options: [
+        'Aus einem Trainingslauf, der beim Build ausgeführt wird',
+        'Aus einer instrumentierten Fassung der Methode im laufenden Prozess',
+      ],
+      correct: 1,
+      explanation:
+        'Vor Tier 1 läuft eine heiße Methode eine Weile in einer instrumentierten Fassung. Einen Trainingslauf braucht statisches PGO, nicht Dynamic PGO.',
+    },
+    {
+      q: 'An einem Interface-Aufruf kommen laut Profil zu 90 Prozent Circle-Objekte an. Was passiert, wenn danach ein Square ankommt?',
+      options: [
+        'Der Tier-1-Code liefert ein falsches Ergebnis oder wirft eine Exception',
+        'Die Typprüfung schlägt fehl und der normale Interface-Aufruf läuft',
+      ],
+      correct: 1,
+      explanation:
+        'Guarded Devirtualization prüft die Vermutung bei jedem Aufruf. Andere Typen nehmen den Rückfallweg, der Code bleibt korrekt.',
+    },
+    {
+      q: 'Worin liegt der größte Gewinn der Guarded Devirtualization?',
+      options: [
+        'Im gesparten indirekten Sprung',
+        'Darin, dass die Zielmethode eingebettet und mit dem Aufrufer zusammen optimiert werden kann',
+      ],
+      correct: 1,
+      explanation:
+        'Ein indirekter Sprung ist billig. Erst das Inlining hinter der Typprüfung öffnet den Weg für weitere Optimierungen über die Methodengrenze hinweg.',
+    },
+    {
+      q: 'Eine Methode wird beim Start mit ganz anderen Typen aufgerufen als im Dauerbetrieb und dabei heiß. Was passiert mit ihrem Tier-1-Code?',
+      options: [
+        'Er behält die Entscheidungen aus der Startphase',
+        'Die Runtime instrumentiert ihn erneut und übersetzt ihn passend neu',
+      ],
+      correct: 0,
+      explanation:
+        'Tier-1-Code enthält keine Probes mehr. Das Profil aus der instrumentierten Phase bleibt maßgeblich, auch wenn sich das Verhalten später ändert.',
+    },
+    {
+      q: 'Warum übersetzt die Runtime eine heiße ReadyToRun-Methode nicht einfach in instrumentiertes Tier 0?',
+      options: [
+        'Weil sie während der Messung deutlich langsamer würde als der optimierte R2R-Code',
+        'Weil R2R-Code grundsätzlich nie neu übersetzt wird',
+      ],
+      correct: 0,
+      explanation:
+        'Die Runtime übersetzt solche Methoden zuerst optimiert und instrumentiert. So misst sie, ohne in der Zwischenzeit spürbar langsamer zu werden.',
+    },
+    {
+      q: 'Du markierst eine heiße Methode mit vielen Interface-Aufrufen mit AggressiveOptimization. Was ist die Folge?',
+      options: [
+        'Sie bekommt früher optimierten Code und zusätzlich ein Profil',
+        'Sie überspringt das Tiering und bekommt kein Profil, also keine Guarded Devirtualization',
+      ],
+      correct: 1,
+      explanation:
+        'Ohne Tiering gibt es keine instrumentierte Stufe. Die Methode wird beim ersten Aufruf ohne Laufzeitdaten optimiert.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- **Dynamic PGO** misst im laufenden Prozess: Heiße Methoden laufen vor Tier 1 eine Weile in einer **instrumentierten** Fassung.
+- Gesammelt werden **Block- und Kantenzähler**, **Klassenprofile** an virtuellen Aufrufstellen und Delegate-Aufrufen und an wenigen Stellen **Wertprofile**.
+- Tier 1 nutzt das Profil für **Guarded Devirtualization**, für die Anordnung **heißer und kalter Blöcke** und für bessere **Inlining**-Entscheidungen.
+- Jede Optimierung behält einen korrekten **Rückfallweg**. Ein falsches Profil macht Code langsamer, nie falsch.
+- Das Profil wird **einmal** gesammelt und dann eingefroren. Phasenwechsel und **megamorphe** Aufrufstellen begrenzen den Nutzen.
+- **ReadyToRun**-Code misst nicht. Heiße R2R-Methoden gehen über eine optimierte, instrumentierte Zwischenstufe. Native AOT hat kein Dynamic PGO.
+- Seit **.NET 8** ist Dynamic PGO standardmäßig an. `AggressiveOptimization` und abgeschaltetes Tiering schalten es für die betroffenen Methoden ab.
+
+</Block>

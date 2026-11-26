@@ -1,0 +1,318 @@
+---
+id: simd
+title: Hardware-Intrinsics und SIMD
+summary: Wie ein Befehl viele Werte auf einmal verarbeitet, was Vector<T> und Vector128<T> im Register bedeuten, warum IsSupported nichts kostet und wie eine vektorisierte Schleife mit Rest richtig aussieht.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Use SIMD and hardware intrinsics in .NET (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/simd
+  - title: 'Vector128 (Microsoft Learn, API-Referenz)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.intrinsics.vector128
+  - title: 'Vector<T> (Microsoft Learn, API-Referenz)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.numerics.vector-1
+  - title: 'System.Runtime.Intrinsics.X86 (Microsoft Learn, API-Referenz)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.intrinsics.x86
+  - title: 'Hardware Intrinsics in .NET 8 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/dotnet-8-hardware-intrinsics/
+  - title: 'Hardware Intrinsics (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/hw-intrinsics.md
+  - title: 'Vectorization guidelines (dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/coding-guidelines/vectorization-guidelines.md
+  - title: "What's new in the .NET 9 runtime (Microsoft Learn, AVX10v1 und Arm64 SVE)"
+    url: https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-9/runtime
+  - title: "What's new in the .NET 10 runtime (Microsoft Learn, AVX10.2)"
+    url: https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-10/runtime
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './simd.steps';
+import lanesScript from './simd-lanes.steps';
+import supportedScript from './simd-issupported.steps';
+import { simdCode, benchmarkCode } from './simd-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine Schleife, die ein Array summiert, ein Byte sucht oder zwei Puffer vergleicht, arbeitet normalerweise ein Element nach dem anderen ab. Für jedes Element gibt es einen Ladebefehl, einen Rechenbefehl und eine Prüfung, ob die Schleife weitergeht. Bei einer Million Elementen sind das ein paar Millionen Befehle.
+
+Dabei hat jeder aktuelle Prozessor Register, die viel breiter sind als ein `int`. Auf x64 sind die `xmm`-Register 128 Bit breit, mit AVX gibt es `ymm`-Register mit 256 Bit, mit AVX-512 `zmm`-Register mit 512 Bit. Arm64 hat 128 Bit breite Vektorregister. In ein 256-Bit-Register passen acht `int`. Und es gibt Befehle, die in einem Rutsch acht Additionen ausführen, je eine pro `int`.
+
+Diese Idee heißt **SIMD**, Single Instruction, Multiple Data: ein Befehl, viele Daten. Eine Schleife, die das nutzt, braucht für dieselbe Arbeit nur einen Bruchteil der Befehle. Der Haken: Ein normaler C#-Compiler erzeugt aus deiner Schleife keine solchen Befehle, und auch der JIT tut es nicht von selbst. Du musst ihm sagen, dass du in Vektoren denkst. Dafür gibt es in .NET eigene Typen, die der JIT kennt und direkt in Vektorbefehle übersetzt.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen die Lektion:
+
+1. **Ein Vektor ist ein Register mit Lanes.** Ein `Vector128<int>` sind 16 Byte, aufgeteilt in vier Lanes. Operationen wie `+` laufen Lane für Lane, unabhängig voneinander.
+2. **Der JIT übersetzt Vektortypen direkt in Befehle.** `Vector128<T>`, `Vector256<T>`, `Vector512<T>` und `Vector<T>` sind keine gewöhnlichen Structs mit Schleifen darin. Der JIT erkennt ihre Operationen als **Intrinsics** und setzt dafür jeweils einen oder wenige Maschinenbefehle ein.
+3. **Breite und Befehlssatz entscheidet die Maschine, auf der der JIT läuft.** `Vector<T>` hat keine feste Breite, und `Avx2.IsSupported` hat keinen festen Wert. Beides steht erst fest, wenn der JIT auf einer konkreten CPU übersetzt.
+4. **`IsSupported` und `IsHardwareAccelerated` sind Konstanten.** Der JIT ersetzt sie beim Übersetzen durch `true` oder `false` und wirft die Zweige weg, die nie laufen können. Die Prüfung kostet zur Laufzeit nichts.
+5. **Eine vektorisierte Schleife hat immer einen Rest.** Die Hauptschleife verarbeitet ganze Vektoren, was übrig bleibt, muss anders erledigt werden.
+
+<Callout kind="fehlannahme">
+  „`Vector<T>` ist immer 256 Bit breit.“ Nein: Die Runtime legt die Breite beim Start passend zur
+  CPU fest. Auf x64 mit AVX2 sind es 256 Bit, auf Arm64 128 Bit, und selbst auf Rechnern mit
+  AVX-512 bleibt `Vector<T>` standardmäßig bei 256 Bit. Code, der eine feste Anzahl von Elementen
+  pro Vektor annimmt, ist auf einer anderen Maschine falsch.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel summiert die Zahlen 1 bis 11 mit `Vector128<int>`. Zwei Durchläufe der Vektorschleife verarbeiten acht Elemente, eine skalare Schleife erledigt die letzten drei. Die Ansicht zeigt zwei Register übereinander: oben den frisch geladenen Vektor `v`, unten den Akkumulator `acc`.
+
+<StepPlayer script={script} />
+
+Achte auf Schritt 6. Die Vektorschleife hört auf, sobald kein ganzer Vektor mehr in die Daten passt. Würde sie noch einmal laden, läse sie 4 Byte hinter dem Ende der Daten, und das ist bei Spans und Arrays kein harmloser Fehler, sondern Lesen fremden Speichers. Die Bedingung `i <= data.Length - Vector128<int>.Count` ist deshalb das wichtigste Detail der ganzen Methode.
+
+Das Listing im Tab „Assembler“ ist eine vereinfachte Skizze für x64. Die echte Ausgabe des JIT sieht im Detail anders aus, etwa weil er die Schleife entrollt oder den Span anders übergibt. Das Prinzip ist aber dasselbe: ein Ladebefehl und ein Additionsbefehl pro vier Elemente.
+
+{/* TODO(verify): Asm sketch in simd.steps.ts against real JitDisasm output (.NET 10, x64, AVX2). */}
+
+</Block>
+
+<Block n={4} title="Register, Lanes und die Vektortypen">
+
+.NET bietet SIMD in mehreren Schichten an. Die Grundlage sind die **Vektortypen**, die Werte in Registern darstellen:
+
+| Typ                                   | Breite                          | Seit                    |
+| ------------------------------------- | ------------------------------- | ----------------------- |
+| `Vector<T>` (System.Numerics)          | hängt von der CPU ab            | 2014, als NuGet-Paket   |
+| `Vector128<T>`                         | 128 Bit                         | .NET Core 3.0           |
+| `Vector64<T>`                          | 64 Bit (Arm)                    | .NET 5                  |
+| `Vector256<T>`                         | 256 Bit                         | .NET Core 3.0           |
+| `Vector512<T>`                         | 512 Bit                         | .NET 8                  |
+
+Die festen Breiten bekamen mit .NET 7 einen großen Satz plattformunabhängiger Operationen: Operatoren wie `+` und `&`, `Create`, `Load`, `Equals`, `Sum`, `ExtractMostSignificantBits` und viele mehr, jeweils als statische Methoden der nicht generischen Klassen `Vector128`, `Vector256` und so weiter. Seitdem kannst du vektorisierten Code schreiben, der auf x64 und Arm64 gleichermaßen läuft. Der Typparameter `T` ist dabei ein primitiver Zahlentyp und legt fest, wie die Bits in Lanes aufgeteilt werden.
+
+<StepPlayer script={lanesScript} />
+
+Zwei Beobachtungen aus der Visualisierung sind wichtig. Erstens ist eine Umdeutung wie `AsByte` gratis: Der JIT erzeugt dafür keinen Befehl, weil sich an den Bits nichts ändert. Zweitens bestimmt allein der Typ, welcher Befehl entsteht. `+` auf `Vector128<int>` wird zu einer Addition von 32-Bit-Lanes, auf `Vector128<byte>` zu einer Addition von 8-Bit-Lanes, auf `Vector128<float>` zu einer Gleitkomma-Addition.
+
+**`Vector<T>` oder feste Breiten?** `Vector<T>` ist bequem, weil derselbe Code auf jeder Maschine die dort übliche Breite nutzt. Dafür weißt du beim Schreiben nicht, wie viele Elemente ein Vektor hat, und manche Algorithmen brauchen genau das, etwa um Bytes gezielt umzusortieren. Die Microsoft-Dokumentation empfiehlt deshalb für neue Algorithmen `Vector128<T>` als Ausgangspunkt, breitere Pfade erst dann, wenn eine Messung sie rechtfertigt.
+
+**Plattformspezifische Intrinsics.** Unterhalb der plattformunabhängigen Schicht liegen Klassen, deren Methoden jeweils genau einem Maschinenbefehl entsprechen: `Sse2`, `Avx2`, `Avx512F`, `Avx10v1` und viele weitere in `System.Runtime.Intrinsics.X86`, `AdvSimd` und `Sve` in `System.Runtime.Intrinsics.Arm`. Sie bieten auch Befehle, für die es keine portable Entsprechung gibt. Der Preis ist, dass du für jede Plattform einen eigenen Pfad und einen Fallback brauchst.
+
+</Block>
+
+<Block n={5} title="IsSupported: entschieden beim Übersetzen">
+
+Jede Intrinsic-Klasse hat eine statische Property `IsSupported`, die plattformunabhängigen Klassen haben `IsHardwareAccelerated`. Im IL sind das ganz normale Aufrufe von Property-Gettern. Der JIT behandelt sie aber besonders: Er weiß, auf welcher CPU er läuft und welche Befehlssätze die Runtime freigegeben hat, und setzt das Ergebnis als Konstante ein. Ein `if` mit einer konstanten Bedingung ist für ihn ein toter Zweig, und toten Code entfernt er.
+
+<StepPlayer script={supportedScript} />
+
+Daraus folgt eine Regel, die die Dokumentation ausdrücklich nennt: Lies `IsSupported`, `IsHardwareAccelerated` und `Count` direkt dort, wo du sie brauchst. Speicherst du den Wert in einem eigenen Feld, ist er für den JIT keine Konstante mehr, und die Prüfung samt aller Zweige bleibt im Code.
+
+{/* TODO(verify): A static readonly bool copy of IsSupported is folded in Tier 1 (static readonly as constant) but not in Tier 0; the docs only say "don't cache the values". */}
+
+**`IsSupported` und `IsHardwareAccelerated` sind nicht dasselbe.** `Avx512F.IsSupported` sagt, ob die Befehle verfügbar sind. `Vector512.IsHardwareAccelerated` sagt, ob die Runtime die 512-Bit-Breite für die portable Schicht empfiehlt. Laut .NET-Blog meldet .NET 8 auf einigen älteren Intel-Prozessoren mit AVX-512 für `Vector512.IsHardwareAccelerated` standardmäßig `false`, während `Avx512F.IsSupported` dort `true` ist. Wer mit portablen Typen arbeitet, sollte deshalb `IsHardwareAccelerated` abfragen.
+
+</Block>
+
+<Block n={6} title="Eine Schleife richtig vektorisieren">
+
+Fast jede vektorisierte Methode hat denselben Aufbau. Ganz außen steht die Auswahl der Breite, von der breitesten zur schmalsten, jeweils mit `IsHardwareAccelerated` und einer Mindestlänge. Bei zu kurzen Eingaben lohnt sich der Vektorpfad nicht, dann läuft eine skalare Schleife. Innen steht die Hauptschleife über ganze Vektoren und danach die Behandlung des Rests.
+
+### Der Rest
+
+Für den Rest gibt es zwei Strategien:
+
+- **Skalare Restschleife.** So wie im Beispiel oben: Was nicht mehr in einen Vektor passt, wird einzeln verarbeitet. Einfach und immer korrekt, aber bei kurzen Eingaben macht der Rest einen großen Teil der Arbeit aus.
+- **Letzten Vektor überlappend laden.** Die BCL lädt oft einen letzten vollen Vektor, der am Ende der Daten endet und sich mit dem schon verarbeiteten Bereich überschneidet. Bei einer **idempotenten** Operation wie einer Suche ist das harmlos: Ein Element zweimal zu prüfen ändert das Ergebnis nicht. Bei einer Summe würden die überlappenden Elemente doppelt zählen. Dort muss man sie vorher mit einer Maske auf null setzen, etwa mit `Vector128.ConditionalSelect`.
+
+### Suchen statt Rechnen
+
+Viele Vektoralgorithmen in der BCL rechnen nicht, sie suchen. Das Muster für „wo steht das erste Byte mit diesem Wert?“ sieht so aus:
+
+```csharp
+Vector128<byte> target = Vector128.Create(value);         // value in allen 16 Lanes
+Vector128<byte> v = Vector128.Create(data.Slice(i));
+Vector128<byte> eq = Vector128.Equals(v, target);         // 0xFF, wo gleich, sonst 0
+if (eq != Vector128<byte>.Zero)
+{
+    uint mask = eq.ExtractMostSignificantBits();          // ein Bit pro Lane
+    return i + BitOperations.TrailingZeroCount(mask);
+}
+```
+
+Der Vergleich liefert keinen `bool`, sondern wieder einen Vektor, in dem jede Lane aus lauter Einsen oder lauter Nullen besteht. Erst `ExtractMostSignificantBits` macht daraus eine Ganzzahl mit einem Bit pro Lane, und die Zahl der Nullen am unteren Ende ist der Index des ersten Treffers. So prüft eine Schleife 16, 32 oder 64 Bytes pro Durchlauf mit einer einzigen Verzweigung.
+
+### Laden und Ausrichtung
+
+Für das Laden empfehlen die Richtlinien des Runtime-Teams `Vector128.Create(span)` und `CopyTo`. Der JIT entfernt die Grenzprüfung dabei in typischen Schleifen, und es braucht weder Pinning noch Zeigerarithmetik. Die Variante `LoadUnsafe(ref T, nuint elementOffset)` ist für Fälle gedacht, in denen du einen Puffer über einen verwalteten Verweis durchläufst. Sie verzichtet auf jede Prüfung, und ein Fehler liest fremden Speicher.
+
+Ausrichtung ist auf aktuellen Prozessoren meist nebensächlich: Die normalen Ladebefehle akzeptieren beliebige Adressen. Kosten entstehen vor allem, wenn ein Zugriff eine Cache-Line-Grenze überschreitet. Bei sehr großen Eingaben richtet die BCL die Hauptschleife deshalb auf eine Vektorgrenze aus. Für verwaltete Arrays hat das eine Tücke: Der GC darf das Array verschieben, eine Ausrichtung gilt also nur, solange es fixiert ist. Mehr zu den Folgen in „Pinning und Fragmentierung“.
+
+{/* TODO(verify): Which BCL routines align the main loop (e.g. SpanHelpers, TensorPrimitives for large inputs) and the cost model for unaligned loads crossing cache lines on current x64 and Arm64 cores. */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+**Über das Ende hinaus lesen.** Der häufigste Fehler in vektorisiertem Code ist eine falsche Grenze der Hauptschleife oder ein falsch berechneter letzter Vektor. Mit `Create(span)` gibt das eine Exception, mit `LoadUnsafe` stillen Unsinn oder einen Absturz. Das Runtime-Team testet solche Routinen deshalb mit Puffern, hinter denen eine geschützte Speicherseite liegt, und mit Längen, die kein Vielfaches der Vektorbreite sind.
+
+**Verwaltete Verweise außerhalb des Puffers.** Wer mit `Unsafe.Add` und `Unsafe.Subtract` selbst durch einen Puffer läuft, darf einen `ref` nie vor den Anfang oder hinter das Ende zeigen lassen, auch nicht kurzzeitig. Die Richtlinien beschreiben einen echten Fehler in einer `LastIndexOf`-Implementierung: Ein Verweis zeigte für einen Moment vor den Puffer, der GC verschob das Array, aktualisierte den ungültigen Verweis nicht, und die Schleife las danach veralteten Speicher.
+
+**Gleitkomma rechnet in anderer Reihenfolge.** Eine vektorisierte Summe über `float` addiert in vier oder acht Teilsummen und fasst sie am Ende zusammen. Gleitkomma-Addition ist nicht assoziativ, das Ergebnis kann sich deshalb in den letzten Stellen von der skalaren Schleife unterscheiden. Das ist kein Fehler, aber ein Test, der auf exakte Gleichheit prüft, schlägt fehl.
+
+**Überlauf ohne Fehlermeldung.** Additionen auf Ganzzahl-Lanes laufen bei Überlauf einfach herum, wie `unchecked`-Arithmetik. Eine Summe über viele große `int` braucht deshalb breitere Akkumulatoren oder eine eigene Überlaufprüfung.
+
+{/* TODO(verify): Vector128<int> operator + never throws on overflow, also inside a checked context. */}
+
+**Getestet wird nur der Pfad deiner Maschine.** Läuft deine CI auf AVX2 und dein Server auf Arm64, hat der Arm-Pfad nie einen Test gesehen. Die Konfigurationsschalter im Abschnitt „Selbst nachweisen“ schalten Befehlssätze gezielt ab.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Der wichtigste Rat zuerst: Schreib selten eigene Vektorschleifen. Die BCL hat die häufigen Fälle längst vektorisiert, getestet und für jede Plattform abgestimmt. `Span<T>.IndexOf`, `IndexOfAny`, `SequenceEqual`, `Contains`, die Suchmethoden von `string`, die Klassen für ASCII und UTF-8 und `SearchValues<T>` nutzen intern genau die Muster aus dieser Lektion. Für numerische Arbeit über ganze Puffer gibt es `TensorPrimitives` im Paket System.Numerics.Tensors mit Summen, Skalarprodukten und elementweisen Operationen. Wer `data.AsSpan().IndexOf(x)` schreibt statt einer eigenen Schleife, bekommt SIMD ohne eine Zeile Intrinsic-Code.
+
+{/* TODO(verify): Which of these BCL APIs are vectorized in .NET 8 and later (Span IndexOf/IndexOfAny/SequenceEqual/Contains, string search, Ascii, Utf8, SearchValues). */}
+
+Eigene Vektorisierung lohnt sich, wenn ein Profiler eine Schleife als heiß ausweist, die BCL keine passende Methode hat und die Daten groß genug sind. Dann gilt die Reihenfolge der Dokumentation: zuerst Randfälle als Tests, dann eine skalare Lösung, dann dieselbe Logik mit `Vector128<T>`, dann messen. Breitere Typen und plattformspezifische Intrinsics kommen erst dazu, wenn die Messung sie rechtfertigt.
+
+Wann es sich **nicht** lohnt:
+
+- **Kleine Eingaben.** Bei acht Elementen kostet das Aufsetzen der Vektoren mehr, als es spart. Benchmarke die Längen, die in deinem Programm wirklich vorkommen.
+- **Verzweigungsreiche Logik.** SIMD verträgt keine Verzweigung pro Element. Lässt sich die Logik nicht als Vergleich plus Maske plus Auswahl ausdrücken, bleibt nur der skalare Weg.
+- **Speichergebundene Schleifen.** Wenn die Daten nicht im Cache liegen, wartet der Prozessor auf den Speicher. Breitere Befehle ändern daran wenig. Die Dokumentation warnt ausdrücklich, dass acht Lanes nicht achtfache Geschwindigkeit bedeuten.
+
+**Arm64 ist kein Sonderfall mehr.** Auf Arm64-Servern und Apple-Silicon-Rechnern gibt es nur 128 Bit breite NEON-Register, `AdvSimd` ist der Grundbefehlssatz. Code, der nur einen `Avx2`-Pfad und sonst den skalaren Fallback hat, läuft dort skalar. Wer portabel mit `Vector128<T>` schreibt, bekommt auf beiden Plattformen Vektorcode. Manche Operationen sind auf Arm64 allerdings teurer als auf x64, etwa `ExtractMostSignificantBits`, für das es dort keinen einzelnen Befehl gibt. Die BCL verwendet deshalb teilweise eigene Arm-Varianten.
+
+{/* TODO(verify): ExtractMostSignificantBits has no single-instruction equivalent on Arm64 (needs several instructions) and BCL search loops use Arm-specific alternatives. */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Beim Start ermittelt die Runtime, welche Befehlssätze die CPU und das Betriebssystem unterstützen, und gleicht sie mit den Konfigurationsschaltern ab. Das Ergebnis gibt sie dem JIT mit. Daraus folgen die Konstanten für `IsSupported`, die Breite von `Vector<T>` und die Frage, welche Breiten als beschleunigt gelten.
+
+Im JIT tragen die Methoden der Vektortypen und der Intrinsic-Klassen das Attribut `[Intrinsic]`. Der Importer erkennt sie und erzeugt statt eines Aufrufs einen eigenen Knoten, den das Backend in den passenden Befehl übersetzt. Auf x64 wählt es dabei die VEX- oder EVEX-Kodierung, wenn AVX oder AVX-512 vorhanden ist. Jede dieser Methoden hat zusätzlich eine Implementierung in C#, die greift, wenn keine Hardware-Beschleunigung vorhanden ist. Deshalb läuft vektorisierter Code auch auf einer Maschine ohne SIMD korrekt, nur langsam.
+
+{/* TODO(verify): Fallback behaviour when a platform-specific intrinsic is called although IsSupported is false (PlatformNotSupportedException) vs. the software fallback of the cross-platform Vector128 APIs. */}
+
+Für Experimente gibt es Schalter mit dem Präfix `DOTNET_`. `EnableHWIntrinsic=0` schaltet alle Intrinsics ab, `EnableAVX2=0` den 256-Bit-Pfad, `MaxVectorTBitWidth` begrenzt `Vector<T>` (mit dem Wert 512 erlaubst du auf AVX-512-Hardware auch 512 Bit), `PreferredVectorBitWidth` begrenzt die Breite, die als beschleunigt gilt. Diese Schalter sind Diagnosewerkzeuge und kein stabiler Vertrag. Sie wirken nur auf Code, den der JIT übersetzt, nicht auf vorkompilierten Code aus ReadyToRun oder Native AOT. Wie dort Befehlssätze gewählt werden, zeigen „ReadyToRun und Crossgen“ und „Native AOT“.
+
+<Callout kind="version">
+  `Vector<T>` gibt es seit 2014, `Vector128<T>`, `Vector256<T>` und die x86-Intrinsics seit .NET
+  Core 3.0, Arm-Unterstützung mit `AdvSimd` seit .NET 5. .NET 7 brachte die plattformunabhängigen
+  Operationen, .NET 8 `Vector512<T>` und AVX-512. .NET 9 ergänzte `Avx10v1` und experimentelle
+  SVE-Unterstützung für Arm64, .NET 10 `Avx10v2`, das standardmäßig noch abgeschaltet ist. Die
+  Namen der Schalter haben sich dabei geändert: In .NET 8 und 9 heißt der Schalter für AVX-512
+  `DOTNET_EnableAVX512F`, ab .NET 10 `DOTNET_EnableAVX512`.
+</Callout>
+
+{/* TODO(verify): Version table in block 4 (Vector64 with .NET 5, cross-platform APIs .NET 7) against the .NET 8 hardware intrinsics blog post; EnableAVX512F present in release/9.0 and replaced by EnableAVX512 in release/10.0 (src/coreclr/inc/clrconfigvalues.h). */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Drei Experimente: Was meldet deine Maschine, wie sieht der Code aus, und lohnt es sich?
+
+**Was meldet deine Maschine?** Das erste Programm gibt `Vector<int>.Count` und die wichtigsten `IsSupported`-Werte aus. Starte es danach mit `DOTNET_EnableAVX2=0` und mit `DOTNET_EnableHWIntrinsic=0` und vergleiche. Auf einem Arm64-Rechner siehst du `Count` gleich 4 und `AdvSimd.IsSupported` gleich `True`.
+
+**Wie sieht der Code aus?** Mit `DOTNET_JitDisasm` siehst du in der Hauptschleife Befehle wie `vmovdqu` und `vpaddd` auf x64 oder Lade- und Additionsbefehle auf den `v`-Registern von Arm64. Wie du solche Listings liest, zeigt „JIT-Assembler lesen“.
+
+**Lohnt es sich?** Der Benchmark vergleicht die skalare Summe mit `Vector128<int>` und `Vector<int>` für drei Längen. Bei 8 Elementen erwartest du kaum einen Unterschied, bei großen Längen einen deutlichen Vorsprung der Vektorvarianten. Wie groß er ist, hängt von CPU und Cache ab.
+
+{/* TODO(verify): Expected relative results of SumBench on x64 (AVX2) and Arm64; whether the JIT already unrolls or otherwise speeds up the scalar foreach over int[] so that the gap is smaller than expected. */}
+
+<VerifyCard
+  sharplab="Füge eine Methode mit Vector128-Code in sharplab.io ein und stelle die Ausgabe auf „JIT Asm“. Prüfe, dass für Vector128.Create(span) und + jeweils nur ein Lade- und ein Additionsbefehl erscheinen und dass von den IsSupported-Zweigen nur einer übrig ist."
+  code={simdCode}
+  benchmark={benchmarkCode}
+  note="Ergebnisse hängen stark von der CPU ab. Miss auf der Hardware, auf der dein Code später läuft, und mit den Längen, die dort vorkommen."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="simd"
+  questions={[
+    {
+      q: 'Wie viele int passen in einen Vector<int>?',
+      options: [
+        'Immer 8, weil Vector<T> 256 Bit breit ist',
+        'Das hängt von der CPU ab und steht erst zur Laufzeit fest',
+        'Immer 4, weil Vector<T> 128 Bit breit ist',
+      ],
+      correct: 1,
+      explanation:
+        'Die Runtime legt die Breite beim Start fest: auf x64 mit AVX2 meist 256 Bit (8 int), auf Arm64 128 Bit (4 int). Für den JIT ist Vector<int>.Count danach eine Konstante.',
+    },
+    {
+      q: 'Was kostet if (Avx2.IsSupported) in optimiertem Code zur Laufzeit?',
+      options: [
+        'Einen Aufruf, der die CPU befragt',
+        'Einen Speicherzugriff auf ein gecachtes Flag',
+        'Nichts, der JIT setzt eine Konstante ein und entfernt den toten Zweig',
+      ],
+      correct: 2,
+      explanation:
+        'IsSupported ist für den JIT eine Konstante. Er übersetzt nur den Zweig, der auf dieser Maschine laufen kann.',
+    },
+    {
+      q: 'Eine vektorisierte Summe über 11 int mit Vector128<int>. Was passiert mit den letzten drei Elementen?',
+      options: [
+        'Sie werden ignoriert',
+        'Eine Restschleife oder ein maskierter letzter Vektor verarbeitet sie',
+        'Der Ladebefehl liest einfach über das Ende hinaus, das ist erlaubt',
+      ],
+      correct: 1,
+      explanation:
+        'Jede vektorisierte Schleife braucht eine Restbehandlung. Über das Ende hinaus zu lesen ist ein Fehler, bei Create(span) eine Exception, bei LoadUnsafe Lesen fremden Speichers.',
+    },
+    {
+      q: 'Warum darf IndexOf den letzten Vektor überlappend laden, eine Summe aber nicht ohne Weiteres?',
+      options: [
+        'Suchen ist idempotent, doppelt geprüfte Elemente ändern das Ergebnis nicht. Bei einer Summe würden sie doppelt zählen',
+        'Weil Summen nur mit Vector<T> funktionieren',
+      ],
+      correct: 0,
+      explanation:
+        'Bei nicht idempotenten Operationen müssen die überlappenden Lanes vorher maskiert werden, zum Beispiel mit ConditionalSelect.',
+    },
+    {
+      q: 'Dein Code hat einen Avx2-Pfad und einen skalaren Fallback. Was passiert auf einem Arm64-Server?',
+      options: [
+        'Der JIT übersetzt die Avx2-Befehle in NEON-Befehle',
+        'Avx2.IsSupported ist false, es läuft der skalare Fallback',
+      ],
+      correct: 1,
+      explanation:
+        'Plattformspezifische Intrinsics gibt es nur auf ihrer Plattform. Portabler Code mit Vector128<T> wäre auf Arm64 vektorisiert gelaufen.',
+    },
+    {
+      q: 'Eine vektorisierte float-Summe weicht in der letzten Nachkommastelle von der skalaren Schleife ab. Woran liegt das?',
+      options: [
+        'An einem Fehler im JIT',
+        'An der anderen Reihenfolge der Additionen, denn Gleitkomma-Addition ist nicht assoziativ',
+      ],
+      correct: 1,
+      explanation:
+        'Die Vektorschleife bildet Teilsummen pro Lane und fasst sie am Ende zusammen. Andere Reihenfolge heißt anderes Runden.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- **SIMD**: ein Befehl verarbeitet alle **Lanes** eines Vektorregisters, zum Beispiel vier `int` in einem `Vector128<int>`.
+- `Vector128<T>`, `Vector256<T>`, `Vector512<T>` haben feste Breiten, **`Vector<T>`** nimmt die Breite der Maschine: auf x64 mit AVX2 meist 256 Bit, auf Arm64 128 Bit.
+- **`IsSupported`**, **`IsHardwareAccelerated`** und **`Count`** sind für den JIT Konstanten. Tote Zweige verschwinden, die Prüfung kostet zur Laufzeit nichts.
+- Eine vektorisierte Schleife besteht aus Breitenwahl, **Hauptschleife** und **Restbehandlung**. Über das Ende hinaus zu lesen ist der häufigste Fehler.
+- Erst die **BCL** nutzen (`IndexOf`, `SequenceEqual`, `SearchValues`, `TensorPrimitives`), eigene Vektorschleifen nur für gemessene Engpässe, bevorzugt portabel mit `Vector128<T>`.
+- Alle Pfade testen: `DOTNET_EnableAVX2=0` und `DOTNET_EnableHWIntrinsic=0` erzwingen die schmaleren Pfade auf derselben Maschine.
+
+</Block>

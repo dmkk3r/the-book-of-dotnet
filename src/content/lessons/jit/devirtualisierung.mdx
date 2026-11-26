@@ -1,0 +1,310 @@
+---
+id: devirtualisierung
+title: Devirtualisierung
+summary: Wann der JIT einen virtuellen Aufruf oder Interface-Aufruf in einen direkten Aufruf verwandelt, woher er den exakten Typ kennt und warum sealed mehr ist als eine Designentscheidung.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Performance Improvements in .NET 8 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+  - title: 'Performance Improvements in .NET 10 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-10/
+  - title: 'Performance Improvements in .NET 7 (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/performance_improvements_in_net_7/
+  - title: 'Performance Improvements in .NET Core 2.1 (.NET Blog, Devirtualisierung von EqualityComparer<T>.Default)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-core-2-1/
+  - title: 'Guarded Devirtualization (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/jit/GuardedDevirtualization.md
+  - title: 'Book of the Runtime: Virtual Stub Dispatch'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/virtual-stub-dispatch.md
+  - title: 'CA1852: Interne Typen versiegeln (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/fundamentals/code-analysis/quality-rules/ca1852
+  - title: 'Devirtualisierung im Importer (importercalls.cpp im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/importercalls.cpp
+updated: 2026-11-26
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './devirtualisierung.steps';
+import decisionScript from './devirtualisierung-decision.steps';
+import lateScript from './devirtualisierung-late.steps';
+import { devirtCode, benchmarkCode } from './devirtualisierung-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein virtueller Aufruf ist ein Versprechen an die Zukunft: Welche Methode läuft, entscheidet erst das Objekt, das zur Laufzeit ankommt. Genau das macht Polymorphie so nützlich. Ein `Stream` kann eine Datei sein, ein Netzwerk-Socket oder ein Puffer im Speicher, und der Code, der `stream.Read(buffer)` aufruft, muss davon nichts wissen.
+
+Der Mechanismus dafür ist billig. Wie die Lektion „Virtuelle Aufrufe und Interface-Dispatch“ zeigt, liest ein virtueller Aufruf den MethodTable-Zeiger des Objekts, dann einen Slot an fester Position, und springt indirekt dorthin. Interface-Aufrufe laufen über Stubs, die sich die gesehenen Typen merken. In beiden Fällen sind es ein paar Ladebefehle und ein Sprung, den der Prozessor meist richtig vorhersagt.
+
+Teuer wird ein virtueller Aufruf an anderer Stelle: im Compiler. Für den JIT ist ein Aufruf, dessen Ziel er nicht kennt, eine **Blackbox**. Er kann den Rumpf nicht einbetten, er weiß nicht, ob die Methode Felder verändert, und er kann nichts über ihr Ergebnis vorausberechnen. Damit endet an jedem virtuellen Aufruf das Inlining, und mit ihm fast alle Optimierungen, die darauf aufbauen. Eine Property `Legs`, die einfach `4` zurückgibt, kostet als virtueller Aufruf ein Vielfaches dessen, was sie als eingebettete Konstante kosten würde.
+
+**Devirtualisierung** ist der Versuch des JIT, diese Blackbox zu öffnen: Wenn er beweisen kann, welche Methode an einer Aufrufstelle laufen wird, ersetzt er den virtuellen Aufruf durch einen direkten. Ab da ist der Aufruf ein ganz normaler Kandidat für das Inlining.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir diese vier Sätze:
+
+1. **Devirtualisieren heißt: das Ziel beweisen.** Der JIT ersetzt einen virtuellen Aufruf nur dann durch einen direkten, wenn kein anderes Ziel möglich ist. Eine Vermutung reicht dafür nicht.
+2. **Der Beweis braucht den exakten Typ oder ein Verbot von Ableitungen.** Entweder weiß der JIT genau, welcher Typ das Objekt hat, oder der statische Typ beziehungsweise die Methode ist `sealed`.
+3. **Der Gewinn ist das Inlining, nicht der gesparte Sprung.** Devirtualisierung ist meist nur die Eintrittskarte. Was danach kommt, entscheidet der Inliner.
+4. **Wo der Beweis fehlt, kann der JIT wetten.** Mit Dynamic PGO setzt er eine Typprüfung vor einen direkten Aufruf. Das ist eine eigene Technik mit Rückfallweg, die **Guarded Devirtualization**.
+
+<Callout kind="fehlannahme">
+  „`sealed` ändert nur die Semantik, nicht die Leistung.“ Für den JIT ist `sealed` eine Zusicherung:
+  Es gibt keine Ableitung, also auch kein anderes Ziel für einen virtuellen Aufruf. Aus einem
+  Aufruf über den Slot wird ein direkter Aufruf, der eingebettet werden kann. Auch Typprüfungen mit
+  `is` und Casts werden billiger.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ruft dreimal dieselbe Art von Methode auf und addiert `1` zum Ergebnis. Der Unterschied liegt nur darin, was der JIT über den Typ des Objekts weiß. Im Reiter „Assembler“ stehen die drei x64-Listings untereinander, die Tabelle zeigt jeweils, welche Instruktion gerade läuft und welche Daten sie liest.
+
+<StepPlayer script={script} />
+
+{/* TODO(verify): x64 listings in the step script (slot load sequence with offsets 0x40 and 0x20, null check "cmp byte ptr [rcx], cl", ViaDog folded to "mov eax, 5") with SharpLab or DOTNET_JitDisasm on .NET 8+. */}
+
+Achte auf den Unterschied zwischen dem zweiten und dem dritten Listing. Beide sind devirtualisiert, beide lesen weder MethodTable noch Slot. Aber nur im dritten verschwindet der Aufruf ganz, weil der Inliner `Dog.Legs` einbetten darf. Bei `Bird` verhindert das Attribut `NoInlining` genau diesen zweiten Schritt. Deshalb ist es irreführend, Devirtualisierung am gesparten indirekten Sprung zu messen.
+
+Eine Sache bleibt in allen drei Fassungen: die Nullprüfung. Ein virtueller Aufruf auf `null` wirft eine `NullReferenceException`, und dieses Verhalten muss auch der direkte Aufruf behalten. Der virtuelle Aufruf bekommt die Prüfung gratis, denn das Lesen des MethodTable-Zeigers aus `null` löst die Ausnahme aus. Beim direkten und beim eingebetteten Aufruf liest der JIT das Objekt deshalb kurz an.
+
+</Block>
+
+<Block n={4} title="Woher der JIT den exakten Typ kennt">
+
+Die Visualisierung spielt sechs Aufrufstellen durch. An jeder stellt der JIT dieselben Fragen: Ist der Aufruf überhaupt virtuell? Gibt es Ableitungen? Kennt er den exakten Typ? Und erst wenn alles das nicht hilft: Gibt es ein Profil?
+
+<StepPlayer script={decisionScript} />
+
+{/* TODO(verify): Order of the checks as drawn: devirtualization in the importer (impDevirtualizeCall) first, guarded devirtualization only for calls that could not be devirtualized and only in optimized code with a class profile. */}
+
+Die Quellen für einen exakten Typ sind vielfältiger, als man denkt:
+
+**Versiegelte Typen und Methoden.** Ist die Klasse `sealed`, kann eine Variable dieses Typs nur auf genau diesen Typ zeigen. Dasselbe gilt für eine einzelne Methode mit `sealed override`: Auch wenn die Klasse Ableitungen hat, kann keine davon diese Methode noch einmal überschreiben. Aufrufe über eine Variable dieses Typs gehen dann direkt an die versiegelte Methode.
+
+**Objekte, die gerade erzeugt wurden.** Nach `var c = new Cat();` weiß der JIT, dass `c` exakt ein `Cat` ist, auch wenn `Cat` Ableitungen hat. Das gilt, solange er den Weg des Verweises bis zum Aufruf verfolgen kann, etwa innerhalb derselben Methode.
+
+**Werttypen.** Structs können nicht abgeleitet werden. Ruft Code eine Methode auf einem Struct auf, ist das Ziel immer bekannt. Besonders wichtig ist das in generischem Code: Bei `Hash<T>(T x) where T : IHashable` erzeugt der C#-Compiler einen **constrained-Aufruf**, und weil die Runtime für jeden Werttyp eigenen Maschinencode erzeugt, ist `T` darin exakt bekannt. Der Interface-Aufruf wird ein direkter Aufruf, ohne Box. Warum es diesen eigenen Code gibt, erklärt die Lektion „Generics zur Laufzeit“.
+
+**Statische Felder mit readonly.** In Tier 1 ist eine Klasse meist schon initialisiert. Der JIT darf den Inhalt eines `static readonly`-Felds dann wie eine Konstante behandeln und kennt damit auch den exakten Typ des Objekts, auf das es zeigt. Ein `private static readonly IComparer<Item> s_comparer = new ItemComparer();` wird so in heißem Code direkt aufgerufen.
+
+{/* TODO(verify): static readonly fields of initialized classes treated as constants in Tier 1, including the exact type of a referenced object for devirtualization (Performance Improvements in .NET 5/8). */}
+
+**Bekannte Methoden des Frameworks.** Für `EqualityComparer<T>.Default` und `Comparer<T>.Default` kennt der JIT laut .NET-Blog seit .NET Core 2.1 den Typ des Ergebnisses. `EqualityComparer<int>.Default.Equals(a, b)` wird so zu einem direkten Aufruf, der eingebettet werden kann. Davon profitieren `Dictionary<TKey, TValue>` und viele andere Collections, wenn `TKey` ein Werttyp ist.
+
+{/* TODO(verify): EqualityComparer<T>.Default devirtualization introduced in .NET Core 2.1, Comparer<T>.Default added later (version?). */}
+
+**Interfaces.** Kennt der JIT den exakten Typ, devirtualisiert er Interface-Aufrufe genauso wie virtuelle Aufrufe. Er fragt die Runtime, welche Methode des Typs das Interface implementiert, und ruft sie direkt auf. Ohne exakten Typ hilft dagegen auch ein `sealed` an der implementierenden Klasse nichts, solange die Variable vom Interface-Typ ist: Hinter einem `IShape` kann jede Klasse stecken, die `IShape` implementiert.
+
+**Delegates.** Ein Delegate ist ebenfalls ein indirekter Aufruf. Mit Dynamic PGO kann der JIT seit .NET 7 die häufigste Zielmethode erraten und hinter einer Prüfung direkt aufrufen. Neuere Versionen können laut .NET-Blog auch Delegates einbetten, deren Ziel ohne Profil feststeht, etwa ein Lambda, das in derselben Methode erzeugt und aufgerufen wird.
+
+{/* TODO(verify): Delegate GDV with PGO since .NET 7; static delegate devirtualization or inlining of delegates whose target is known (lambda created and invoked in the same method) in .NET 10 (Performance Improvements in .NET 10). */}
+
+</Block>
+
+<Block n={5} title="Späte Devirtualisierung und Wetten mit Profil">
+
+### Wenn der Typ erst nach dem Inlining sichtbar wird
+
+Oft steht der exakte Typ nicht direkt an der Aufrufstelle, sondern versteckt sich in einer anderen Methode: einer Fabrikmethode, einer Property, einem Konstruktor. Beim Einlesen des IL sieht der JIT nur deren Signatur. Erst wenn er die Methode eingebettet hat, wird sichtbar, welches Objekt sie tatsächlich erzeugt. Für diesen Fall gibt es die **späte Devirtualisierung**: Nach dem Einbetten schaut der JIT sich Aufrufe auf dem Ergebnis ein zweites Mal an.
+
+<StepPlayer script={lateScript} />
+
+{/* TODO(verify): Late devirtualization during the inlining phase (fginline.cpp) and inlining of the newly devirtualized call in the same pass; stack allocation of the Circle object in .NET 10. */}
+
+Das zeigt, wie eng die Optimierungen ineinandergreifen. Inlining liefert Typinformation, Typinformation ermöglicht Devirtualisierung, Devirtualisierung liefert neue Kandidaten für das Inlining. Ob das Objekt danach noch auf dem Heap landen muss, ist eine Frage der Lektion „Escape Analysis“.
+
+### Guarded Devirtualization
+
+Kann der JIT das Ziel nicht beweisen, bleibt ihm in Tier 1 eine Wette. Dynamic PGO zählt in einer instrumentierten Phase, welche Typen an einer Aufrufstelle ankommen. Dominiert einer, erzeugt der JIT eine Typprüfung: Stimmt der MethodTable-Zeiger, läuft ein direkter und meist eingebetteter Aufruf, sonst der ursprüngliche virtuelle Aufruf. Diese Technik heißt **Guarded Devirtualization**. Wie Profile gesammelt werden und wie viele Typen der JIT prüft, erklärt die Lektion „Dynamic PGO“.
+
+Für diese Lektion ist der Unterschied wichtig: Echte Devirtualisierung ist ein **Beweis** und kostet zur Laufzeit nichts. Guarded Devirtualization ist eine **Vermutung**, die bei jedem Aufruf geprüft wird. Sie gibt es nur in Tier 1 mit Profil, nicht in vorkompiliertem Code ohne Profil, nicht mit Native AOT und nicht bei Methoden, die das Tiering überspringen.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Geteilter generischer Code für Referenztypen
+
+Für Werttypen erzeugt die Runtime eigenen Code pro Instanziierung. Für Referenztypen teilen sich alle Instanziierungen einen Code: `Process<Dog>` und `Process<Cat>` laufen durch dieselbe Übersetzung, in der `T` nur „irgendein Referenztyp“ ist. Ein Aufruf `item.Legs()` auf einem `T` bleibt darin virtuell, auch wenn `Dog` und `Cat` beide `sealed` sind. Die gleiche Methode mit `struct`-Typen wird dagegen vollständig devirtualisiert. Wer in einer heißen generischen Methode Wert auf Devirtualisierung legt, sollte wissen, welcher der beiden Fälle vorliegt.
+
+{/* TODO(verify): In shared canonical code (T = __Canon) calls on T are not devirtualized statically, even if the actual instantiation type is sealed; GDV via PGO can still apply. */}
+
+### Den Vergleicher zwischenspeichern
+
+Ein naheliegender Gedanke ist, `EqualityComparer<T>.Default` einmal in einem Feld abzulegen, um den Zugriff zu sparen. Das kann genau das Gegenteil bewirken: Ein Instanzfeld vom Typ `IEqualityComparer<T>` verrät dem JIT nicht, welcher Typ darin steckt. Der direkte Aufruf, den der JIT bei `EqualityComparer<T>.Default.Equals(a, b)` erzeugt hätte, wird wieder ein Interface-Aufruf. Laut .NET-Blog nutzen die Collections des Frameworks deshalb den direkten Ausdruck, wenn kein eigener Vergleicher übergeben wurde.
+
+{/* TODO(verify): Caching EqualityComparer<T>.Default in an instance field defeats devirtualization; Dictionary<TKey,TValue> uses EqualityComparer<TKey>.Default directly for value type keys when no comparer is given. */}
+
+### Debug-Builds und Tier 0
+
+Devirtualisierung ist eine Optimierung. Tier 0 und Debug-Builds verzichten darauf, ein Aufruf auf einer `sealed`-Klasse sieht dort genauso aus wie jeder andere virtuelle Aufruf. Wer kurz nach dem Start misst oder im Debugger den Assembler anschaut, sieht deshalb nicht den Code, der später im Dauerbetrieb läuft. Wie Tier 0 und Tier 1 zusammenspielen, zeigt die Lektion „Tiered Compilation und OSR“.
+
+### sealed nachträglich ist eine Breaking Change
+
+Bei internen Typen ist `sealed` kostenlos. Bei öffentlichen Typen einer Bibliothek ist es eine Zusage an alle Nutzer: Wer von deiner Klasse ableitet, bekommt nach dem Hinzufügen von `sealed` einen Compilerfehler. Entscheide bei öffentlichen Typen deshalb bewusst und früh. Das umgekehrte Entfernen von `sealed` ist dagegen unkritisch.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Die wichtigste praktische Folgerung ist schlicht: Versiegle Klassen, von denen nichts ableiten soll. Für interne Typen gibt es dafür eine eigene Analyseregel, **CA1852**. Sie meldet `internal`-Typen ohne Ableitungen in der eigenen Assembly, die nicht `sealed` sind. Microsoft Learn begründet sie ausdrücklich mit der Leistung: Der Compiler kann Aufrufe auf versiegelten Typen direkt statt virtuell ausführen. Die Regel ist standardmäßig nicht als Warnung aktiv, du schaltest sie in der `.editorconfig` ein.
+
+{/* TODO(verify): CA1852 introduced with .NET 7 SDK analyzers, default severity (suggestion or none), whether InternalsVisibleTo disables it. */}
+
+```ini
+# .editorconfig
+dotnet_diagnostic.CA1852.severity = warning
+```
+
+Daneben gilt für die Gestaltung von Code:
+
+| Situation                                        | Wirkung                                           | Was hilft                                      |
+| ------------------------------------------------ | ------------------------------------------------- | ---------------------------------------------- |
+| Klasse ohne Ableitungen, Aufruf über Klassentyp  | direkter Aufruf, einbettbar                       | `sealed` setzen                                |
+| Aufruf über Interface-Variable                   | nur mit exaktem Typ oder Profil devirtualisiert   | konkreten Typ verwenden, wo er bekannt ist     |
+| Generische Methode über Structs                  | eigener Code, Aufrufe direkt                      | Constraint statt Interface-Parameter           |
+| Generische Methode über Klassen                  | geteilter Code, Aufrufe bleiben virtuell          | mit Profil messen, im Zweifel Struct-Wrapper   |
+| Strategie-Objekt in `static readonly`            | Tier 1 kennt den Typ                              | `static readonly` statt veränderlichem Feld    |
+| Viele gleich häufige Typen an einer Stelle       | keine Devirtualisierung möglich                   | akzeptieren, der Aufruf selbst ist billig      |
+
+Ein Nebeneffekt von `sealed` betrifft Typprüfungen: `obj is Dog` ist bei einer versiegelten Klasse ein einziger Vergleich des MethodTable-Zeigers. Bei einer offenen Klasse muss die Prüfung auch Ableitungen akzeptieren und gegebenenfalls die Hierarchie hinaufgehen.
+
+{/* TODO(verify): isinst/castclass to a sealed class compiles to an inline MethodTable comparison without helper call (.NET 5+?). */}
+
+### Native AOT kennt das ganze Programm
+
+Bei Native AOT gibt es keinen JIT zur Laufzeit und kein Dynamic PGO. Dafür hat der AOT-Compiler einen Vorteil: Er sieht beim Übersetzen das gesamte Programm, denn nachgeladener Code ist ausgeschlossen. Hat eine virtuelle Methode im ganzen Programm keine Überschreibung oder eine Klasse keine Ableitung, kann er sie behandeln, als wären sie `sealed`. Die Grenzen dieser Analyse und was Reflection dabei bedeutet, behandelt die Lektion „Native AOT“.
+
+{/* TODO(verify): ILCompiler devirtualizes based on whole program analysis (types without derived types treated as sealed, unoverridden virtual methods), per Performance Improvements in .NET 7/8 and the ILCompiler DevirtualizationManager. */}
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Der JIT kennt das Typsystem nicht selbst. Will er einen Aufruf devirtualisieren, fragt er über die Schnittstelle zwischen JIT und Execution Engine bei der Runtime nach: „Welche Methode implementiert diese virtuelle Methode oder Interface-Methode auf diesem Typ?“ Die Runtime antwortet mit der konkreten Methode oder lehnt ab, etwa wenn der Typ nicht exakt bekannt ist oder die Auflösung zur Übersetzungszeit nicht sicher möglich ist. Das passiert schon beim Einlesen des IL im Importer und später noch einmal bei der späten Devirtualisierung.
+
+{/* TODO(verify): JIT-EE interface method resolveVirtualMethod (CORINFO_DEVIRTUALIZATION_INFO), called from impDevirtualizeCall in importercalls.cpp; failure reasons such as variance or default interface methods. */}
+
+Gelingt die Devirtualisierung, markiert der JIT den Aufruf als Kandidaten für das Inlining. Ob er tatsächlich eingebettet wird, entscheidet dann die Inlining-Policy nach ihren üblichen Regeln, siehe „Inlining“. Bei vorkompiliertem ReadyToRun-Code kommen Grenzen der Version Bubble hinzu: Eine Klasse aus einer anderen Assembly könnte mit einer neuen Version ihr `sealed` verlieren, deshalb ist Crossgen vorsichtiger als der JIT zur Laufzeit.
+
+{/* TODO(verify): Crossgen2 restricts devirtualization across version bubble boundaries (sealedness of types outside the bubble is not relied upon). */}
+
+<Callout kind="version">
+  Devirtualisierung für `sealed`-Typen und exakte Typen gibt es in RyuJIT seit .NET Core 2.0. Seitdem
+  kam in fast jeder Version etwas dazu: `EqualityComparer<T>.Default` in .NET Core 2.1, Guarded
+  Devirtualization mit Dynamic PGO als Standard in .NET 8, laut .NET-Blog weitere Fälle wie Delegates
+  und Interface-Aufrufe auf Arrays in .NET 10. Was genau auf deiner Version passiert, zeigt
+  `DOTNET_JitDisasm`.
+</Callout>
+
+{/* TODO(verify): Version list: basic devirtualization in .NET Core 2.0, EqualityComparer<T>.Default in 2.1, array interface devirtualization (IEnumerable<T> on T[]) and delegate inlining in .NET 10. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Zwei Experimente zeigen die Devirtualisierung direkt im Maschinencode.
+
+**Die Aufrufe vergleichen.** Lass dir den Assembler der fünf Methoden zeigen. In `ViaBase` und `ViaCat` sollte ein indirekter Aufruf über die MethodTable stehen, denn `Cat` ist nicht versiegelt. `ViaDog` sollte ohne Aufruf auskommen und direkt die Konstante `5` liefern. In `ViaNewCat` sollte ebenfalls kein Aufruf von `Legs` mehr stehen, ob die Allokation des `Cat`-Objekts bleibt, hängt von der Version und der Escape Analysis ab. `SameInt` sollte zu einem einfachen Vergleich zweier Zahlen werden.
+
+**Profil gegen Beweis.** Der Benchmark summiert über 1024 Objekte, einmal über `Animal`-Verweise, einmal über `Dog`-Verweise. Mit Dynamic PGO sollte der Abstand klein sein, denn die Typprüfung auf `Dog` trifft immer. Ohne Dynamic PGO sollte `ViaAnimal` deutlich langsamer sein, `ViaSealedDog` dagegen gleich schnell bleiben, denn der Beweis braucht kein Profil.
+
+{/* TODO(verify): Expected asm (ViaCat stays virtual, ViaNewCat folds to 5, SameInt becomes a cmp/sete) and benchmark ratios with and without DOTNET_TieredPGO=0 on .NET 8+ x64. */}
+
+<VerifyCard
+  sharplab="Stelle auf sharplab.io die Ausgabe auf „JIT Asm“ und die Konfiguration auf Release. SharpLab übersetzt ohne Laufzeitprofil, du siehst also nur echte Devirtualisierung, keine Guarded Devirtualization."
+  code={devirtCode}
+  benchmark={benchmarkCode}
+  note="Die Ergebnisse hängen von der .NET-Version ab. Vergleiche immer Tier-1-Code, BenchmarkDotNet wärmt dafür vor der Messung auf."
+/>
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="devirtualisierung"
+  questions={[
+    {
+      q: 'Worin liegt der Hauptgewinn, wenn der JIT einen virtuellen Aufruf devirtualisiert?',
+      options: [
+        'Im gesparten Lesen von MethodTable und Slot',
+        'Darin, dass der Aufruf danach eingebettet und mit dem Aufrufer zusammen optimiert werden kann',
+      ],
+      correct: 1,
+      explanation:
+        'Das Nachschlagen im Slot kostet wenige Takte. Wertvoll ist, dass aus der Blackbox ein bekanntes Ziel wird, das der Inliner einsetzen kann.',
+    },
+    {
+      q: 'class Cat : Animal ist nicht sealed. Wird new Cat().Legs() devirtualisiert?',
+      options: [
+        'Nein, ohne sealed bleibt der Aufruf virtuell',
+        'Ja, der JIT kennt den exakten Typ aus dem new',
+      ],
+      correct: 1,
+      explanation:
+        'Der exakte Typ ist eine eigene Quelle für den Beweis. sealed braucht der JIT nur, wenn er über die Variable nichts Genaueres weiß.',
+    },
+    {
+      q: 'Eine Variable hat den Typ IShape. Die einzige Implementierung Circle ist sealed. Kann der JIT s.Area() ohne Profil devirtualisieren?',
+      options: [
+        'Ja, weil Circle sealed ist',
+        'Nein, hinter IShape kann jede implementierende Klasse stecken',
+      ],
+      correct: 1,
+      explanation:
+        'sealed verbietet nur Ableitungen von Circle. Andere Klassen können IShape trotzdem implementieren, auch später geladene. Mit Dynamic PGO bleibt die Guarded Devirtualization.',
+    },
+    {
+      q: 'Warum devirtualisiert der JIT x.Hash() in Hash<T>(T x) where T : IHashable für T = Point (struct), aber nicht für T = Dog (sealed class)?',
+      options: [
+        'Für Werttypen gibt es eigenen Code pro Instanziierung, Referenztypen teilen sich einen Code',
+        'Weil Interface-Aufrufe auf Klassen grundsätzlich nie devirtualisiert werden',
+      ],
+      correct: 0,
+      explanation:
+        'Im geteilten Code für Referenztypen ist T nur irgendein Referenztyp. In Hash<Point> ist T exakt Point.',
+    },
+    {
+      q: 'Was unterscheidet Guarded Devirtualization von echter Devirtualisierung?',
+      options: [
+        'Sie beruht auf einer Vermutung aus dem Profil, die bei jedem Aufruf geprüft wird',
+        'Sie funktioniert nur bei sealed-Klassen',
+      ],
+      correct: 0,
+      explanation:
+        'Echte Devirtualisierung ist ein Beweis und kostet zur Laufzeit nichts. Guarded Devirtualization prüft den Typ und behält den virtuellen Aufruf als Rückfallweg.',
+    },
+    {
+      q: 'Was meldet die Analyseregel CA1852?',
+      options: [
+        'Interne Typen ohne Ableitungen, die nicht sealed sind',
+        'Virtuelle Aufrufe in Konstruktoren',
+      ],
+      correct: 0,
+      explanation:
+        'CA1852 schlägt vor, solche Typen zu versiegeln. Das ist gefahrlos und ermöglicht direkte Aufrufe und billigere Typprüfungen.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- **Devirtualisierung** ersetzt einen virtuellen Aufruf oder Interface-Aufruf durch einen direkten, wenn der JIT das Ziel **beweisen** kann.
+- Der Beweis kommt aus `sealed`-Typen und `sealed`-Methoden oder aus einem **exakten Typ**: `new`, Werttypen, generischer Code über Structs, `static readonly`-Felder in Tier 1, bekannte Methoden wie `EqualityComparer<T>.Default`.
+- Der eigentliche Gewinn ist das **Inlining** danach. Ein virtueller Aufruf selbst kostet nur wenige Takte.
+- **Späte Devirtualisierung** nutzt Typen, die erst nach dem Einbetten einer Methode sichtbar werden. Optimierungen ziehen sich so gegenseitig nach.
+- Ohne Beweis bleibt in Tier 1 nur die **Guarded Devirtualization** aus Dynamic PGO, eine geprüfte Vermutung mit Rückfallweg.
+- Geteilter generischer Code für Referenztypen, Tier 0 und Debug-Builds devirtualisieren nicht.
+- Versiegle Klassen ohne Ableitungen, für interne Typen hilft **CA1852**. Native AOT kann dank Sicht auf das ganze Programm noch weiter gehen.
+
+</Block>

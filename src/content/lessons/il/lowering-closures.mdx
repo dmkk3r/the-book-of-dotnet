@@ -321,7 +321,7 @@ Für die Runtime ist eine Closure nichts Besonderes. Sie sieht eine Klasse mit F
 Indirekte Aufrufe sind für den JIT normalerweise eine Grenze: Er weiß nicht, welche Methode dahinter steckt, und kann sie nicht inlinen. Neuere Versionen schieben diese Grenze hinaus:
 
 - **Dynamic PGO** beobachtet zur Laufzeit, welche Methode hinter einem Delegate-Aufruf meistens steckt. Der optimierte Code prüft dann, ob es wieder diese Methode ist, und ruft sie direkt auf oder inlinet sie sogar. Mehr dazu in „Dynamic PGO“.
-- **Escape Analysis** erkennt Objekte, die eine Methode nicht verlassen, und legt sie auf den Stack statt auf den Heap. Neuere .NET-Versionen wenden das auch auf Delegates an, wenn der JIT den Aufruf sehen und die Lambda inlinen kann. Dann verschwindet die Allokation, obwohl im IL weiterhin `newobj` steht, siehe „Escape Analysis“.
+- **Escape Analysis** erkennt Objekte, die eine Methode nicht verlassen, und legt sie auf den Stack statt auf den Heap. Seit .NET 10 gilt das auch für Delegates, deren Aufruf (`Invoke`) der JIT in derselben Methode sieht: Dann verschwindet die Allokation des Delegates, obwohl im IL weiterhin `newobj` steht. Die Display-Klasse mit den erfassten Variablen kann trotzdem auf dem Heap bleiben, siehe „Escape Analysis“.
 
 <Callout kind="version">
   Das Lowering hängt von der C#-Version ab: `foreach` mit einer Variable pro Iteration seit C# 5,
