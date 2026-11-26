@@ -1,0 +1,93 @@
+---
+import type { GetStaticPaths } from 'astro';
+import { render } from 'astro:content';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Breadcrumbs from '@/components/layout/Breadcrumbs.astro';
+import LessonNav from '@/components/layout/LessonNav.astro';
+import OnThisPage from '@/components/layout/OnThisPage.astro';
+import LessonPlaceholder from '@/components/lesson/LessonPlaceholder.astro';
+import DraftBanner from '@/components/lesson/DraftBanner.astro';
+import Sources from '@/components/lesson/Sources.astro';
+import { curriculum, neighbors, chapterPath, type Lesson } from '@/lib/curriculum';
+import { getLessons } from '@/lib/lessons';
+import { STATUS_LABELS } from '@/lib/lesson-status';
+import { blockTitles } from '@/lib/slug';
+import { withBase } from '@/lib/paths';
+
+export const getStaticPaths = (() =>
+  curriculum.lessons.map((lesson) => ({
+    params: { chapter: lesson.chapter.id, lesson: lesson.id },
+    props: { lesson },
+  }))) satisfies GetStaticPaths;
+
+interface Props {
+  lesson: Lesson;
+}
+
+const { lesson } = Astro.props;
+const { prev, next } = neighbors(lesson);
+const info = (await getLessons()).get(lesson.id);
+const entry = info?.entry;
+const Content = entry ? (await render(entry)).Content : undefined;
+const title = entry?.data.title ?? lesson.title;
+const sections = info ? [...blockTitles(info.texts[0] ?? ''), 'Quellen'] : [];
+const date = entry
+  ? new Intl.DateTimeFormat('de-DE', { dateStyle: 'medium', timeZone: 'UTC' }).format(
+      entry.data.updated,
+    )
+  : undefined;
+---
+
+<BaseLayout
+  title={title}
+  description={entry?.data.summary}
+  currentChapter={lesson.chapter.id}
+  currentLesson={lesson.id}
+>
+  <article data-pagefind-body={entry ? '' : undefined}>
+    <Breadcrumbs
+      items={[
+        { label: 'Übersicht', href: withBase('') },
+        {
+          label: `Kapitel ${lesson.chapter.number}: ${lesson.chapter.title}`,
+          href: withBase(chapterPath(lesson.chapter.id)),
+        },
+      ]}
+    />
+    <h1 data-pagefind-meta="title">{title}</h1>
+    <ul class="meta" data-pagefind-ignore>
+      <li>Lektion</li>
+      {entry ? (
+        <>
+          <li>
+            Stand: <time datetime={entry.data.updated.toISOString().slice(0, 10)}>{date}</time>
+          </li>
+          <li>Status: {STATUS_LABELS[entry.data.status]}</li>
+          {entry.data.dotnetVersion && <li>.NET {entry.data.dotnetVersion}</li>}
+        </>
+      ) : (
+        <li>in Vorbereitung</li>
+      )}
+    </ul>
+    {sections.length > 0 && <OnThisPage titles={sections} inline />}
+    {entry && <p class="lead">{entry.data.summary}</p>}
+    {entry?.data.status === 'draft' && <DraftBanner />}
+    {Content ? <Content /> : <LessonPlaceholder />}
+    {entry && <Sources data={entry.data} />}
+  </article>
+  <LessonNav prev={prev} next={next} />
+  {sections.length > 0 && <OnThisPage slot="rail" titles={sections} />}
+</BaseLayout>
+
+<style>
+  .meta {
+    list-style: none;
+    margin: 0 0 16px;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 24px;
+    font-size: 14px;
+    color: var(--muted);
+  }
+</style>

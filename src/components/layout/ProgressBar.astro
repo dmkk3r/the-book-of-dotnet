@@ -1,0 +1,25 @@
+---
+interface Props {
+  total: number;
+}
+const { total } = Astro.props;
+---
+
+<div class="prog">
+  <span>
+    <span data-progress-count>0</span> von {total} erledigt
+  </span>
+  <div class="bar" aria-hidden="true">
+    <i data-progress-bar data-total={total}></i>
+  </div>
+</div>
+
+<style>
+  .prog {
+    display: grid;
+    gap: 4px;
+    font-size: 13px;
+    color: var(--muted);
+    min-width: 120px;
+  }
+</style>

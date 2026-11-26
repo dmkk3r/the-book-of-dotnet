@@ -1,0 +1,335 @@
+---
+id: allokation
+title: Allokation und Allocation Contexts
+summary: Warum new in .NET meist nur einen Zeiger verschiebt, was jeder Thread dafür besitzt, wann der langsame Pfad eine Collection auslöst und wo versteckte Allokationen entstehen.
+status: draft
+dotnetVersion: '7+'
+sources:
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Grundlagen der Garbage Collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/fundamentals
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'Quellcode des GC-Allokators in dotnet/runtime (allocation.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/allocation.cpp
+  - title: 'gc_alloc_context in dotnet/runtime (gcinterface.h)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gcinterface.h
+  - title: 'GC.GetAllocatedBytesForCurrentThread (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.getallocatedbytesforcurrentthread
+  - title: 'GC.AllocateUninitializedArray (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.allocateuninitializedarray
+  - title: 'dotnet-counters (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/diagnostics/dotnet-counters
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './allokation.steps';
+import pathsScript from './allokation-pfade.steps';
+import threadsScript from './allokation-threads.steps';
+import { measureCode, benchmarkCode } from './allokation-verify';
+
+<Block n={1} title="Das Problem">
+
+Wer in C oder C++ Speicher anfordert, ruft einen allgemeinen Allokator wie `malloc` auf. Der muss für jede Anfrage einen passenden freien Bereich finden: Er durchsucht Freilisten nach Blöcken passender Größe, teilt größere Blöcke auf und führt Buch darüber, was wo frei ist. Weil mehrere Threads gleichzeitig allozieren können, braucht er außerdem Synchronisation, also Locks oder pro Thread getrennte Zwischenspeicher. Und beim Freigeben muss er Nachbarblöcke wieder zusammenführen, damit der Speicher nicht in lauter kleine Stücke zerfällt.
+
+Für C-Programme ist das tragbar, weil sie vergleichsweise selten allozieren. Verwalteter Code alloziert dagegen ständig. Jeder String, jedes Array, jede Liste, jeder Enumerator, jede Closure und jede Box ist ein eigenes Objekt auf dem Heap. Ein Webserver erzeugt pro Anfrage leicht Hunderte bis Tausende Objekte. Würde jedes `new` eine Freiliste durchsuchen und einen Lock nehmen, wäre Allokation ein ernsthafter Engpass.
+
+Der .NET-GC hat einen Vorteil, den `malloc` nicht hat: Er darf Objekte verschieben. Weil er beim Kompaktieren die Überlebenden zusammenschiebt, entsteht hinter ihnen ein großer, zusammenhängender freier Bereich. In so einem Bereich muss man nichts suchen. Man kann Objekte einfach eines hinter das andere legen.
+
+Der Zielkonflikt verschiebt sich dadurch: Die einzelne Allokation wird extrem billig, aber jede Allokation verbraucht ein Stück des Budgets, nach dem der GC die nächste Collection plant. Die Kosten verschwinden also nicht, sie kommen nur später und gebündelt.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Sechs Sätze tragen den Rest der Lektion:
+
+1. **Allokation ist Bump-Pointer-Allokation.** Neue kleine Objekte kommen nach Gen0, und zwar direkt hinter das zuletzt angelegte Objekt. Allozieren heißt im Normalfall: einen Zeiger um die Objektgröße weiterschieben.
+2. **Jeder Thread hat ein eigenes Allocation Context.** Das sind im Kern zwei Zeiger: `alloc_ptr` (das nächste freie Byte) und `alloc_limit` (das Ende des Blocks, den der GC diesem Thread überlassen hat). Kein anderer Thread schreibt in diesen Block.
+3. **Der schnelle Pfad braucht keinen Lock.** Addieren, mit dem Limit vergleichen, zurückschreiben, Methodentabelle eintragen. Das erledigt ein kleiner Helfer, den der JIT bei jedem `new` aufruft.
+4. **Ist der Block voll, folgt der langsame Pfad.** Der GC-Allokator teilt unter einem Lock einen neuen Block zu. Das Book of the Runtime nennt diese Blockgröße **Allocation Quantum**, typischerweise rund 8 KB.
+5. **Jeder neue Block zählt gegen das Gen0-Budget.** Ist es aufgebraucht, löst der langsame Pfad eine Collection aus. Die meisten Collections entstehen genau so: in einem ganz gewöhnlichen `new`.
+6. **Speicher wird genullt übergeben.** Der GC nullt einen Block, wenn er ihn zuteilt, nicht pro Objekt. Deshalb stehen alle Felder eines neuen Objekts ohne Zusatzarbeit auf 0, `null` oder `false`.
+
+Für große Objekte gilt eine Ausnahme: Ab 85.000 Byte landen sie im Large Object Heap und werden ohne Allocation Context direkt vom GC angelegt (dazu unten mehr).
+
+{/* TODO(verify): Allocation quantum "typically 8k" per BOTR; current value CLR_SIZE = 8*1024+32 in gcinternal.h, and whether it is adjusted dynamically (allocation_quantum in gc.cpp). LOH threshold 85,000 bytes per Microsoft Learn. */}
+
+<Callout kind="fehlannahme">
+  „Weil `new` nur einen Zeiger verschiebt, sind Allokationen praktisch kostenlos.“ Die einzelne
+  Allokation ist tatsächlich billig. Aber jedes Byte verbraucht Gen0-Budget, und wer mehr alloziert,
+  bekommt mehr Collections. Die Rechnung kommt nicht beim `new`, sondern in Form von GC-Pausen und
+  CPU-Zeit im GC.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel legt vier Objekte in einem stark verkleinerten Allocation Context an. Achte darauf, dass sich zwischen den Schritten nur `alloc_ptr` bewegt, und darauf, was in Schritt 5 passiert, wenn das nächste Objekt nicht mehr passt.
+
+<StepPlayer script={script} />
+
+Bemerkenswert ist der Bereich hinter `alloc_limit`. Der GC hält am Ende jedes Blocks Platz für ein kleines **freies Objekt** frei. Wird der Context aufgegeben, verwandelt er den ungenutzten Rest in so ein freies Objekt. Der Heap bleibt damit eine lückenlose Folge von Objekten, die der GC bei einer Collection von vorne bis hinten durchlaufen kann. Liegt der neue Block direkt hinter dem alten, kann der Allokator den Context auch einfach verlängern. Im JIT-Assembler (in SharpLab unter „JIT Asm“) siehst du von alldem nur einen einzigen Aufruf eines Allokations-Helfers pro `new`, dem die Methodentabelle des Typs übergeben wird.
+
+{/* TODO(verify): Helper names shown in SharpLab JIT Asm for new of a class (CORINFO_HELP_NEWSFAST) and for arrays (CORINFO_HELP_NEWARR_1_VC / _OBJ) in current .NET. */}
+
+</Block>
+
+<Block n={4} title="Schneller und langsamer Pfad">
+
+### Was eine Allokation von Anfang bis Ende kostet
+
+Eine Allokation hat zwei sehr unterschiedliche Pfade. Der **schnelle Pfad** besteht aus wenigen Instruktionen: Den Context des aktuellen Threads finden, `alloc_ptr + Größe` berechnen, mit `alloc_limit` vergleichen, den neuen Zeiger zurückschreiben und an die alte Adresse den Zeiger auf die Methodentabelle eintragen. Bei Arrays kommt die Länge hinzu. Danach läuft der Konstruktor, und der ist oft teurer als die Allokation selbst.
+
+Der **langsame Pfad** beginnt, wenn die Limit-Prüfung scheitert. Der Helfer ruft den GC-Allokator auf. Der nimmt einen Lock des Heaps, denn er verändert jetzt gemeinsamen Zustand. Er sucht einen neuen Block, entweder am Ende der aktuellen Gen0-Region oder in einer Lücke, die eine frühere Collection in einer Freiliste hinterlassen hat. Dann prüft er das Gen0-Budget, nullt den Block und stellt den Context des Threads auf ihn um.
+
+<StepPlayer script={pathsScript} />
+
+Die Kosten eines `new` hängen damit vor allem davon ab, wie oft der langsame Pfad nötig ist. Mit einem Block von einigen Kilobyte und typischen Objekten von einigen Dutzend Byte trifft das nur einen kleinen Bruchteil der Allokationen. Teuer wird es erst, wenn der langsame Pfad eine Collection auslöst. Dann dauert dieses eine `new` so lange wie die ganze Collection, und alle anderen verwalteten Threads stehen in dieser Zeit ebenfalls.
+
+{/* TODO(verify): Slow path details in allocation.cpp: more_space_lock_soh, soh_try_fit, a_fit_free_list_p, and the gen0 budget check via dd_new_allocation before triggering a GC. */}
+
+Eine Variante des schnellen Pfads gibt es für Typen mit Finalizer. Solche Objekte muss die Runtime bei der Allokation zusätzlich in eine Liste für die Finalisierung eintragen, deshalb wählt der JIT dafür einen anderen, langsameren Helfer. Mehr dazu in der Lektion „Finalisierung“.
+
+{/* TODO(verify): That allocations of finalizable types always go through a slower helper (CORINFO_HELP_NEWFAST instead of NEWSFAST) and register with the finalization queue at allocation time. */}
+
+### Warum der Speicher schon genullt ist
+
+C# garantiert, dass die Felder eines neuen Objekts ihren Standardwert haben. Ein Verweisfeld, das zufälligen Speicherinhalt enthielte, wäre für den GC katastrophal: Er würde beim Markieren einem Verweis folgen, der nirgendwohin zeigt. Das Book of the Runtime begründet das Nullen genau so: Es verhindert, dass Objektverweise auf beliebigen Speicher zeigen.
+
+Statt jedes Objekt einzeln zu nullen, nullt der Allokator den ganzen Block, wenn er ihn einem Context zuteilt. Laut Book of the Runtime hat das einen Nebeneffekt: Der frisch genullte Block liegt danach im Prozessorcache, also genau dort, wo die nächsten Objekte entstehen. Speicher, der frisch vom Betriebssystem kommt, ist bereits genullt und muss nicht noch einmal angefasst werden.
+
+Für große Puffer, die du ohnehin sofort komplett überschreibst, ist das Nullen verschwendete Arbeit. Dafür gibt es seit .NET 5 `GC.AllocateUninitializedArray<T>`. Die Runtime darf das Nullen dann überspringen, bei kleinen Arrays tut sie es aber trotzdem, weil sich der Sonderweg dort nicht lohnt. Die Methode ist nur für Arrays aus Typen ohne Verweise gedacht, sonst wäre das Problem mit den zufälligen Verweisen sofort wieder da.
+
+{/* TODO(verify): GC.AllocateUninitializedArray available since .NET 5, size threshold below which it still zeroes (around 2048 bytes in GC.CoreCLR.cs), and behavior for types containing references (falls back to normal allocation). */}
+
+### Große Objekte nehmen einen anderen Weg
+
+Objekte ab 85.000 Byte (in der Praxis fast immer Arrays) passen nicht sinnvoll in einen Block von wenigen Kilobyte. Das Book of the Runtime hält fest, dass große Objekte keine Allocation Contexts und kein Allocation Quantum verwenden. Sie werden einzeln und direkt im Large Object Heap angelegt, unter einem eigenen Lock, und der Speicher wird dabei ebenfalls genullt. Bei einem Array von einigen Megabyte ist dieses Nullen ein spürbarer Teil der Kosten.
+
+Auch der LOH hat ein Budget. Ist es erschöpft, löst eine Allokation eine Collection aus, und weil der LOH logisch zu Gen2 gehört, ist das eine volle Collection. Viele kurzlebige große Arrays sind deshalb besonders teuer. Mehr dazu in der Lektion „LOH, POH und Non-GC-Heap“.
+
+{/* TODO(verify): LOH allocations use more_space_lock_uoh and exhausting the LOH budget triggers a gen2 GC. */}
+
+</Block>
+
+<Block n={5} title="Ein Context pro Thread">
+
+Die zweite Zutat neben dem Bump-Pointer ist, dass jeder Thread seinen eigenen Context hat. Das Book of the Runtime formuliert es so: Solange der aktuelle Allocation Context nicht erschöpft ist, ist für Allokationen kein Lock nötig. Zwei Threads, die gleichzeitig allozieren, schreiben in verschiedene Blöcke und kommen sich nie in die Quere.
+
+<StepPlayer script={threadsScript} />
+
+Konkurrenz entsteht nur im langsamen Pfad, und der läuft einmal pro Block statt einmal pro Objekt. Bei sehr vielen allozierenden Threads kann der Lock des Heaps trotzdem zum Engpass werden. Server GC entschärft das, indem er mehrere Heaps mit je eigenem Lock anlegt und die allozierenden Threads auf diese Heaps verteilt. Wie viele Heaps es gibt und wie DATAS ihre Zahl anpasst, behandelt die Lektion „Workstation, Server und DATAS“.
+
+{/* TODO(verify): Server GC associates allocation contexts with heaps and rebalances threads between heaps (balance_heaps in allocation.cpp). */}
+
+Der Context selbst ist eine kleine Struktur, die die Runtime für jeden verwalteten Thread anlegt. Neben den beiden Zeigern enthält sie Zähler für die Bytes, die der Thread bisher alloziert hat. Genau daraus liest `GC.GetAllocatedBytesForCurrentThread` später seinen Wert.
+
+{/* TODO(verify): gc_alloc_context fields alloc_ptr, alloc_limit, alloc_bytes, alloc_bytes_uoh in gcinterface.h, and that GetAllocatedBytesForCurrentThread is computed from alloc_bytes minus the unused rest of the context. */}
+
+Wenn eine Collection beginnt, werden alle Contexts aufgegeben: Ihr ungenutzter Rest wird zu freien Objekten, damit der GC den Heap durchlaufen kann. Nach der Collection bekommt jeder Thread beim nächsten langsamen Pfad einen neuen Block.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Versteckte Allokationen
+
+Allokationen sind leicht zu sehen, wenn `new` dasteht. Viele entstehen aber, ohne dass das Wort im Code vorkommt:
+
+```csharp
+int limit = 10;
+var big = items.Where(x => x > limit);   // Closure-Objekt, Delegate, Iterator
+object o = limit;                         // Box
+Log("Start", limit, DateTime.Now);        // params object[]: Array plus zwei Boxen
+string s = "Wert: " + limit;              // neuer String
+async Task<int> LoadAsync() { ... }       // State Machine auf dem Heap, wenn ein await wirklich wartet
+```
+
+- **Lambdas, die Variablen einfangen**, brauchen ein Objekt für die eingefangenen Variablen und einen Delegate. Lambdas ohne Captures cacht der Compiler in einem statischen Feld. Details in der Lektion „Lambdas und Closures“.
+- **Boxing** legt für jeden Werttyp, der als `object` oder Interface benutzt wird, eine neue Box an.
+- **`params`-Arrays** entstehen bei jedem Aufruf. Seit C# 13 können `params`-Parameter auch `ReadOnlySpan<T>` sein, dann entfällt das Array.
+- **LINQ** erzeugt pro Operator meist ein Iterator-Objekt und für das Prädikat einen Delegate. Die Lektion „LINQ-Iteratoren“ zeigt die Ausnahmen.
+- **String-Verkettung** erzeugt immer einen neuen String, weil Strings unveränderlich sind.
+- **Async-Methoden** allozieren ihre State Machine auf dem Heap, sobald ein `await` tatsächlich warten muss.
+
+{/* TODO(verify): C# 13 params collections (params ReadOnlySpan<T>) and that BCL overloads like string.Concat/Console.WriteLine gained span-based params overloads in .NET 9. */}
+
+Einzeln kostet jede dieser Allokationen wenig. Im heißen Pfad, also in Code, der Millionen Mal pro Sekunde läuft, summieren sie sich zur Hauptlast des GC.
+
+### Die Allokationsrate bestimmt die GC-Frequenz
+
+Gen0-Collections werden ausgelöst, wenn das Gen0-Budget aufgebraucht ist. Bei festem Budget heißt das: Doppelt so viele allozierte Bytes pro Sekunde bedeuten ungefähr doppelt so viele Gen0-Collections. Die Größe des Heaps spielt dafür kaum eine Rolle, entscheidend ist der Durchsatz an Bytes.
+
+Daraus folgt eine zweite, weniger offensichtliche Wirkung. Je häufiger Collections laufen, desto kürzer ist die Zeit zwischen ihnen, und desto mehr Objekte sind „zufällig“ noch am Leben, wenn eine Collection kommt. Sie werden promotet, obwohl sie Millisekunden später gestorben wären. Eine hohe Allokationsrate macht also nicht nur Gen0 teurer, sie schiebt auch mehr Objekte nach Gen1 und Gen2 (siehe „Generationen“).
+
+{/* TODO(verify): Gen0 budget is dynamic (survival rate, cache size, DATAS), so "doubling the rate doubles gen0 GCs" holds only approximately. */}
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Messen
+
+- `GC.GetAllocatedBytesForCurrentThread()` liefert die Bytes, die der aktuelle Thread seit seinem Start alloziert hat. Die Differenz vor und nach einem Codestück ist ein schneller, genauer Test.
+- `GC.GetTotalAllocatedBytes(precise)` liefert dasselbe für den ganzen Prozess.
+- **BenchmarkDotNet** zeigt mit `[MemoryDiagnoser]` die Spalte „Allocated“ pro Aufruf. Das ist das Werkzeug der Wahl für Vergleiche (siehe „BenchmarkDotNet richtig nutzen“).
+- **dotnet-counters** zeigt die Allokationsrate eines laufenden Prozesses in Bytes pro Sekunde, zusammen mit der Zahl der Collections.
+
+{/* TODO(verify): GC.GetTotalAllocatedBytes(bool precise) available since .NET Core 3.0; counter names for allocation rate in .NET 8 (alloc-rate) and .NET 9+ (dotnet.gc.heap.total_allocated). */}
+
+Für die Ursachensuche in einem echten Prozess brauchst du einen Trace mit Allokationsereignissen, der zeigt, welche Typen an welchen Stellen alloziert werden. Wie das geht, steht in der Lektion „dotnet-counters, -trace, -dump, -gcdump“.
+
+### Muster und Auswege
+
+| Code                                | Effekt                               | Warum                                 | Ausweg                                             |
+| ----------------------------------- | ------------------------------------ | ------------------------------------- | -------------------------------------------------- |
+| `items.Where(x => x > limit)`       | Closure, Delegate, Iterator          | Capture und LINQ-Operator             | Schleife im heißen Pfad, statische Lambda          |
+| `object o = value;`                 | Box pro Zuweisung                    | Werttyp wird zum Objekt               | Generics statt `object`                            |
+| `Log(fmt, a, b)` mit `params object[]` | Array plus Boxen                  | Argumente werden eingesammelt         | Überladungen, `params ReadOnlySpan<T>`             |
+| `s += teil;` in einer Schleife      | Ein neuer String pro Durchlauf       | Strings sind unveränderlich           | `StringBuilder`, `string.Create`                   |
+| `new byte[4096]` pro Anfrage        | Puffer pro Aufruf                    | Kurzlebiger Speicher in großer Menge  | `ArrayPool<byte>.Shared`, `stackalloc` für Kleines |
+| `new byte[1_000_000]` pro Anfrage   | LOH-Allokation, volle Collections    | Großes Objekt, LOH gehört zu Gen2     | Pooling                                            |
+| `Substring` zum Parsen              | Neuer String pro Teilstück           | Kopie der Zeichen                     | `ReadOnlySpan<char>` und `AsSpan()`                |
+
+Allokationen zu vermeiden heißt fast immer: Daten nicht kopieren, sondern auf vorhandenen Speicher zeigen (Lektion „Span&lt;T&gt; und Memory&lt;T&gt;“), kleine temporäre Puffer auf den Stack legen (Lektion „stackalloc“) oder große Puffer wiederverwenden (Lektion „ArrayPool und Pooling“). Wichtig ist das nur im heißen Pfad. Eine Allokation pro Anfrage in einem Webserver ist kein Problem, eine pro verarbeitetem Byte schon.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die billigste Allokation ist die, die nie auf dem Heap landet. Seit einigen Versionen führt der JIT eine **Escape-Analyse** durch: Er prüft, ob ein neu angelegtes Objekt die Methode verlassen kann, etwa weil es zurückgegeben, in ein Feld geschrieben oder an eine unbekannte Methode übergeben wird. Bleibt es nachweislich lokal, darf der JIT es auf dem Stack anlegen. Es verbraucht dann kein Gen0-Budget und verschwindet beim Verlassen der Methode von selbst.
+
+Die Analyse ist bewusst vorsichtig. Sobald ein Objekt an eine Methode übergeben wird, die nicht geinlinet wurde, gilt es als entkommen. In der Praxis profitieren vor allem kleine Hilfsobjekte, Boxen und in neueren Versionen auch Delegates und kleine Arrays. Wie das genau funktioniert, zeigt die Lektion „Escape Analysis“.
+
+<Callout kind="version">
+  Object Stack Allocation ist im JIT schon länger vorhanden, wurde aber erst in neueren Versionen
+  standardmäßig aktiviert und schrittweise auf weitere Fälle ausgedehnt. Welche Fälle in deiner
+  Version erfasst sind, prüfst du am besten mit einem Benchmark und `[MemoryDiagnoser]`.
+</Callout>
+
+{/* TODO(verify): .NET version in which object stack allocation was enabled by default (.NET 9 for boxes and simple class instances?) and the extensions in .NET 10 (small arrays of value types, delegates, more escape cases). Source: Performance Improvements in .NET 9 and .NET 10 blog posts. */}
+
+Der GC selbst passt das Gen0-Budget laufend an. Überlebt bei Gen0-Collections viel, wird es größer, damit Objekte mehr Zeit zum Sterben haben. Bei Server GC sind die Budgets deutlich größer als bei Workstation GC, mit DATAS orientieren sie sich an der Größe der langlebigen Daten. Die Allokationsrate bleibt trotzdem der Hebel, den nur dein Code bewegen kann.
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das erste Experiment misst einzelne Allokationen mit `GC.GetAllocatedBytesForCurrentThread`. Jede Aktion läuft einmal vorab, damit JIT-Kompilierung und statische Initialisierung nicht mitgezählt werden.
+
+{/* TODO(verify): Expected output on x64, Release build: new object() 24 B, Boxing 24 B, String-Verkettung 40 B ("Wert: 50", 8 chars; int.ToString for small numbers is cached since .NET 8), int[1000] 4024 B, byte[100_000] 100024 B. */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ausführen (dotnet run -c Release). Erwartet auf 64-Bit: 24 B für das leere Objekt und für die Box, rund 40 B für den String, gut 4 KB für das int-Array und gut 100 KB für das große Array. Die Zahlen sind exakt, weil der Zähler pro Thread geführt wird. Die Lambdas fangen value und sink ein, ihr eigenes Closure-Objekt entsteht aber nur einmal und fällt nicht in die Messung."
+  code={measureCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'Loop', allocated: '-' },
+    { method: 'Linq', allocated: '64 B' },
+    { method: 'Box', allocated: '24 B' },
+    { method: 'Concat', allocated: '40 B' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. Loop alloziert nichts, Linq einen Delegate, weil die Lambda this einfängt, Box eine Box und Concat einen neuen String."
+/>
+
+{/* TODO(verify): Benchmark expectations: Linq allocates only the delegate (Enumerable.Count on an array uses a span fast path without enumerator in .NET 9+), delegate size 64 B on x64; Concat 40 B. */}
+
+Für einen laufenden Prozess startest du `dotnet-counters monitor --process-id <pid> --counters System.Runtime` und beobachtest Allokationsrate und Zahl der Gen0-Collections. Verdoppelst du in einer Schleife die Allokationen pro Durchlauf, steigt die Allokationsrate, und die Gen0-Collections pro Sekunde steigen mit.
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="allokation"
+  questions={[
+    {
+      q: 'Was passiert im schnellen Pfad einer Allokation im Normalfall?',
+      options: [
+        'Der GC sucht in einer Freiliste nach einem passenden Block',
+        'Der Thread schiebt seinen alloc_ptr um die Objektgröße weiter, nach einer Prüfung gegen alloc_limit',
+        'Die Runtime nimmt einen globalen Lock und fordert Speicher vom Betriebssystem an',
+      ],
+      correct: 1,
+      explanation:
+        'Kleine Objekte entstehen per Bump-Pointer im Allocation Context des Threads. Freilisten, Locks und neue Blöcke gehören zum langsamen Pfad.',
+    },
+    {
+      q: 'Warum brauchen zwei Threads, die gleichzeitig allozieren, im Normalfall keinen Lock?',
+      options: [
+        'Weil jeder Thread seinen eigenen Allocation Context in einem eigenen Block hat',
+        'Weil Allokationen atomar mit Interlocked erfolgen',
+        'Weil der GC alle Threads während der Allokation anhält',
+      ],
+      correct: 0,
+      explanation:
+        'Jeder Context gehört genau einem Thread. Erst wenn ein neuer Block nötig ist, nimmt der langsame Pfad einen Lock des Heaps.',
+    },
+    {
+      q: 'Wann löst eine Allokation typischerweise eine Gen0-Collection aus?',
+      options: [
+        'Nach einer festen Zahl von Objekten',
+        'Wenn ihr Context voll ist und das Gen0-Budget aufgebraucht ist',
+        'Bei jeder Allokation, die nicht in den Context passt',
+      ],
+      correct: 1,
+      explanation:
+        'Ein voller Context führt nur zum langsamen Pfad. Eine Collection folgt erst, wenn auch das Budget erschöpft ist.',
+    },
+    {
+      q: 'Warum sind die Felder eines neuen Objekts ohne Konstruktor-Code 0 oder null?',
+      options: [
+        'Der JIT fügt für jedes Feld eine Zuweisung ein',
+        'Der Allokator nullt den ganzen Block, wenn er ihn dem Context zuteilt',
+        'Das Betriebssystem nullt jede Seite bei jedem Zugriff',
+      ],
+      correct: 1,
+      explanation:
+        'Genullt wird blockweise beim Zuteilen. Das schützt den GC vor zufälligen Verweisen und ist billiger als pro Objekt.',
+    },
+    {
+      q: 'Ein byte[200_000] wird angelegt. Welchen Weg nimmt die Allokation?',
+      options: [
+        'Bump-Pointer im Allocation Context in Gen0',
+        'Direkt in den Large Object Heap, ohne Allocation Context',
+        'Auf den Stack, weil es ein Array aus Werttypen ist',
+      ],
+      correct: 1,
+      explanation:
+        'Objekte ab 85.000 Byte verwenden keine Allocation Contexts. Sie werden einzeln im LOH angelegt, der mit Gen2 eingesammelt wird.',
+    },
+    {
+      q: 'Ein Dienst alloziert doppelt so viel pro Anfrage wie vorher, die Heapgröße bleibt gleich. Was ist die wahrscheinlichste Folge?',
+      options: [
+        'Keine, solange der Heap nicht wächst',
+        'Etwa doppelt so viele Gen0-Collections und mehr zufällig promotete Objekte',
+        'Nur mehr Gen2-Collections',
+      ],
+      correct: 1,
+      explanation:
+        'Die Allokationsrate verbraucht das Gen0-Budget. Mehr Bytes pro Sekunde bedeuten mehr Collections, und mehr Collections promoten mehr Objekte, die gerade noch leben.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Kleine Objekte entstehen per **Bump-Pointer**: Zeiger weiterschieben, gegen das Limit prüfen, Methodentabelle eintragen.
+- Jeder Thread hat ein eigenes **Allocation Context** (`alloc_ptr`, `alloc_limit`), deshalb braucht der schnelle Pfad keinen Lock.
+- Ist der Block voll, holt der **langsame Pfad** unter einem Lock einen neuen, typischerweise rund 8 KB großen Block.
+- Jeder neue Block zählt gegen das **Gen0-Budget**. Ist es erschöpft, löst die Allokation eine Collection aus.
+- Speicher wird **blockweise genullt** übergeben. Große Objekte ab 85.000 Byte gehen ohne Context direkt in den LOH.
+- **Versteckte Allokationen** (Closures, Boxing, `params`, LINQ, Strings, async) sind im heißen Pfad die häufigste Ursache für viele Collections.
+- Die **Allokationsrate** bestimmt die GC-Frequenz. Messen mit `GC.GetAllocatedBytesForCurrentThread`, `[MemoryDiagnoser]` und `dotnet-counters`.
+
+</Block>

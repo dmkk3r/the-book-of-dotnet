@@ -1,0 +1,357 @@
+---
+id: gc-handles
+title: WeakReference und GC-Handles
+summary: Wie die Handle-Tabelle der Runtime Verweise ermöglicht, die der GC anders behandelt als normale, wann schwache Verweise geleert werden und wie ConditionalWeakTable Daten ohne Speicherleck an Objekte hängt.
+status: draft
+dotnetVersion: '6+'
+sources:
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'GCHandle (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.interopservices.gchandle
+  - title: 'GCHandleType (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.interopservices.gchandletype
+  - title: 'Schwache Verweise (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/weak-references
+  - title: 'WeakReference<T> (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.weakreference-1
+  - title: 'ConditionalWeakTable<TKey,TValue> (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.compilerservices.conditionalweaktable-2
+  - title: 'DependentHandle (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.dependenthandle
+  - title: 'Caching in .NET (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/extensions/caching
+  - title: 'Quellcode des GC in dotnet/runtime (gc.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gc.cpp
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './gc-handles.steps';
+import cwtScript from './gc-handles-cwt.steps';
+import raceScript from './gc-handles-race.steps';
+import { handlesCode, cwtCode } from './gc-handles-verify';
+
+<Block n={1} title="Das Problem">
+
+Für den GC gibt es normalerweise nur eine Art von Verweis: Ein Feld, eine lokale Variable oder ein statisches Feld zeigt auf ein Objekt, und solange so ein Verweis von einer Root aus erreichbar ist, lebt das Objekt. Diese Regel ist einfach und deckt fast alles ab. An ein paar Stellen reicht sie aber nicht.
+
+**Festhalten ohne verwalteten Verweis.** Übergibst du einer nativen Bibliothek einen Callback samt Zustandsobjekt, merkt sich die Bibliothek nur eine Zahl. Im verwalteten Code zeigt vielleicht nichts mehr auf das Zustandsobjekt. Der GC würde es einsammeln, und der nächste Callback liefe ins Leere. Es braucht also einen Weg, ein Objekt ausdrücklich am Leben zu halten, ohne dass ein Feld darauf zeigt.
+
+**Beobachten ohne festzuhalten.** Ein Cache möchte ein teuer berechnetes Objekt wiederverwenden, solange es ohnehin noch lebt, aber nicht der Grund sein, dass es lebt. Ein normaler Verweis kann das nicht, jeder Verweis hält fest.
+
+**Nicht verschieben.** Nativer Code arbeitet mit Adressen. Verschiebt der GC beim Kompaktieren ein Array, während eine native Funktion hineinschreibt, schreibt sie an die alte Stelle.
+
+**Daten an fremde Objekte hängen.** Ein Framework will zu beliebigen Objekten Zusatzinformationen speichern, ohne deren Klassen zu ändern und ohne sie dadurch unsterblich zu machen.
+
+All diese Fälle löst die Runtime mit demselben Werkzeug: **GC-Handles**. Ein Handle ist ein Eintrag in einer Tabelle, die der GC kennt und bei jeder Collection nach den Regeln des jeweiligen Handle-Typs behandelt.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Die Runtime führt eine **Handle-Tabelle**, getrennt vom verwalteten Heap. Jeder Eintrag zeigt auf ein Objekt und hat einen Typ, der festlegt, wie der GC ihn behandelt:
+
+1. **Normal** (stark): Der Eintrag ist eine Root. Das Objekt lebt, bis das Handle freigegeben wird.
+2. **Weak** (kurz schwach): Keine Root. Ist das Objekt sonst unerreichbar, setzt der GC das Handle auf `null`, und zwar noch bevor ein Finalizer laufen könnte.
+3. **WeakTrackResurrection** (lang schwach): Keine Root. Wird erst geleert, wenn das Objekt nach der Finalisierung wirklich tot ist.
+4. **Pinned**: Eine Root, die das Objekt zusätzlich an seiner Adresse festhält.
+5. **Dependent**: Ein Paar aus zwei Objekten. Das erste wird schwach gehalten, das zweite lebt genau so lange wie das erste.
+
+`GCHandle` ist die öffentliche API dafür: `GCHandle.Alloc(obj, type)` legt einen Eintrag an, `Target` liest das Ziel, `Free` gibt den Eintrag frei. `WeakReference` und `WeakReference<T>` sind Klassen, die intern ein Weak-Handle besitzen, `ConditionalWeakTable` baut auf Dependent-Handles auf.
+
+Wo die Handles im Ablauf einer Collection auftauchen, steht im Book of the Runtime: Starke Handles werden wie andere Roots beim Markieren berücksichtigt, schwache Handles behandelt der GC nach dem Markieren und leert die, deren Ziel unmarkiert geblieben ist.
+
+{/* TODO(verify): BOTR garbage-collection.md wording on handles as roots and weak handle scanning; dependent handles are not described there in detail (see gc.cpp scan_dependent_handles). */}
+
+<Callout kind="fehlannahme">
+  „Ein WeakReference hält sein Ziel, bis der Speicher knapp wird.“ Nein. .NET hat keine weichen
+  Verweise, die vom Speicherdruck abhängen. Ein schwaches Handle wird bei der nächsten Collection
+  geleert, die die Generation seines Ziels einschließt und es unerreichbar findet. Bei einem jungen
+  Objekt ist das oft schon die nächste Gen0-Collection.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel hält drei Objekte auf drei Arten: über eine lokale Variable, über ein Normal-Handle und über ein `WeakReference`. Achte in Schritt 4 darauf, welche Objekte der GC beim Markieren erreicht, und in Schritt 5 darauf, wann das Weak-Handle geleert wird.
+
+<StepPlayer script={script} />
+
+Bemerkenswert ist, wie wenig ein Handle von außen sichtbar ist. `strong` ist ein kleines Struct, das nur die Kennung des Eintrags enthält. Nichts im verwalteten Code zeigt auf `Data B`, und trotzdem lebt es. Genau das macht Handles für nativen Code nützlich und zugleich gefährlich: Ein vergessenes `Free` hält ein Objekt für immer fest, und kein Feld verrät, wer es festhält.
+
+</Block>
+
+<Block n={4} title="Die Handle-Typen im Detail">
+
+### GCHandle
+
+`GCHandle` ist ein Werttyp, der eine Kennung des Tabelleneintrags enthält. Er hat keinen Finalizer und gibt nichts von selbst frei: Jedes `Alloc` braucht genau ein `Free`. Nach `Free` ist das Struct ungültig, ein weiterer Zugriff auf `Target` löst eine `InvalidOperationException` aus.
+
+Für nativen Code gibt es `GCHandle.ToIntPtr(handle)`. Das Ergebnis ist eine Zahl, die du als `void*`-Kontext an eine native Bibliothek übergeben kannst. Im Callback machst du daraus mit `GCHandle.FromIntPtr(ptr)` wieder ein Handle und kommst über `Target` an dein Objekt:
+
+```csharp
+var state = new CallbackState();
+GCHandle handle = GCHandle.Alloc(state);              // Normal: hält state fest
+NativeLib.Register(&OnEvent, GCHandle.ToIntPtr(handle));
+
+[UnmanagedCallersOnly]
+static void OnEvent(IntPtr context)
+{
+    var s = (CallbackState)GCHandle.FromIntPtr(context).Target!;
+    s.Handle();
+}
+// beim Abmelden: NativeLib.Unregister(); handle.Free();
+```
+
+Wie Funktionszeiger und `UnmanagedCallersOnly` zusammenspielen, zeigt „Funktionszeiger und Callbacks“.
+
+Ein `Pinned`-Handle hält das Objekt zusätzlich an seiner Adresse fest. `AddrOfPinnedObject` liefert dann die Adresse der Daten. Das geht nur für Objekte, deren Inhalt nativer Code direkt lesen kann, also Arrays und Strings aus blittable Elementen oder blittable Klassen, sonst wirft `Alloc` eine `ArgumentException`. Für kurze Aufrufe ist `fixed` die bessere Wahl, weil es kein Handle braucht. Warum langes Pinning den Heap zerstückelt, steht in „Pinning und Fragmentierung“.
+
+{/* TODO(verify): Exact rule for which objects can be pinned with GCHandleType.Pinned (blittable / primitive data only, ArgumentException otherwise) in .NET 8+. */}
+
+### Kurz und lang schwach
+
+Der Unterschied zwischen `Weak` und `WeakTrackResurrection` ergibt sich aus der Reihenfolge, in der der GC beim Markieren vorgeht:
+
+1. Alles markieren, was von starken Roots aus erreichbar ist.
+2. **Kurze schwache Handles** leeren, deren Ziel unmarkiert ist.
+3. Die Finalization Queue durchsuchen, unerreichbare Objekte mit Finalizer in die F-Reachable Queue verschieben und von dort aus erneut markieren.
+4. **Lange schwache Handles** leeren, deren Ziel immer noch unmarkiert ist.
+
+{/* TODO(verify): This order against gc.cpp mark_phase (GcShortWeakPtrScan, ScanForFinalization, scan of dependent handles, GcWeakPtrScan). */}
+
+Ein Objekt mit Finalizer, das auf seinen Finalizer wartet, ist für ein kurzes Handle also schon tot, für ein langes noch lebendig. Das ist Absicht: Der Finalizer könnte das Objekt wiederbeleben (siehe „Finalisierung“). Ein kurzes Handle zeigt danach trotzdem auf `null`, ein langes auf das wiederbelebte Objekt. In der Praxis willst du fast immer das kurze: Ein Objekt nach seinem Finalizer weiterzubenutzen, ist selten sinnvoll, denn es hat seine Ressourcen ja schon freigegeben. `new WeakReference(obj)` erzeugt ein kurzes, `new WeakReference(obj, trackResurrection: true)` ein langes Handle.
+
+### WeakReference und WeakReference&lt;T&gt;
+
+`WeakReference<T>` ist die empfohlene, typsichere Variante. Sie hat bewusst keine `IsAlive`-Eigenschaft, sondern nur `TryGetTarget(out T target)`, die das Ziel in einem Schritt prüft und liefert. Warum das wichtig ist, zeigt die Stolperfalle weiter unten.
+
+Jedes `WeakReference` kostet zwei Dinge: ein kleines Objekt auf dem Heap und einen Eintrag in der Handle-Tabelle. Den Eintrag gibt die Runtime frei, wenn das `WeakReference`-Objekt selbst eingesammelt wird. Wer Millionen schwacher Verweise anlegt, hat also Millionen Handles, und die muss der GC bei Collections durchgehen.
+
+{/* TODO(verify): How the handle of a WeakReference is released in .NET 8+ (finalizer on WeakReference vs. special GC support), and how much handle scanning costs per collection (handle table ages, only condemned generations scanned). */}
+
+</Block>
+
+<Block n={5} title="ConditionalWeakTable und Dependent-Handles">
+
+### Warum ein Dictionary nicht reicht
+
+Angenommen, du willst zu beliebigen Objekten Zusatzdaten speichern, etwa ein Serialisierer, der pro Objekt einen Zustand merkt. Mit einem `Dictionary<object, Meta>` hält das Wörterbuch jeden Schlüssel stark fest. Kein Objekt, das je hineingekommen ist, stirbt, solange das Wörterbuch lebt.
+
+Der naheliegende Ausweg, die Schlüssel als `WeakReference` zu speichern, scheitert an einem Detail: Die Werte sind weiterhin stark gehalten. Zeigt ein Wert auf seinen Schlüssel, und bei angehängten Zusatzdaten ist das sehr häufig, hält der Wert den Schlüssel am Leben und damit indirekt sich selbst. Das schwache Handle wird nie geleert.
+
+### Was ein Dependent-Handle anders macht
+
+Ein **Dependent-Handle** verbindet ein primäres und ein sekundäres Objekt. Das primäre wird nicht festgehalten. Das sekundäre lebt genau so lange, wie das primäre aus einem anderen Grund lebt. Der GC behandelt das Paar so, als hätte das primäre Objekt ein unsichtbares Feld, das auf das sekundäre zeigt. Ein Verweis vom Wert zurück auf den Schlüssel erzeugt deshalb keinen Kreislauf, der etwas am Leben hält.
+
+<StepPlayer script={cwtScript} />
+
+Für den GC ist das aufwendiger als ein normales Handle. Ob ein sekundäres Objekt lebt, hängt davon ab, ob sein primäres markiert ist, und das kann wiederum von anderen sekundären Objekten abhängen. Der GC muss die Dependent-Handles deshalb wiederholt durchgehen, bis sich nichts mehr ändert.
+
+{/* TODO(verify): Iterative scanning of dependent handles until no new objects are promoted (gc.cpp scan_dependent_handles / GcDhReScan) and its cost with many entries. */}
+
+`ConditionalWeakTable<TKey, TValue>` verpackt das in eine bequeme API. Sie vergleicht Schlüssel nach Referenzidentität, nicht nach `Equals`, ist threadsicher und hält ihre Schlüssel nicht fest. Typische Methoden sind `Add`, `TryGetValue`, `GetValue(key, createValueCallback)` und `AddOrUpdate`. Seit .NET 6 gibt es das zugrunde liegende `DependentHandle` auch als öffentlichen Typ.
+
+{/* TODO(verify): DependentHandle public since .NET 6; AddOrUpdate available since .NET Core 2.0 / .NET Standard 2.1; ConditionalWeakTable thread-safety statement in the docs. */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### IsAlive prüfen, dann Target lesen
+
+Zwischen zwei Zeilen Code kann jederzeit eine Collection stattfinden, ausgelöst von einer Allokation auf irgendeinem Thread. Wer erst `IsAlive` fragt und dann `Target` liest, prüft etwas, das im nächsten Moment nicht mehr stimmt.
+
+<StepPlayer script={raceScript} />
+
+Die Lösung ist einfach: Ziel einmal in eine lokale Variable lesen und nur diese prüfen. Eine lokale Variable ist eine starke Root, das Objekt kann dir also nicht mehr unter den Händen verschwinden.
+
+```csharp
+if (cacheRef.TryGetTarget(out var data))   // WeakReference<T>
+    data.Use();
+
+var obj = weakRef.Target as Data;          // WeakReference
+if (obj is not null) obj.Use();
+```
+
+`IsAlive` taugt nur für die umgekehrte Aussage: `false` bleibt `false`, ein toter schwacher Verweis wird nie wieder lebendig.
+
+### Caches aus schwachen Verweisen
+
+Ein Cache, der seine Einträge nur über `WeakReference` hält, wirkt elegant: Der GC räumt auf, sobald niemand die Einträge braucht. In der Praxis ist er fast leer. Neue Einträge liegen in Gen0, und die nächste Gen0-Collection, die oft nur Millisekunden später kommt, leert jedes Handle, dessen Ziel sonst niemand hält. Der Cache trifft also nur dann, wenn das Objekt ohnehin noch anderswo festgehalten wird. Außerdem hängt seine Trefferquote von Allokationsrate und GC-Modus ab, nicht von deiner Anwendung.
+
+### GCHandle.Free vergessen
+
+Ein `Normal`- oder `Pinned`-Handle ohne `Free` ist ein Speicherleck. Bei `Pinned` kommt Fragmentierung dazu, weil der GC um das festgehaltene Objekt herum nicht kompaktieren kann. Kapsle die Lebensdauer eines Handles deshalb in einen Typ mit `Dispose` und gib es auf jedem Weg frei, auch bei Ausnahmen. Im Speicherabbild zeigt SOS mit `!gchandles` die Handles nach Typ, mit `!gcroot` siehst du, wenn ein Objekt nur über ein Handle lebt.
+
+{/* TODO(verify): SOS command names and output (!gchandles statistics per handle type, !gcroot showing "HandleTable" roots). */}
+
+### Ereignisse halten Abonnenten fest
+
+Das häufigste Leck dieser Art hat gar nichts mit Handles zu tun. Abonniert ein kurzlebiges Objekt ein Ereignis eines langlebigen, speichert der Delegate im Ereignis einen starken Verweis auf den Abonnenten. Der Abonnent lebt dann so lange wie der Herausgeber. Die erste Antwort ist, sich ordentlich abzumelden, etwa in `Dispose`. Wo das nicht möglich ist, helfen schwache Ereignismuster: Der Herausgeber hält seine Abonnenten über schwache Verweise, wie es etwa der `WeakEventManager` in WPF tut. Dafür muss er tote Einträge selbst aufräumen, und Lambdas, die nur der Delegate festhält, sterben sofort.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Welches Werkzeug wofür
+
+| Typ                     | Root?           | Wann geleert oder frei                           | Typischer Einsatz                                       |
+| ----------------------- | --------------- | ------------------------------------------------ | ------------------------------------------------------- |
+| `Normal`                | ja              | bei `Free`                                       | Zustandsobjekt für native Callbacks                     |
+| `Pinned`                | ja, und fixiert | bei `Free`                                       | Puffer, den nativer Code länger benutzt                 |
+| `Weak`                  | nein            | wenn das Ziel unerreichbar ist, vor Finalizern   | `WeakReference`, Beobachter, Ereignismuster             |
+| `WeakTrackResurrection` | nein            | erst nach der Finalisierung                      | selten, wenn auch wiederbelebte Objekte zählen sollen   |
+| Dependent               | nein            | wenn der Schlüssel stirbt, samt Wert             | `ConditionalWeakTable`, Daten an fremde Objekte hängen  |
+
+### Caches richtig bauen
+
+Für Caches nimm einen Cache mit klarer Verdrängungsstrategie, etwa `MemoryCache` aus `Microsoft.Extensions.Caching.Memory`. Er hält Einträge stark, verdrängt sie aber nach Ablaufzeit, nach Größe oder bei Bedarf. Damit bestimmst du, wie lange etwas lebt, und nicht der Zufall der nächsten Collection. Bedenke dabei die Midlife Crisis aus „Generationen“: Einträge mit kurzer Ablaufzeit erreichen oft Gen2 und sterben dort.
+
+### Kosten im Blick
+
+Handles sind billig, aber nicht kostenlos. Jedes Handle ist ein Eintrag, den der GC bei Collections prüfen muss, Dependent-Handles sogar wiederholt. Ein paar Tausend sind unproblematisch, Millionen kurzlebiger `WeakReference`-Objekte können GC-Pausen messbar verlängern. In einem GC-Trace siehst du die Zahl der Handles pro Collection, im Speicherabbild die Verteilung nach Typ.
+
+{/* TODO(verify): GC events carrying handle counts (GCHeapStats / GCGlobalHeapHistory fields), and the claim that millions of weak handles measurably increase pause times (Maoni Stephens mem-doc). */}
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die Handle-Tabelle gehört zum GC selbst. Sie ist in Abschnitte nach Handle-Typ gegliedert und merkt sich für ihre Einträge ein Alter, damit eine Gen0-Collection nicht jedes Handle im Prozess anschauen muss, sondern vor allem die, deren Ziel in den eingesammelten Generationen liegen kann. Beim Kompaktieren aktualisiert der GC die Einträge wie jeden anderen Verweis, mit Ausnahme gepinnter Ziele, die sich nicht bewegen.
+
+{/* TODO(verify): Handle table organization (handletable.cpp, objecthandle.cpp): per-type segments, age tracking per handle block, and which handle types are scanned in ephemeral GCs. */}
+
+Die Runtime benutzt Handles auch selbst: Statische Felder von Referenztypen, Sync Blocks und Interop-Wrapper werden intern über Handles verwaltet. Deshalb tauchen in `!gchandles` meist schon viele Einträge auf, bevor dein Code ein einziges `GCHandle.Alloc` aufgerufen hat.
+
+{/* TODO(verify): Which runtime structures use handles internally in .NET 8+ (statics via pinned object arrays / handles, sync block weak handles, RCW/CCW handles, ref-counted handles for COM). */}
+
+<Callout kind="version">
+  `DependentHandle` ist seit .NET 6 öffentlich. Neuere Versionen ergänzen typisierte Varianten von
+  `GCHandle`, die `Free` über `Dispose` erzwingen und ohne Casts auskommen. Das Modell der
+  Handle-Typen ändert sich dadurch nicht.
+</Callout>
+
+{/* TODO(verify): Generic GCHandle<T>, PinnedGCHandle<T> and WeakGCHandle<T> introduced in .NET 10 (System.Runtime.InteropServices), implementing IDisposable. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das erste Experiment vergleicht einen schwachen und einen starken Verweis über eine einzige Gen0-Collection. Die Allokation steckt in einer eigenen Methode, damit keine lokale Variable in `Main` die Objekte festhält.
+
+{/* TODO(verify): Expected output in Release without debugger: "weak lebt: False", "strong lebt: True". */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ohne Debugger ausführen (dotnet run -c Release). Erwartet: weak lebt: False, strong lebt: True. Schon eine Gen0-Collection leert das schwache Handle, das Normal-Handle hält sein Ziel bis zum Free."
+  code={handlesCode}
+/>
+
+Das zweite Experiment zeigt den Unterschied zwischen `Dictionary` und `ConditionalWeakTable`, wenn der Wert auf seinen Schlüssel zeigt. Zwei schwache Verweise beobachten die Schlüssel.
+
+{/* TODO(verify): Expected output: "Schlüssel im Dictionary lebt: True", "Schlüssel in der Tabelle lebt: False". */}
+
+<VerifyCard
+  sharplab="Ebenfalls im Release-Modus ausführen. Erwartet: Der Schlüssel im Dictionary lebt (True), der Schlüssel in der ConditionalWeakTable ist eingesammelt (False), obwohl sein Wert auf ihn zeigt."
+  code={cwtCode}
+/>
+
+Mit `dotnet-dump` kannst du beides auch im laufenden Prozess sehen: Erstelle ein Speicherabbild, öffne es mit `dotnet-dump analyze` und rufe `gchandles` auf. Die Ausgabe gruppiert die Handles nach Typ, darunter „Strong“, „Weak Short“, „Weak Long“, „Pinned“ und „Dependent“.
+
+{/* TODO(verify): Handle type names in the output of SOS gchandles in dotnet-dump. */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="gc-handles"
+  questions={[
+    {
+      q: 'Ein Objekt wird nur noch über ein WeakReference<T> referenziert und liegt in Gen0. Wann ist TryGetTarget voraussichtlich false?',
+      options: [
+        'Erst wenn der Speicher knapp wird',
+        'Nach der nächsten Gen0-Collection',
+        'Erst nach einer vollen Gen2-Collection',
+      ],
+      correct: 1,
+      explanation:
+        'Schwache Handles hängen nicht vom Speicherdruck ab. Jede Collection, die die Generation des Ziels einschließt und es unerreichbar findet, leert das Handle.',
+    },
+    {
+      q: 'Was unterscheidet ein kurzes (Weak) von einem langen (WeakTrackResurrection) schwachen Handle?',
+      options: [
+        'Das lange Handle hält sein Ziel bis zur nächsten Gen2-Collection fest',
+        'Das kurze wird vor der Finalisierung geleert, das lange erst, wenn das Objekt danach wirklich tot ist',
+        'Nur das lange Handle darf an nativen Code übergeben werden',
+      ],
+      correct: 1,
+      explanation:
+        'Der GC leert kurze schwache Handles, bevor er Objekte mit Finalizer in die F-Reachable Queue verschiebt, lange erst danach. Ein wiederbelebtes Objekt bleibt deshalb nur über ein langes Handle sichtbar.',
+    },
+    {
+      q: 'Du rufst GCHandle.Alloc(obj) auf und vergisst Free. Was passiert?',
+      options: [
+        'Der GC gibt das Handle bei der nächsten Collection frei',
+        'Das Objekt lebt bis zum Prozessende, weil das Normal-Handle eine Root ist',
+        'Der Finalizer von GCHandle gibt es irgendwann frei',
+      ],
+      correct: 1,
+      explanation:
+        'GCHandle ist ein Struct ohne Finalizer. Ein Normal-Handle ist eine Root, bis jemand Free aufruft. Ohne Free ist das ein Speicherleck.',
+    },
+    {
+      q: 'Warum löst ein Dictionary<WeakReference, Meta> das Leck nicht, wenn Meta auf seinen Schlüssel zeigt?',
+      options: [
+        'Weil WeakReference kein gültiger Schlüsseltyp ist',
+        'Weil der stark gehaltene Wert den Schlüssel erreicht und ihn so am Leben hält',
+        'Weil das Dictionary seine Schlüssel kopiert',
+      ],
+      correct: 1,
+      explanation:
+        'Das Dictionary hält Meta stark, Meta zeigt auf den Schlüssel, also ist der Schlüssel erreichbar und das schwache Handle wird nie geleert. Ein Dependent-Handle hält den Wert dagegen nur, solange der Schlüssel lebt.',
+    },
+    {
+      q: 'Was ist an `if (wr.IsAlive) ((Data)wr.Target).Use();` falsch?',
+      options: [
+        'Nichts, IsAlive garantiert, dass Target nicht null ist',
+        'Zwischen IsAlive und Target kann eine Collection das Handle leeren',
+        'Target darf nur auf dem Finalizer-Thread gelesen werden',
+      ],
+      correct: 1,
+      explanation:
+        'IsAlive beschreibt nur einen Augenblick. Richtig ist, Target einmal in eine lokale Variable zu lesen (oder TryGetTarget zu nutzen) und diese zu prüfen. Die lokale Variable hält das Objekt dann fest.',
+    },
+    {
+      q: 'Wie vergleicht ConditionalWeakTable ihre Schlüssel?',
+      options: [
+        'Mit Equals und GetHashCode',
+        'Nach Referenzidentität',
+        'Nach dem Typ des Schlüssels',
+      ],
+      correct: 1,
+      explanation:
+        'Die Tabelle hängt Daten an genau ein Objekt. Zwei verschiedene, aber gleiche Objekte haben unterschiedliche Einträge.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- **GC-Handles** sind Einträge in einer Tabelle der Runtime, die der GC je nach Typ als Root behandelt oder nicht.
+- **Normal** und **Pinned** halten ihr Ziel fest, Pinned zusätzlich an seiner Adresse. Jedes `GCHandle.Alloc` braucht ein `Free`, sonst entsteht ein Leck.
+- **Weak** wird geleert, sobald das Ziel unerreichbar ist, noch vor der Finalisierung. **WeakTrackResurrection** erst danach.
+- `WeakReference` hält nichts fest und wartet nicht auf Speicherdruck. Caches aus schwachen Verweisen leeren sich bei jeder Gen0-Collection, nimm `MemoryCache`.
+- Ziel eines schwachen Verweises **einmal lesen**, dann prüfen. `IsAlive` gefolgt von `Target` ist ein Wettlauf.
+- **Dependent-Handles** halten einen Wert genau so lange wie seinen Schlüssel. `ConditionalWeakTable` hängt damit Daten an Objekte, ohne Leck, auch wenn der Wert auf den Schlüssel zeigt.
+- Handles kosten GC-Zeit. Millionen davon, besonders Dependent-Handles, verlängern Collections.
+
+</Block>

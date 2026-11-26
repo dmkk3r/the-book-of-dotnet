@@ -1,0 +1,223 @@
+/*
+ * Design tokens.
+ * Chrome replicates the look of the Microsoft Learn documentation (measured values: Segoe UI or
+ * Selawik, 16/28 body text, 688px text column, 275px sidebar and rail, alert colours). Visualization colors (stack, heap, ref, thread, jit) are binding semantics.
+ */
+@font-face {
+  /* Selawik: Microsoft's open-source (OFL) fallback with the metrics of Segoe UI, self-hosted.
+     Segoe UI itself is used where it is installed (Windows). See src/styles/fonts/SELAWIK-LICENSE.txt */
+  font-family: Selawik;
+  src: url('./fonts/selawik-400.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: Selawik;
+  src: url('./fonts/selawik-600.woff2') format('woff2');
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: Selawik;
+  src: url('./fonts/selawik-700.woff2') format('woff2');
+  font-weight: 700;
+  font-display: swap;
+}
+
+:root {
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-alt: #f2f2f2;
+  --ink: #161616;
+  --muted: #505050;
+  --line: #e6e6e6;
+  --line-strong: #d1d1d1;
+  --input-line: #616161;
+  --code-bg: #fafafa;
+  --code-head-bg: #f0f0f0;
+  --code-inline-bg: #e6e6e6;
+  --header-bg: #fafafa;
+  --footer-bg: #e8e6df;
+  --toc-active: #ebebeb;
+  --rail-active: #0f6cbd;
+
+  --accent: #0065b3;
+  --accent-hover: #004173;
+  --accent-soft: #e5f1fa;
+  --on-accent: #ffffff;
+
+  --ref: #5b3fd9;
+  --ref-soft: #ece8fd;
+  --stack: #0e7c72;
+  --stack-soft: #e1f3f0;
+  --heap: #a86b05;
+  --heap-soft: #fbf0dc;
+  --thread: #1f5fad;
+  --thread-soft: #e3edfa;
+  --jit: #a8327a;
+  --jit-soft: #f8e5f0;
+  --hl: #fff4ce;
+  --ok: #107c10;
+  --bad: #a4262c;
+
+  /* Alerts (Note, Tip, Important, Caution, Warning), text colour doubles as border colour */
+  --note: #3b2e58;
+  --note-bg: #efd9fd;
+  --tip: #0e700e;
+  --tip-bg: #f1faf1;
+  --important: #115ea3;
+  --important-bg: #ebf3fc;
+  --caution: #b10e1c;
+  --caution-bg: #fdf3f4;
+  --warning: #8a3707;
+  --warning-bg: #fff9f5;
+
+  /* Code (Visual Studio light colors) */
+  --code-keyword: #0101fd;
+  --code-string: #a31515;
+  --code-comment: #008000;
+  --code-type: #006881;
+  --code-function: #161616;
+  --code-number: #161616;
+
+  --font-sans:
+    'Segoe UI', 'Segoe UI Variable Text', Selawik, -apple-system, BlinkMacSystemFont,
+    'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --font-mono: SFMono-Regular, Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+
+  /* The header scrolls away (two rows of 54px), sidebar and rail stick to the top. */
+  --header-height: 108px;
+  --sticky-top: 0px;
+  --sidebar-width: 275px;
+  --rail-width: 275px;
+  --text-width: 688px;
+  --content-max: 1600px;
+  --radius: 4px;
+  --radius-lg: 6px;
+  --shadow: 0 1.6px 3.6px 0 rgb(0 0 0 / 0.13), 0 0.3px 0.9px 0 rgb(0 0 0 / 0.11);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #1f1f1f;
+    --surface: #1f1f1f;
+    --surface-alt: #2b2b2b;
+    --ink: #ffffff;
+    --muted: #d2d2d2;
+    --line: #404040;
+    --line-strong: #505050;
+    --input-line: #e6e6e6;
+    --code-bg: #1f1f1f;
+    --code-head-bg: #333333;
+    --code-inline-bg: #404040;
+    --header-bg: #292929;
+    --footer-bg: #091f2c;
+    --toc-active: #333333;
+    --rail-active: #75b6e7;
+    --accent: #75b6e7;
+    --accent-hover: #a6cff0;
+    --accent-soft: #1a2633;
+    --on-accent: #1f1f1f;
+    --ref: #a08cff;
+    --ref-soft: #272144;
+    --stack: #3cc4b4;
+    --stack-soft: #12302d;
+    --heap: #e7a93b;
+    --heap-soft: #33270f;
+    --thread: #6ea8f2;
+    --thread-soft: #152842;
+    --jit: #ee82bf;
+    --jit-soft: #3a1a2d;
+    --hl: #2e2b12;
+    --ok: #6ccb5f;
+    --bad: #f1707b;
+    --note: #efd9fd;
+    --note-bg: #3b2e58;
+    --tip: #dff6dd;
+    --tip-bg: #054b16;
+    --important: #9ccbee;
+    --important-bg: #004173;
+    --caution: #fde7e9;
+    --caution-bg: #630001;
+    --warning: #fdcfb4;
+    --warning-bg: #4a1e04;
+    --code-keyword: #569cd6;
+    --code-string: #ce9178;
+    --code-comment: #63b456;
+    --code-type: #4ec9b0;
+    --code-function: #ffffff;
+    --code-number: #b5cea8;
+    --shadow: 0 1.6px 3.6px 0 rgb(0 0 0 / 0.4), 0 0.3px 0.9px 0 rgb(0 0 0 / 0.3);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  --bg: #1f1f1f;
+  --surface: #1f1f1f;
+  --surface-alt: #2b2b2b;
+  --ink: #ffffff;
+  --muted: #d2d2d2;
+  --line: #404040;
+  --line-strong: #505050;
+  --input-line: #e6e6e6;
+  --code-bg: #1f1f1f;
+  --code-head-bg: #333333;
+  --code-inline-bg: #404040;
+  --header-bg: #292929;
+  --footer-bg: #091f2c;
+  --toc-active: #333333;
+  --rail-active: #75b6e7;
+  --accent: #75b6e7;
+  --accent-hover: #a6cff0;
+  --accent-soft: #1a2633;
+  --on-accent: #1f1f1f;
+  --ref: #a08cff;
+  --ref-soft: #272144;
+  --stack: #3cc4b4;
+  --stack-soft: #12302d;
+  --heap: #e7a93b;
+  --heap-soft: #33270f;
+  --thread: #6ea8f2;
+  --thread-soft: #152842;
+  --jit: #ee82bf;
+  --jit-soft: #3a1a2d;
+  --hl: #2e2b12;
+  --ok: #6ccb5f;
+  --bad: #f1707b;
+  --note: #efd9fd;
+  --note-bg: #3b2e58;
+  --tip: #dff6dd;
+  --tip-bg: #054b16;
+  --important: #9ccbee;
+  --important-bg: #004173;
+  --caution: #fde7e9;
+  --caution-bg: #630001;
+  --warning: #fdcfb4;
+  --warning-bg: #4a1e04;
+  --code-keyword: #569cd6;
+  --code-string: #ce9178;
+  --code-comment: #63b456;
+  --code-type: #4ec9b0;
+  --code-function: #ffffff;
+  --code-number: #b5cea8;
+  --shadow: 0 1.6px 3.6px 0 rgb(0 0 0 / 0.4), 0 0.3px 0.9px 0 rgb(0 0 0 / 0.3);
+  color-scheme: dark;
+}
+
+/* Shiki css-variables theme → Visual Studio colors */
+:root {
+  --shiki-foreground: var(--ink);
+  --shiki-background: var(--code-bg);
+  --shiki-token-keyword: var(--code-keyword);
+  --shiki-token-comment: var(--code-comment);
+  --shiki-token-constant: var(--code-type);
+  --shiki-token-string: var(--code-string);
+  --shiki-token-string-expression: var(--code-string);
+  --shiki-token-function: var(--code-function);
+  --shiki-token-parameter: var(--ink);
+  --shiki-token-punctuation: var(--ink);
+  --shiki-token-link: var(--accent);
+}

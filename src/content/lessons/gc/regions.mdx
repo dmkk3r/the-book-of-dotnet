@@ -1,0 +1,300 @@
+---
+id: regions
+title: Segments und Regions
+summary: Wie der GC seinen Adressraum organisiert, warum wenige große Segmente an Grenzen stießen und wie viele kleine Regions seit .NET 7 Promotion, Fragmentierung und das Zurückgeben von Speicher verändern.
+status: draft
+dotnetVersion: '7+'
+sources:
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'GC-Konfigurationseinstellungen: Region range, Region size, Standalone GC (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector
+  - title: 'Maoni Stephens: Put a DPAD on that GC!'
+    url: https://devblogs.microsoft.com/dotnet/put-a-dpad-on-that-gc/
+  - title: 'Maoni Stephens: How segments and regions differ in decommitting memory in the .NET 7 GC'
+    url: https://itnext.io/how-segments-and-regions-differ-in-decommitting-memory-in-the-net-7-gc-68c58465ab5a
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'Planphase mit Regions in dotnet/runtime (plan_phase.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/plan_phase.cpp
+  - title: 'GC.GetConfigurationVariables (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.getconfigurationvariables
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './regions.steps';
+import segmentScript from './regions-segmente.steps';
+import lifecycleScript from './regions-lebenszyklus.steps';
+import { configCode } from './regions-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein Garbage Collector braucht Speicher, den er selbst verwaltet. Er holt ihn vom Betriebssystem in zwei Schritten: Zuerst **reserviert** er Adressraum, also einen Bereich virtueller Adressen, der für niemanden sonst vergeben wird. Dann **committed** er Teile davon. Erst committeter Speicher ist durch physischen Speicher oder die Auslagerungsdatei gedeckt und zählt zum Verbrauch des Prozesses. Umgekehrt gibt er Speicher zurück, indem er ihn **decommitted**.
+
+Die Frage ist, in welchen Einheiten er das tut. Bis .NET 6 lautete die Antwort: in **Segmenten**. Ein Segment ist laut Book of the Runtime ein zusammenhängender Speicherblock, den der GC vom Betriebssystem holt und von niedrigen zu hohen Adressen füllt. Segmente waren groß, bei Server GC auf 64-Bit ein bis mehrere Gigabyte, bei Workstation GC einige hundert Megabyte. Jeder Heap hatte genau ein **ephemeres Segment**, an dessen Ende Gen0 und Gen1 lagen, dazu beliebig viele weitere Segmente mit Gen2-Objekten und eigene Segmente für den Large Object Heap.
+
+{/* TODO(verify): Segment sizes (Server GC 64-bit 1, 2 or 4 GB depending on heap count; Workstation 256 MB) per Maoni Stephens, "Put a DPAD on that GC!". */}
+
+Das funktionierte viele Jahre gut, stieß aber an Grenzen, als .NET in immer unterschiedlicheren Umgebungen lief, von kleinen Containern bis zu Servern mit hunderten Gigabyte:
+
+- **Speicher zurückgeben war grob.** Ein Segment konnte nur den Bereich hinter seinem letzten lebenden Objekt decommitten. Eine große Lücke mitten im Segment blieb committed, solange irgendwo dahinter noch ein Objekt lebte.
+- **Freier Platz war an seine Generation gebunden.** Eine Lücke in einem Gen2-Segment half Gen0 nicht, denn kleine Allokationen fanden nur im ephemeren Segment statt.
+- **Fixierte Objekte blockierten ganze Bereiche.** Ein gepinntes Objekt im ephemeren Segment ließ sich nicht verschieben. Der Bereich um es herum blieb belegt und wurde oft mitsamt Lücken zu Gen2.
+- **Wachstum ging in großen Sprüngen.** Brauchte Gen2 oder der LOH mehr Platz, kam gleich ein ganzes neues Segment hinzu.
+
+Der Zielkonflikt: Große Einheiten sind einfach zu verwalten und brauchen wenig Buchführung. Kleine Einheiten machen den GC beweglich, kosten aber mehr Verwaltung.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Seit .NET 7 organisiert der GC auf 64-Bit-Systemen den Heap standardmäßig in **Regions**. Fünf Sätze tragen den Rest der Lektion:
+
+1. **Der Heap besteht aus vielen gleich großen Regions.** Statt weniger Segmente gibt es viele kleine Blöcke, standardmäßig 4 MB für normale Objekte. LOH und POH bekommen größere Regions, achtmal so groß.
+2. **Jede Generation besitzt eine Liste von Regions.** Gen0, Gen1, Gen2, LOH und POH haben jeweils ihre eigenen. Es gibt kein ephemeres Segment mehr, in dem mehrere Generationen nebeneinander liegen.
+3. **Freie Regions kommen in eine gemeinsame Freiliste.** Jede Generation kann eine freie Region übernehmen, bei Server GC sogar ein anderer Heap.
+4. **Eine Region kann als Ganzes die Generation wechseln.** Statt jedes Objekt zu kopieren, kann der GC eine Region einfach der nächsten Generation zuschlagen (oder in Sonderfällen einer jüngeren).
+5. **Speicher geht pro Region zurück.** Eine leere Region kann decommitted werden, egal was in ihren Nachbarn liegt.
+
+Beim Start reserviert der GC dafür einen großen zusammenhängenden Adressbereich, aus dem er alle Regions schneidet. Microsoft Learn nennt als Standard 256 GB, auf Maschinen mit mehr physischem Speicher das Doppelte. Das ist reiner Adressraum, kein Speicherverbrauch.
+
+{/* TODO(verify): Defaults per Microsoft Learn runtime-config page: SOH region 4 MB, UOH regions 8x (32 MB), reserve range 256 GB or twice physical memory if larger; regions on 64-bit Windows and Linux (macOS?). */}
+
+<Callout kind="fehlannahme">
+  „Seit .NET 7 reserviert mein Prozess 256 GB, er verbraucht also viel mehr Speicher.“ Nein.
+  Reservierter Adressraum ist nur ein Versprechen an dich selbst, dass diese Adressen frei bleiben.
+  Er kostet keinen physischen Speicher. Was zählt, ist der committete Speicher, und der wächst Region
+  für Region nur so weit, wie der Heap ihn braucht.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel zeigt zwei Gen0-Collections mit Regions. Achte in Schritt 4 darauf, was mit den leeren Gen0-Regions passiert, und in Schritt 6 darauf, dass eine Region ihre Generation wechselt, ohne dass ein einziges Objekt bewegt wird.
+
+<StepPlayer script={script} />
+
+Ob der GC kompaktiert oder nur freigibt, entscheidet er in der Planphase anhand dessen, wie viel Platz er gewinnen würde (siehe „Mark, Plan, Relocate, Compact“). Mit Segmenten hieß Freigeben ohne Kompaktieren, die Grenze zwischen den Generationen innerhalb des ephemeren Segments zu verschieben. Mit Regions wechselt dagegen die ganze Region die Liste. In beiden Fällen bleibt jedes Objekt an seiner Adresse, aber mit Regions ist die Generation sauber an eine Region gebunden.
+
+{/* TODO(verify): That a non-compacting (sweeping) ephemeral GC promotes all condemned regions as a whole (find_first_valid_region in plan_phase.cpp), and the conditions under which the plan phase chooses to sweep. */}
+
+</Block>
+
+<Block n={4} title="Wie Segmente funktionierten">
+
+Regions verstehst du am besten im Vergleich. Die folgende Visualisierung zeigt einen Heap mit Segmenten: ein Gen2-Segment, das ephemere Segment mit seinem Gen2-Anteil, Gen1 und Gen0 am Ende, und ein LOH-Segment.
+
+<StepPlayer script={segmentScript} />
+
+Zwei Eigenschaften stechen heraus. Erstens kann ein Segment nur vom Ende her schrumpfen. Laut Maoni Stephens decommitted der GC bei Segmenten nur den Teil hinter dem letzten lebenden Objekt. Eine Lücke in der Mitte zurückzugeben, hätte zusätzliche Buchführung verlangt, und die führt, wie sie schreibt, letztlich ohnehin zur Idee der Regions.
+
+Zweitens war das ephemere Segment ein Sonderfall, um den sich viel Logik drehte. Lief es voll, musste der GC entweder mehr Gen1-Collections machen, um Platz zu schaffen, oder ein neues ephemeres Segment besorgen. Das Book of the Runtime beschreibt beides: aggressivere ephemere Collections, um kein neues Segment zu brauchen, und Segmente ohne lebende Objekte, die wiederverwendet werden und zum neuen ephemeren Segment werden. Das alte ephemere Segment wurde dabei zu einem Gen2-Segment, samt allem, was darin lag.
+
+{/* TODO(verify): That on ephemeral segment expansion the old ephemeral segment's contents become gen2 (expand_heap in plan_phase.cpp, should_promote_ephemeral / demotion of a reused segment). */}
+
+Für den Alltag hieß das: Ein Dienst, der kurzzeitig viel Speicher brauchte, behielt danach oft deutlich mehr committed, als er noch nutzte. Hohe Fragmentierung in Gen2 ließ sich nur durch kompaktierende volle Collections beseitigen, und die sind teuer.
+
+</Block>
+
+<Block n={5} title="Regions im Detail">
+
+### Promotion mit Regions
+
+Mit Segmenten war Promotion an die Lage im ephemeren Segment gekoppelt: Gen1 lag vor Gen0, Gen2 davor. Eine Region dagegen trägt ihre Generation als Eigenschaft. Der GC kann in der Planphase für jede Region festlegen, in welcher Generation sie nach der Collection liegen soll. Maoni Stephens nennt das **DPAD**, „Dynamic Promotion And Demotion“: Eine Region kann nach oben oder nach unten wandern.
+
+Im Normalfall heißt das: Überlebt in einer Region viel, lohnt sich Kopieren nicht, und die Region wird als Ganzes promotet. Überlebt wenig, kopiert der GC die Überlebenden in eine Region der nächsten Generation, und die leere Region geht zurück in die Freiliste. Daneben gibt es Sonderfälle:
+
+- **Gepinnte Objekte.** Eine Gen0-Region, in der nur gepinnte Objekte überleben, muss nicht in Gen1 landen. Der GC kann sie in Gen0 lassen (Demotion), statt den ganzen Bereich mitsamt Lücken aufzuwerten. Mehr dazu in der Lektion „Pinning und Fragmentierung“.
+- **Regions mit sehr hoher Überlebensrate.** Der Quellcode kennt einen Modus „Sweep in Plan“, in dem eine Region schon in der Planphase nur freigegeben und direkt einer Zielgeneration zugeordnet wird, unter Umständen sogar Gen2. Dieser Modus ist standardmäßig aber ausgeschaltet.
+
+{/* TODO(verify): Sweep in plan (SIP): enable_special_regions_p defaults to false, enabled via GCEnableSpecialRegions; thresholds sip_surv_ratio_th = 90 % in gcinternal.h. Demotion of gen0/gen1 regions with only pinned survivors (decide_on_demotion_pin_surv in plan_phase.cpp). */}
+
+### Freigeben und Kompaktieren pro Region
+
+Freigeben (Sweep) und Kompaktieren sind auch mit Regions die beiden Möglichkeiten, eine Collection abzuschließen. Neu ist, dass leere Regions bei beiden sofort vollständig frei werden. Eine Region, in der nichts überlebt hat, wandert als Ganzes in die Freiliste. Lücken innerhalb einer Region, die nicht leer ist, kommen wie früher in die Freiliste der Generation und werden für Promotion oder Allokation wiederverwendet.
+
+Beim Kompaktieren muss der GC außerdem nicht mehr alles in einen einzigen zusammenhängenden Bereich schieben. Er kann die Überlebenden in beliebige Regions der Zielgeneration verdichten. Das macht vor allem Kompaktieren in Gen2 und im LOH flexibler.
+
+### Wie Speicher zurückgeht
+
+Freie Regions werden nicht sofort decommitted. Eine leere Region in die Freiliste zu legen, ist billig, und die nächste Allokation braucht vielleicht gleich wieder eine. Der GC schätzt deshalb anhand der Budgets ab, wie viele freie Regions er demnächst braucht, behält diese committed und decommitted den Überschuss schrittweise.
+
+<StepPlayer script={lifecycleScript} />
+
+{/* TODO(verify): Decommit policy for regions: number of free regions kept based on budgets (distribute_free_regions), gradual decommit over time (DECOMMIT_SIZE_PER_MILLISECOND), aging of free regions. */}
+
+Der wichtige Unterschied zu Segmenten ist die Granularität. Ein Gen2, in dem nach einer vollen Collection die Hälfte der Regions leer ist, kann diese Hälfte zurückgeben, auch wenn hinter ihr noch lebende Regions liegen.
+
+### Reserve und Regionsgröße
+
+Alle Regions entstehen in dem großen Adressbereich, den der GC beim Start reserviert. Laut Microsoft Learn hängt seine Größe von der Konfiguration ab: ohne Limits 256 GB (oder das Doppelte des physischen Speichers, wenn der größer ist), mit einem Heap Hard Limit das Fünffache dieses Limits, mit Limits pro Objekt-Heap deren Summe. Begrenzt ist er außerdem durch ein eventuelles Limit für virtuellen Speicher, er nimmt höchstens die Hälfte davon.
+
+Den aktuellen Wert liefert `GC.GetConfigurationVariables()` unter dem Namen `GCRegionRange`. Ändern kannst du ihn mit `DOTNET_GCRegionRange` (seit .NET 7) oder `System.GC.RegionRange` in der runtimeconfig.json (seit .NET 10). Die Regionsgröße steuert entsprechend `GCRegionSize`. Microsoft Learn nennt zwei Fälle, in denen sich das lohnt: sehr kleine Heaps, bei denen 1 MB große Regions die Buchführung des GC verkleinern, und Linux-Systeme, bei denen größere Regions (etwa 32 MB) die Zahl der Speicherabbildungen senken.
+
+{/* TODO(verify): RegionRange/RegionSize config names and versions (env var .NET 7, runtimeconfig .NET 10) per Microsoft Learn; whether GetConfigurationVariables reports GCRegionSize too. */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Anderer Speicherverbrauch nach dem Upgrade
+
+Wer von .NET 6 auf .NET 7 oder neuer umsteigt, sieht oft andere Speicherzahlen. Mehrere Effekte überlagern sich. Die virtuelle Größe des Prozesses springt wegen der großen Reservierung stark nach oben, was harmlos ist, aber Überwachungswerkzeuge irritieren kann, die virtuellen Speicher messen. Der committete Speicher kann leicht steigen, weil jede Generation mindestens eine Region besitzt und der GC freie Regions eine Weile vorhält. Er kann aber auch sinken, weil leere Bereiche mitten im Heap jetzt zurückgegeben werden können.
+
+Bei sehr kleinen Heaps fällt die Mindestgröße stärker ins Gewicht: Fünf Objekt-Heaps mit je mindestens einer Region, bei Server GC multipliziert mit der Zahl der Heaps, ergeben schnell einige zehn Megabyte, auch wenn kaum Objekte leben. Microsoft Learn empfiehlt für solche Prozesse kleinere Regions.
+
+{/* TODO(verify): Minimum committed footprint with regions (at least one region per generation per heap; whether the full 4 MB is committed or only the used part plus commit granularity). */}
+
+### Der Prozess startet nicht mehr
+
+Ein Fall ist selten, aber verwirrend: Ist für den Prozess ein Limit für virtuellen Speicher gesetzt (etwa mit `ulimit -v` unter Linux), kann schon die Reservierung beim Start scheitern. Der Prozess bricht dann in der GC-Initialisierung mit „Out of Memory“ ab, obwohl kaum Speicher benutzt wird. Microsoft Learn beschreibt genau diesen Fall und empfiehlt, `GCRegionRange` auf das Zwei- bis Fünffache des tatsächlich committeten Heaps zu setzen. Zu klein darf es auch nicht werden, sonst muss der GC häufiger kompaktierende volle Collections machen, um Platz für große Regions zu schaffen.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Beobachten
+
+- **Committed statt virtuell.** Für den Speicherverbrauch zählt der committete Speicher. `GC.GetGCMemoryInfo().TotalCommittedBytes` liefert ihn für den GC-Heap, `dotnet-counters` zeigt ihn als eigenen Zähler.
+- **Heapgröße und Fragmentierung.** `GC.GetGCMemoryInfo()` liefert auch die Heapgröße und die fragmentierten Bytes, aufgeschlüsselt pro Generation in `GenerationInfo`.
+- **GC-Ereignisse.** Ein Trace mit GC-Ereignissen zeigt für jede Collection, ob sie kompaktiert oder freigegeben hat, und wie groß die Generationen davor und danach waren. Wie du solche Traces aufzeichnest, steht in der Lektion „dotnet-counters, -trace, -dump, -gcdump“, die Auswertung in „PerfView“.
+
+{/* TODO(verify): dotnet-counters counter for GC committed bytes (gc-committed in .NET 6+ EventCounters, dotnet.gc.last_collection.memory.committed_size in .NET 9+ meters). */}
+
+### Was sich wann lohnt
+
+| Situation                                  | Was du siehst                             | Warum                                           | Was hilft                                     |
+| ------------------------------------------ | ----------------------------------------- | ----------------------------------------------- | --------------------------------------------- |
+| Virtuelle Größe ab .NET 7 viel höher       | Hunderte GB „Virtual“ im Taskmanager      | Reservierung für alle Regions                   | Nichts, auf committed achten                  |
+| Sehr kleiner Dienst, viel Overhead         | Committed deutlich über der Heapgröße     | Mindestens eine Region pro Generation und Heap  | `GCRegionSize` verkleinern, Workstation GC    |
+| Start scheitert mit OOM                    | Abbruch in der GC-Initialisierung         | Reservierung über dem Limit für virtuellen Speicher | `GCRegionRange` setzen                    |
+| Linux mit zu vielen Speicherabbildungen    | Fehler wegen `vm.max_map_count`           | Viele kleine Regions                            | `GCRegionSize` vergrößern                     |
+| Speicher sinkt nach Lastspitze langsam     | Committed fällt erst nach einiger Zeit    | Freie Regions werden schrittweise decommitted   | Meist erwünscht, sonst `GCConserveMemory`     |
+
+Die meisten Anwendungen brauchen keine dieser Einstellungen. Microsoft Learn sagt es ausdrücklich: Regions werden nur bei Bedarf angelegt, die Regionsgröße muss dich im Allgemeinen nicht kümmern. Einen Überblick über alle Stellschrauben gibt die Lektion „GC-Konfiguration und Container“.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Regions sind eine reine Angelegenheit des GC. Der JIT und dein Code merken davon fast nichts, mit einer Ausnahme: Die Write Barrier muss bei jeder Verweis-Zuweisung entscheiden, ob ein Verweis von alt nach jung zeigt. Mit Segmenten reichte dafür ein Vergleich mit den Grenzen des ephemeren Bereichs. Mit Regions sind junge Objekte über den ganzen Adressbereich verteilt, deshalb nutzt die Barrier eine Tabelle, die pro Region die Generation festhält. Details in der Lektion „Write Barriers und Card Tables“.
+
+{/* TODO(verify): Region-aware write barrier variants (WriteBarrier_Byte_Region / WriteBarrier_Bit_Region, region_to_generation_table) and that .NET 7+ uses them by default. */}
+
+<Callout kind="version">
+  Regions sind seit .NET 7 der Standard für 64-Bit-Prozesse unter Windows und Linux. 32-Bit-Prozesse
+  verwenden weiterhin Segmente, weil ihr Adressraum für eine große Reservierung zu klein ist. Wer zu
+  Segmenten zurück will, kann einen eigenständigen GC laden, der noch Segmente verwendet: in .NET 7
+  und 8 mit `DOTNET_GCName=clrgc.dll` (unter Linux `libclrgc.so`).
+</Callout>
+
+{/* TODO(verify): Which standalone GC library ships with segments in .NET 7, 8, 9, 10 (clrgc.dll = segments, clrgcexp.dll = regions?), whether it is still shipped in .NET 9+, regions on macOS, and that 32-bit always uses segments. System.GC.Name / DOTNET_GCName per Microsoft Learn; .NET 9 also has System.GC.Path. */}
+
+Der Wechsel auf Regions war über mehrere Versionen vorbereitet. Maoni Stephens beschreibt in „Put a DPAD on that GC!“ den Stand während .NET 6, als Regions noch als experimentelle Variante über eine Konfiguration zuschaltbar sein sollten. Seit .NET 7 ist es umgekehrt: Regions sind der Standard, Segmente die Ausnahme.
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das Experiment liest die Konfiguration des GC aus und misst committeten Speicher und Heapgröße vor und nach einer vollen Collection, die viel Müll einsammelt.
+
+{/* TODO(verify): Expected output on x64 Linux/Windows, Workstation GC, .NET 8+: GCRegionRange = 274877906944 (256 GB) on machines with up to 256 GB RAM, GCRegionSize = 4194304; committed after GC may drop only after some time due to gradual decommit. */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus auf einem 64-Bit-System ausführen (dotnet run -c Release). Erwartet: Ein Eintrag GCRegionRange mit einigen hundert Gigabyte (in Byte). Nach der Collection ist die Heapgröße deutlich kleiner, der committete Speicher sinkt dagegen oft weniger stark oder erst später, weil freie Regions eine Weile vorgehalten werden. Starte das Programm danach mit der Umgebungsvariable DOTNET_GCRegionSize=100000 (hexadezimal, also 1 MB) und vergleiche."
+  code={configCode}
+/>
+
+Für einen laufenden Dienst vergleichst du in `dotnet-counters` die Heapgröße mit dem committeten Speicher des GC. Klafft zwischen beiden dauerhaft eine große Lücke, liegt das entweder an Fragmentierung innerhalb von Regions oder an vorgehaltenen freien Regions. Ein Trace mit GC-Ereignissen zeigt, welches von beiden.
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="regions"
+  questions={[
+    {
+      q: 'Ein Prozess unter .NET 8 zeigt hunderte Gigabyte virtuellen Speicher. Was bedeutet das?',
+      options: [
+        'Ein Speicherleck im GC',
+        'Der GC hat Adressraum für seine Regions reserviert, das kostet keinen physischen Speicher',
+        'Der Heap ist so groß',
+      ],
+      correct: 1,
+      explanation:
+        'Beim Start reserviert der GC einen großen Adressbereich für alle Regions. Relevant für den Verbrauch ist nur der committete Teil.',
+    },
+    {
+      q: 'Warum konnte ein Segment eine große Lücke in seiner Mitte nicht an das Betriebssystem zurückgeben?',
+      options: [
+        'Weil Segmente nur hinter dem letzten lebenden Objekt decommitten',
+        'Weil das Betriebssystem keine Teile eines Blocks zurücknimmt',
+        'Weil Lücken immer sofort von Gen0 belegt werden',
+      ],
+      correct: 0,
+      explanation:
+        'Mit Segmenten wurde nur das Ende hinter dem letzten lebenden Objekt decommitted. Regions lösen das, indem jede leere Region einzeln zurückgehen kann.',
+    },
+    {
+      q: 'Eine Gen0-Region ist nach einer Collection fast voll mit Überlebenden, und der GC gibt nur frei. Was passiert?',
+      options: [
+        'Alle Überlebenden werden in eine Gen1-Region kopiert',
+        'Die Region wird als Ganzes Gen1, kein Objekt bewegt sich',
+        'Die Region bleibt Gen0',
+      ],
+      correct: 1,
+      explanation:
+        'Mit Regions trägt die Region ihre Generation. Beim Freigeben ohne Kompaktieren wechselt sie als Ganzes in die Liste der nächsten Generation.',
+    },
+    {
+      q: 'Eine leere Gen2-Region kommt in die Freiliste. Wer kann sie danach verwenden?',
+      options: [
+        'Nur wieder Gen2',
+        'Jede Generation, bei Server GC auch ein anderer Heap',
+        'Niemand, sie wird sofort decommitted',
+      ],
+      correct: 1,
+      explanation:
+        'Freie Regions sind nicht an eine Generation gebunden. Sie bleiben zunächst committed und werden bei Bedarf von beliebigen Generationen übernommen.',
+    },
+    {
+      q: 'Ein Container-Prozess mit gesetztem Limit für virtuellen Speicher bricht beim Start mit Out of Memory ab. Welche Einstellung ist die erste Wahl?',
+      options: ['GCRegionRange verkleinern', 'GCgen0size erhöhen', 'Server GC aktivieren'],
+      correct: 0,
+      explanation:
+        'Die Reservierung für die Regions kann am Limit scheitern. Microsoft Learn empfiehlt, GCRegionRange auf das Zwei- bis Fünffache des committeten Heaps zu setzen.',
+    },
+    {
+      q: 'Ändert sich mit Regions das Modell der drei Generationen?',
+      options: [
+        'Ja, es gibt jetzt eine Generation pro Region',
+        'Nein, nur die physische Organisation und die Art der Promotion ändern sich',
+        'Ja, Gen1 entfällt',
+      ],
+      correct: 1,
+      explanation:
+        'Gen0, Gen1, Gen2, LOH und POH bleiben. Regions ändern, wie die Generationen im Adressraum liegen, wie Promotion technisch abläuft und wie Speicher zurückgegeben wird.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Der GC **reserviert** Adressraum und **committed** nur, was er braucht. Für den Speicherverbrauch zählt committed.
+- Bis .NET 6 bestand der Heap aus wenigen großen **Segmenten** mit einem ephemeren Segment für Gen0 und Gen1. Sie konnten nur vom Ende her schrumpfen.
+- Seit .NET 7 nutzt der GC auf 64-Bit **Regions**: viele gleich große Blöcke (standardmäßig 4 MB, für LOH und POH größer), jede Generation besitzt eine Liste davon.
+- Leere Regions kommen in eine **gemeinsame Freiliste** und können von jeder Generation übernommen oder einzeln decommitted werden.
+- Eine Region kann **als Ganzes promotet oder demotet** werden. Promotion heißt nicht mehr zwingend Kopieren.
+- Nach dem Upgrade ändern sich die Speicherzahlen: hohe virtuelle Größe ist harmlos, bei Problemen helfen `GCRegionRange` und `GCRegionSize`.
+- Am Modell der Generationen ändert sich nichts. Es ändert sich, wie sie im Speicher liegen.
+
+</Block>

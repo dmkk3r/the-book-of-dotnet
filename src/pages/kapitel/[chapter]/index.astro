@@ -1,0 +1,147 @@
+---
+import Icon from '@/components/Icon.astro';
+import type { GetStaticPaths } from 'astro';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Breadcrumbs from '@/components/layout/Breadcrumbs.astro';
+import ProgressBar from '@/components/layout/ProgressBar.astro';
+import {
+  curriculum,
+  lessonsOf,
+  chapterPath,
+  lessonPath,
+  TIER_LABELS,
+  type Chapter,
+} from '@/lib/curriculum';
+import { getReadyIds } from '@/lib/lessons';
+import { withBase } from '@/lib/paths';
+
+export const getStaticPaths = (() =>
+  curriculum.chapters.map((chapter) => ({
+    params: { chapter: chapter.id },
+    props: { chapter },
+  }))) satisfies GetStaticPaths;
+
+interface Props {
+  chapter: Chapter;
+}
+
+const { chapter } = Astro.props;
+const lessons = lessonsOf(chapter);
+const ready = await getReadyIds();
+const prev = curriculum.chapters[chapter.number - 2];
+const next = curriculum.chapters[chapter.number];
+---
+
+<BaseLayout title={chapter.title} description={chapter.summary} currentChapter={chapter.id}>
+  <Breadcrumbs
+    items={[{ label: 'Übersicht', href: withBase('') }, { label: `Kapitel ${chapter.number}` }]}
+  />
+  <h1 data-pagefind-body data-pagefind-meta="title">
+    {chapter.title}
+  </h1>
+  <p class="lead" data-pagefind-body>
+    {chapter.summary}
+  </p>
+  <div class="meta" data-progress-chapter={chapter.id}>
+    <span class="tier">{TIER_LABELS[chapter.tier]}</span>
+    <ProgressBar total={lessons.length} />
+  </div>
+
+  <h2 class="list-title">Lektionen in diesem Kapitel</h2>
+  <ol class="lessons" data-pagefind-body>
+    {lessons.map((lesson, i) => (
+      <li>
+        <span class="n" data-pagefind-ignore>
+          {i + 1}
+        </span>
+        <a
+          href={withBase(lessonPath(chapter.id, lesson.id))}
+          data-lesson={lesson.id}
+          data-state={ready.has(lesson.id) ? 'ready' : 'todo'}
+        >
+          {lesson.title}
+        </a>
+        <span class="status" data-pagefind-ignore>
+          {ready.has(lesson.id) ? '' : 'in Vorbereitung'}
+          <span class="done">
+            <Icon name="check" /> erledigt
+          </span>
+        </span>
+        <span class="sr-only" data-done-label data-pagefind-ignore />
+      </li>
+    ))}
+  </ol>
+
+  <div class="page-end">
+    <nav aria-label="Vorheriges und nächstes Kapitel">
+      {prev ? (
+        <a class="pn" rel="prev" href={withBase(chapterPath(prev.id))}>
+          <span class="pn-label">Kapitel {prev.number}</span>
+          <span class="pn-title">{prev.title}</span>
+        </a>
+      ) : (
+        <span />
+      )}
+      {next && (
+        <a class="pn next" rel="next" href={withBase(chapterPath(next.id))}>
+          <span class="pn-label">Kapitel {next.number}</span>
+          <span class="pn-title">{next.title}</span>
+        </a>
+      )}
+    </nav>
+  </div>
+</BaseLayout>
+
+<style>
+  .meta {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    margin: 0 0 32px;
+  }
+  .list-title {
+    font-size: 1.5rem;
+  }
+  .lessons {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border-top: 1px solid var(--line);
+  }
+  .lessons li {
+    display: grid;
+    grid-template-columns: 2.5ch minmax(0, 1fr) auto;
+    gap: 12px;
+    align-items: baseline;
+    padding: 10px 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  .n {
+    color: var(--muted);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .lessons a {
+    font-weight: 600;
+  }
+  .lessons a[data-state='todo'] {
+    color: var(--ink);
+    font-weight: 400;
+  }
+  .status {
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .status .done {
+    display: none;
+    color: var(--ok);
+    font-weight: 600;
+  }
+  li:has(a[data-done='true']) .status {
+    font-size: 0;
+  }
+  li:has(a[data-done='true']) .status .done {
+    display: inline;
+    font-size: 13px;
+  }
+</style>

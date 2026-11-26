@@ -1,0 +1,254 @@
+---
+import Icon from '@/components/Icon.astro';
+import { curriculum, lessonsOf, lessonPath } from '@/lib/curriculum';
+import { getReadyIds } from '@/lib/lessons';
+import { withBase } from '@/lib/paths';
+
+interface Props {
+  currentChapter?: string;
+  currentLesson?: string;
+}
+
+const { currentChapter, currentLesson } = Astro.props;
+const ready = await getReadyIds();
+---
+
+<nav class="toc" id="side" aria-label="Inhaltsverzeichnis">
+  <div class="toc-top">
+    <button
+      type="button"
+      class="toc-collapse"
+      data-side-collapse
+      aria-label="Inhaltsverzeichnis einklappen"
+      title="Inhaltsverzeichnis einklappen"
+      hidden
+    >
+      <Icon name="collapse" />
+    </button>
+  </div>
+  <div class="toc-filter" data-toc-filter hidden>
+    <Icon name="filter" class="toc-filter-icon" />
+    <input
+      type="search"
+      placeholder="Nach Titel filtern"
+      aria-label="Inhaltsverzeichnis nach Titel filtern"
+      autocomplete="off"
+    />
+    <p class="toc-empty" data-toc-empty hidden>
+      Keine Treffer.
+    </p>
+  </div>
+  <ul class="toc-tree">
+    {[
+      ['Übersicht', ''],
+      ['Glossar', 'glossar/'],
+      ['Fortschritt', 'fortschritt/'],
+    ].map(([label, path]) => (
+      <li>
+        <a
+          class="toc-link"
+          href={withBase(path!)}
+          aria-current={
+            !currentChapter && Astro.url.pathname === withBase(path!) ? 'page' : undefined
+          }
+        >
+          {label}
+        </a>
+      </li>
+    ))}
+    {curriculum.chapters.map((chapter) => {
+      const lessons = lessonsOf(chapter);
+      return (
+        <li data-toc-chapter>
+          <details open={chapter.id === currentChapter} data-progress-chapter={chapter.id}>
+            <summary>
+              <span class="chevron" aria-hidden="true">
+                <Icon name="chevron-right" />
+              </span>
+              <span class="toc-chapter-title" data-toc-title>
+                {chapter.number}. {chapter.title}
+              </span>
+              <span class="toc-count">
+                <span data-progress-count>0</span>/{lessons.length}
+                <span class="sr-only"> erledigt</span>
+              </span>
+            </summary>
+            <ul>
+              {lessons.map((lesson) => (
+                <li data-toc-item>
+                  <a
+                    class="toc-link"
+                    href={withBase(lessonPath(chapter.id, lesson.id))}
+                    data-lesson={lesson.id}
+                    data-state={ready.has(lesson.id) ? 'ready' : 'todo'}
+                    aria-current={lesson.id === currentLesson ? 'page' : undefined}
+                  >
+                    <span data-toc-title>{lesson.title}</span>
+                    <span class="toc-done" aria-hidden="true">
+                      <Icon name="check" />
+                    </span>
+                    <span class="sr-only" data-done-label />
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </details>
+        </li>
+      );
+    })}
+  </ul>
+</nav>
+
+<style>
+  .toc {
+    padding: 0 24px 32px;
+    font-size: 14px;
+    line-height: 24.5px;
+  }
+  .toc-top {
+    display: flex;
+    justify-content: flex-end;
+    min-height: 24px;
+    padding-top: 12px;
+  }
+  .toc-collapse {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    margin-right: -6px;
+    border: 0;
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--ink);
+  }
+  .toc-collapse :global(.icon) {
+    width: 20px;
+    height: 20px;
+  }
+  .toc-collapse:hover {
+    background: var(--surface-alt);
+  }
+  .toc-filter {
+    position: relative;
+    margin: 8px 0 12px;
+  }
+  .toc-filter :global(.toc-filter-icon) {
+    position: absolute;
+    left: 10px;
+    top: 7.5px;
+    width: 16px;
+    height: 16px;
+    color: var(--muted);
+    pointer-events: none;
+  }
+  .toc-filter input {
+    width: 100%;
+    height: 31px;
+    padding: 4px 9px 4px 32px;
+    border: 1px solid var(--line-strong);
+    border-bottom-color: var(--input-line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    font-size: 14px;
+  }
+  .toc-filter input:focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 1px;
+  }
+  .toc-empty {
+    margin: 8px 0 0;
+    color: var(--muted);
+  }
+  .toc-tree,
+  .toc-tree ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .toc-tree ul {
+    padding-left: 16px;
+  }
+  .toc-tree li {
+    margin-top: 4px;
+  }
+  .toc-link {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 4px 8px 4px 16px;
+    border-radius: var(--radius);
+    color: var(--ink);
+  }
+  .toc-link:hover {
+    color: var(--ink);
+    text-decoration: underline;
+  }
+  .toc-link[aria-current='page'] {
+    font-weight: 600;
+    background: var(--toc-active);
+  }
+  .toc-link[data-state='todo'] {
+    color: var(--muted);
+  }
+  .toc-done {
+    display: none;
+    margin-left: auto;
+    color: var(--ok);
+    font-weight: 600;
+  }
+  .toc-link[data-done='true'] .toc-done {
+    display: inline;
+  }
+  summary {
+    display: flex;
+    align-items: baseline;
+    gap: 0;
+    padding: 4px 8px 4px 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+    list-style: none;
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+  summary:hover .toc-chapter-title {
+    text-decoration: underline;
+  }
+  .chevron {
+    flex: none;
+    width: 16px;
+    font-size: 12px;
+  }
+  .chevron :global(.icon) {
+    vertical-align: -0.05em;
+    transition: transform 0.15s;
+  }
+  details[open] > summary .chevron :global(.icon) {
+    transform: rotate(90deg);
+  }
+  .toc-count {
+    margin-left: auto;
+    padding-left: 8px;
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  /* Collapsed (button above): only the expand button remains visible. Desktop only. */
+  @media (min-width: 1025px) {
+    :global(html.side-collapsed) .toc > :not(.toc-top) {
+      display: none;
+    }
+    :global(html.side-collapsed) .toc {
+      padding: 0 10px;
+    }
+    :global(html.side-collapsed) .toc-collapse :global(.icon) {
+      transform: scaleX(-1);
+    }
+  }
+  @media (max-width: 1024px) {
+    .toc-collapse {
+      display: none;
+    }
+  }
+</style>

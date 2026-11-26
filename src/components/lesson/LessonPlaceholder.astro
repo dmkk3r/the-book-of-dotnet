@@ -1,0 +1,47 @@
+---
+import Callout from './Callout.astro';
+// Shown for curriculum lessons without an MDX file yet.
+const blocks = [
+  ['Konzept', 'Das mentale Modell in wenigen Absätzen, mit einer statischen Skizze.'],
+  [
+    'Durchspielen',
+    'Ein kurzes Codebeispiel, Schritt für Schritt, mit Live-Ansicht von Stack, Heap oder Threads.',
+  ],
+  ['Unter der Haube', 'Dasselbe Beispiel als IL, gelowerter C#-Code oder JIT-Assembler.'],
+  [
+    'Selbst nachweisen',
+    'Eine SharpLab-Anleitung und ein BenchmarkDotNet-Rezept mit erwartetem Ergebnis.',
+  ],
+  ['Prüfen', 'Zwei bis vier Fragen, die typische Fehlannahmen aufdecken.'],
+] as const;
+---
+
+<Callout kind="hinweis" title="In Vorbereitung">
+  Diese Lektion ist noch nicht ausgearbeitet. Sie wird diesem Aufbau folgen:
+</Callout>
+<ol class="outline">
+  {blocks.map(([title, text]) => (
+    <li>
+      <b>{title}</b>
+      <span>{text}</span>
+    </li>
+  ))}
+</ol>
+
+<style>
+  .outline {
+    max-width: 80ch;
+    margin: 16px 0 0;
+    padding-left: 24px;
+  }
+  .outline li {
+    margin-bottom: 12px;
+  }
+  .outline b {
+    display: block;
+    font-weight: 600;
+  }
+  .outline span {
+    color: var(--muted);
+  }
+</style>

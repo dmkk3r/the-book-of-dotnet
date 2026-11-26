@@ -1,0 +1,248 @@
+---
+id: werttypen
+title: Wert- und Referenztypen
+summary: Was eine Variable eigentlich enthält, wo Werte und Objekte wirklich liegen und warum Zuweisung und Parameterübergabe bei struct und class so unterschiedlich wirken.
+status: draft
+sources:
+  - title: 'Werttypen (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/language-reference/builtin-types/value-types
+  - title: 'Verweistypen (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/language-reference/keywords/reference-types
+  - title: 'Auswählen zwischen Klasse und Struktur (Framework-Entwurfsrichtlinien, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/design-guidelines/choosing-between-class-and-struct
+  - title: 'Book of the Runtime: Type System Overview'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-system.md
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './werttypen.steps';
+import placementScript from './werttypen-placement.steps';
+import paramsScript from './werttypen-params.steps';
+
+<Block n={1} title="Das Problem">
+
+Stell dir vor, jede Zahl in deinem Programm wäre ein eigenes Objekt auf dem Heap. Ein `int` bräuchte dann einen Object Header, einen MethodTable-Zeiger und eine Allokation. Jede Rechnung müsste erst einem Verweis folgen, und der Garbage Collector müsste Milliarden winziger Objekte verwalten. Für kleine, häufig benutzte Werte wäre das absurd teuer.
+
+Umgekehrt brauchst du für viele Dinge genau diese Objekte. Ein Kunde, eine Bestellung, ein offener Datenstrom: Mehrere Programmteile sollen auf **dasselbe** Ding zugreifen und Änderungen gegenseitig sehen. Sie sollen polymorph sein, also über eine Basisklasse oder ein Interface angesprochen werden. Und sie sollen leben, solange jemand sie braucht, nicht nur so lange wie die Methode, die sie erzeugt hat.
+
+.NET löst diesen Zielkonflikt, indem es dir die Wahl lässt. **Werttypen** (`struct`, alle Zahlentypen, `bool`, `char`, `enum`) sind reine Daten ohne Identität. **Referenztypen** (`class`, `string`, Arrays, Delegates, Interfaces) sind Objekte mit Identität auf dem Heap. Fast jede Eigenart von C#, die mit Kopien, `null`, Gleichheit oder Performance zu tun hat, folgt aus diesem einen Unterschied.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Vier Sätze genügen:
+
+1. **Eine Variable eines Werttyps enthält den Wert selbst.** Eine Variable eines Referenztyps enthält einen Verweis, also im Kern eine Adresse, auf ein Objekt auf dem Heap.
+2. **Zuweisung und Parameterübergabe kopieren den Inhalt der Variablen.** Bei Werttypen ist das der ganze Wert, bei Referenztypen nur der Verweis. Das Objekt selbst wird nie kopiert.
+3. **Ein Werttyp liegt dort, wo er deklariert ist.** Als lokale Variable im Stack-Frame oder in einem Register, als Feld einer Klasse im Objekt auf dem Heap, als Element eines Arrays im Array.
+4. **Nur Referenzvariablen können `null` sein.** Ein Werttyp hat immer einen Wert, im Zweifel den Standardwert mit lauter Nullbits. `int?` ist ein eigener Werttyp mit zusätzlichem Flag.
+
+<Callout kind="fehlannahme">
+  „Werttypen liegen auf dem Stack, Referenztypen auf dem Heap.“ Nur der zweite Teil stimmt immer.
+  Der Unterschied ist nicht der Ort, sondern was eine Variable enthält: den Wert oder einen Verweis.
+  Wo ein Werttyp liegt, bestimmt sein Umfeld.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel stellt ein Struct und eine Klasse mit identischem Inhalt nebeneinander und behandelt beide gleich. Achte darauf, wie sich die Zuweisung `s2 = s1` von `c2 = c1` unterscheidet.
+
+<StepPlayer script={script} />
+
+Der Code sieht für beide Typen gleich aus, das Verhalten ist es nicht. Genau deshalb ist es so wichtig, bei jedem Typ zu wissen, auf welcher Seite er steht. Die IDE hilft dabei: Structs und Klassen haben in den meisten Farbschemata unterschiedliche Farben.
+
+</Block>
+
+<Block n={4} title="Wo Werttypen wirklich liegen">
+
+Satz 3 des Modells ist der, den die meisten unterschätzen. Ein Struct ist kein eigenständiges Objekt, sondern ein Stück Speicher, das in etwas anderes eingebettet wird. Das folgende Beispiel zeigt vier Umgebungen für dasselbe Struct.
+
+<StepPlayer script={placementScript} />
+
+Daraus ergeben sich zwei wichtige Folgen:
+
+- **Structs als Felder vergrößern das umgebende Objekt.** `Line` enthält zwei Punkte, also vier `int`-Felder, ohne ein einziges zusätzliches Objekt. Bei einer Klasse `PointC` wären es zwei Verweise und zwei weitere Objekte.
+- **Arrays von Structs sind dicht gepackt.** Für die CPU ist das ideal: Die Daten liegen hintereinander im Speicher und landen gemeinsam im Cache. Bei Arrays von Objekten muss für jedes Element erst einem Verweis an eine andere Stelle gefolgt werden.
+
+### Lokale Variablen und Register
+
+Auch „lokale Variable auf dem Stack“ ist eine Vereinfachung. Der JIT entscheidet selbst, wo er einen Wert hält. Kleine Werte, und oft auch die Felder kleiner Structs, landen in CPU-Registern und berühren den Stack nie. Für das Verständnis ist das Modell mit dem Stack-Frame trotzdem richtig: Der Wert gehört zur laufenden Methode und verschwindet mit ihr.
+
+{/* TODO(verify): Struct promotion (fields of local structs kept in registers) in current JIT versions. */}
+
+</Block>
+
+<Block n={5} title="Parameterübergabe im Detail">
+
+Was für die Zuweisung gilt, gilt genauso für Methodenaufrufe. Ein Parameter ist eine lokale Variable der aufgerufenen Methode, die mit einer Kopie des Arguments gefüllt wird. Bei einem Struct ist das eine Kopie des ganzen Werts, bei einer Klasse eine Kopie des Verweises.
+
+<StepPlayer script={paramsScript} />
+
+### ref, in und out
+
+Willst du, dass eine Methode die Variable des Aufrufers selbst verändert, übergibst du sie mit `ref`. Dann wird nicht der Inhalt kopiert, sondern ein Verweis auf die Variable übergeben, ein sogenannter verwalteter Zeiger:
+
+```csharp
+static void Reset(ref PointS s) => s.X = 0;      // ändert die Variable des Aufrufers
+static void Replace(ref PointC k) => k = new PointC(); // ersetzt das Objekt beim Aufrufer
+
+var p = new PointS { X = 1 };
+Reset(ref p);                                    // p.X ist jetzt 0
+```
+
+`out` funktioniert ebenso, verlangt aber, dass die Methode einen Wert zuweist. `in` übergibt ein Struct per Verweis, verbietet aber Änderungen. Das lohnt sich bei großen Structs, deren Kopie teuer wäre.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Structs in Listen ändern
+
+```csharp
+var arr = new PointS[1];
+arr[0].X = 5;              // funktioniert: das Element wird direkt geändert
+
+var list = new List<PointS> { new() };
+list[0].X = 5;             // Compilerfehler CS1612
+```
+
+Der Unterschied liegt im Zugriff. Ein Array-Element ist eine echte Speicherstelle, `arr[0].X = 5` schreibt direkt hinein. Der Indexer von `List<T>` dagegen ist eine Methode, die eine **Kopie** des Elements zurückgibt. Eine Änderung an dieser Kopie wäre sofort verloren, deshalb verbietet der Compiler sie. Du musst das Element lesen, ändern und zurückschreiben.
+
+### Gleichheit
+
+`==` und `Equals` bedeuten bei den beiden Typarten Verschiedenes. Bei Klassen vergleicht `==` standardmäßig die Verweise, also die Identität: Zwei Objekte mit gleichem Inhalt sind nicht gleich. Bei Structs vergleicht `Equals` standardmäßig den Inhalt, allerdings über eine allgemeine Implementierung in `ValueType`, die langsam sein kann. Wer Structs vergleicht, sollte `IEquatable<T>` implementieren oder gleich ein `record struct` verwenden, das diese Methoden erzeugt.
+
+### Große Structs
+
+Weil jede Zuweisung und jeder Aufruf das ganze Struct kopiert, werden große Structs schnell teurer als Klassen. Die Entwurfsrichtlinien von Microsoft nennen als Faustregel Instanzen unter 16 Byte. Das ist kein hartes Limit, aber ein guter Hinweis, ab wann man genauer hinsehen sollte.
+
+</Block>
+
+<Block n={7} title="In der Praxis: struct oder class?">
+
+| Eigenschaft                 | struct                       | class                                     |
+| --------------------------- | ---------------------------- | ----------------------------------------- |
+| Variable enthält            | den Wert                     | einen Verweis                             |
+| Zuweisung, Parameter        | kopiert den Wert             | kopiert den Verweis                       |
+| Allokation                  | keine eigene, eingebettet    | eigenes Objekt auf dem Heap               |
+| Kosten pro Instanz          | nur die Felder               | Felder plus Header und MethodTable-Zeiger |
+| `null` möglich              | nein (nur mit `Nullable<T>`) | ja                                        |
+| Identität                   | keine                        | ja, `ReferenceEquals`                     |
+| Vererbung                   | nein, nur Interfaces         | ja                                        |
+| Als `object` oder Interface | wird geboxt                  | direkt                                    |
+
+Ein Struct passt gut, wenn ein Typ einen kleinen Wert darstellt, logisch unveränderlich ist und selten als `object` oder Interface benutzt wird: Koordinaten, Geldbeträge, Zeitspannen, Schlüssel aus mehreren Teilen. Eine Klasse passt, sobald Identität, Vererbung, gemeinsamer veränderlicher Zustand oder größere Datenmengen im Spiel sind. Im Zweifel ist eine Klasse die sichere Wahl. Wie sich das Boxing von Structs auswirkt, zeigt die Lektion „Boxing und Unboxing“.
+
+</Block>
+
+<Block n={8} title="Selbst nachweisen">
+
+Im IL siehst du den Unterschied direkt: Für das Struct arbeitet der Compiler mit `initobj` und Feldzugriffen auf der lokalen Variablen, für die Klasse mit `newobj`. Der Benchmark zeigt, was das für die Allokationen bedeutet.
+
+{/* TODO(verify): Expected allocations on x64 (PointS[1000] about 8 KB in one object, PointC[1000] about 8 KB plus 1000 objects of 24 B). */}
+
+<VerifyCard
+  sharplab="Stelle in SharpLab die Ausgabe auf „IL“. Bei var s1 = new PointS steht initobj, bei var c1 = new PointC steht newobj. Die Zuweisung s2 = s1 kopiert mit ldloc und stloc den ganzen Wert."
+  code={`var s1 = new PointS { X = 1 };
+var s2 = s1;
+var c1 = new PointC { X = 1 };
+var c2 = c1;
+
+struct PointS { public int X; }
+class PointC { public int X; }`}
+  benchmark={`[MemoryDiagnoser]
+public class PointBench
+{
+    [Benchmark]
+    public PointS[] Structs()
+    {
+        var a = new PointS[1000];
+        for (int i = 0; i < a.Length; i++) a[i] = new PointS { X = i };
+        return a;
+    }
+
+    [Benchmark]
+    public PointC[] Classes()
+    {
+        var a = new PointC[1000];
+        for (int i = 0; i < a.Length; i++) a[i] = new PointC { X = i };
+        return a;
+    }
+}`}
+note="Structs alloziert ein einziges Array, Classes zusätzlich 1.000 einzelne Objekte."
+/>
+
+</Block>
+
+<Block n={9} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="werttypen"
+  questions={[
+    {
+      q: 'Wo liegt ein int-Feld einer Klasse?',
+      options: ['Auf dem Stack', 'Im Objekt auf dem Heap'],
+      correct: 1,
+      explanation:
+        'Felder gehören zum Objekt. Ein Werttyp als Feld einer Klasse liegt mitten im Heap-Objekt.',
+    },
+    {
+      q: 'Was kopiert var b = a, wenn a eine Klasse ist?',
+      options: ['Das ganze Objekt', 'Nur den Verweis'],
+      correct: 1,
+      explanation:
+        'Beide Variablen zeigen danach auf dasselbe Objekt. Änderungen über b sind über a sichtbar.',
+    },
+    {
+      q: 'Eine Methode erhält eine Klasse als Parameter und weist ihm ein neues Objekt zu. Was sieht der Aufrufer?',
+      options: ['Das neue Objekt', 'Weiterhin das alte Objekt'],
+      correct: 1,
+      explanation:
+        'Der Verweis wurde per Wert übergeben. Die Zuweisung ändert nur die lokale Kopie. Mit ref sähe der Aufrufer das neue Objekt.',
+    },
+    {
+      q: 'Wie viele Objekte legt new PointS[1000] an, wenn PointS ein Struct ist?',
+      options: ['1', '1.001'],
+      correct: 0,
+      explanation: 'Nur das Array. Die 1.000 Structs stehen direkt darin.',
+    },
+    {
+      q: 'Warum lässt der Compiler list[0].X = 5 für eine List<PointS> nicht zu?',
+      options: [
+        'Structs sind unveränderlich',
+        'Der Indexer liefert eine Kopie, die Änderung ginge verloren',
+      ],
+      correct: 1,
+      explanation:
+        'Beim Array ist das Element eine Speicherstelle, bei List<T> liefert der Indexer eine Kopie.',
+    },
+    {
+      q: 'Wie verhält sich == bei zwei verschiedenen Objekten einer Klasse mit gleichem Inhalt (ohne überladenen Operator)?',
+      options: ['true', 'false'],
+      correct: 1,
+      explanation:
+        'Standardmäßig vergleicht == bei Klassen die Verweise. Es sind zwei Objekte, also false.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={10} title="Das Wichtigste in Kürze">
+
+- Werttypen enthalten ihren Wert, Referenztypen einen Verweis auf ein Objekt auf dem Heap.
+- Zuweisung und Parameterübergabe kopieren immer den Inhalt der Variablen: den Wert oder den Verweis.
+- Ein Werttyp liegt dort, wo er deklariert ist: im Stack-Frame, in einem Register, im umgebenden Objekt oder Array.
+- Arrays von Structs sind ein einziges, dicht gepacktes Objekt. Arrays von Klassen enthalten Verweise auf viele Objekte.
+- Referenzen werden per Wert übergeben. Nur `ref` und `out` geben der Methode Zugriff auf die Variable des Aufrufers.
+- Structs eignen sich für kleine, unveränderliche Werte. Für Identität, Vererbung und gemeinsamen Zustand sind Klassen da.
+
+</Block>

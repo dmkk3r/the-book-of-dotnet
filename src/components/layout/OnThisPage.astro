@@ -1,0 +1,88 @@
+---
+import { slugify } from '@/lib/slug';
+
+interface Props {
+  titles: string[];
+  /** Inside the article for narrow screens (the rail is hidden there). */
+  inline?: boolean;
+}
+const { titles, inline = false } = Astro.props;
+const headingId = inline ? 'otp-title-inline' : 'otp-title';
+---
+
+<nav class="otp" data-inline={inline} aria-labelledby={headingId} data-pagefind-ignore>
+  <h2 id={headingId}>In diesem Artikel</h2>
+  <ol>
+    {titles.map((t) => (
+      <li>
+        <a href={`#${slugify(t)}`} data-rail-link={inline ? undefined : ''}>
+          {t}
+        </a>
+      </li>
+    ))}
+  </ol>
+</nav>
+
+<style>
+  /* "In diesem Artikel" as on documentation sites: 18px heading, grey links, blue bar. */
+  .otp {
+    padding: 42px 24px 24px;
+    font-size: 14px;
+    line-height: 18.2px;
+  }
+  h2 {
+    font-size: 18px;
+    line-height: 20.25px;
+    font-weight: 600;
+    margin: 0 0 16px;
+  }
+  ol {
+    list-style: none;
+    margin: 0;
+    padding: 0 0 24px;
+    border-bottom: 1px solid var(--line);
+  }
+  li + li {
+    margin-top: 4px;
+  }
+  a {
+    display: block;
+    padding: 2px 0 2px 8px;
+    border-left: 2px solid transparent;
+    color: var(--muted);
+  }
+  a:hover {
+    color: var(--ink);
+    text-decoration: underline;
+  }
+  a[aria-current] {
+    border-left-color: var(--rail-active);
+    color: var(--ink);
+    font-weight: 600;
+  }
+  /* Inline variant: below the title on narrow screens, with a grey line instead of the bar. */
+  .otp[data-inline='true'] {
+    display: none;
+    padding: 8px 0 8px;
+  }
+  .otp[data-inline='true'] h2 {
+    font-size: 24px;
+    line-height: 1.3;
+  }
+  .otp[data-inline='true'] ol {
+    padding: 0;
+    border: 0;
+    border-left: 1px solid var(--line-strong);
+    margin-left: 0;
+  }
+  .otp[data-inline='true'] a {
+    padding: 4px 0 4px 15px;
+    border-left: 0;
+    color: var(--accent);
+  }
+  @media (max-width: 1200px) {
+    .otp[data-inline='true'] {
+      display: block;
+    }
+  }
+</style>

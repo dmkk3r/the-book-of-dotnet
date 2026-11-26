@@ -1,0 +1,65 @@
+---
+// Dev-only demo page for one visualization component.
+import type { GetStaticPaths } from 'astro';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { StepPlayer } from '@/components/viz';
+import { VIEWS, exampleFor, sourceOf } from '@/lib/viz/demos';
+import { withBase } from '@/lib/paths';
+
+export const getStaticPaths = (() =>
+  VIEWS.map((v) => ({ params: { view: v.view }, props: { info: v } }))) satisfies GetStaticPaths;
+
+const { info } = Astro.props as { info: (typeof VIEWS)[number] };
+const example = exampleFor(info.view);
+---
+
+<BaseLayout title={info.name}>
+  <div class="crumb">
+    <a href={withBase('demo/')}>Visualisierungen</a>
+  </div>
+  <h1>{info.name}</h1>
+  <p class="lead">
+    {info.purpose}. Hell und Dunkel über den Umschalter in der Seitenleiste prüfen.
+  </p>
+  {example ? (
+    <>
+      <p>
+        Beispiel aus der Lektion{' '}
+        {example.lesson && example.href ? (
+          <a href={withBase(example.href)}>{example.lesson.title}</a>
+        ) : (
+          'ohne Zuordnung'
+        )}
+        :
+      </p>
+      <StepPlayer script={example.script} />
+    </>
+  ) : (
+    <p>Noch keine Lektion nutzt diese Ansicht.</p>
+  )}
+  <h2>Zustandsformat</h2>
+  <p class="src">
+    Quelle: <code>src/lib/viz/{info.source}</code>
+  </p>
+  <pre class="source" tabindex="0">{sourceOf(info.source)}</pre>
+</BaseLayout>
+
+<style>
+  h2 {
+    margin-top: 40px;
+  }
+  .src {
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .source {
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 14px;
+    font-size: 13px;
+    line-height: 1.6;
+    overflow: auto;
+    max-height: 600px;
+  }
+</style>

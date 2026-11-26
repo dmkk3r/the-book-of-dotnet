@@ -1,0 +1,92 @@
+---
+import type { LessonEntry } from '@/lib/lessons';
+import { STATUS_LABELS } from '@/lib/lesson-status';
+
+interface Props {
+  data: LessonEntry['data'];
+}
+const { data } = Astro.props;
+const updated = new Intl.DateTimeFormat('de-DE', { dateStyle: 'long', timeZone: 'UTC' }).format(
+  data.updated,
+);
+---
+
+<section class="sources" aria-labelledby="quellen">
+  <h2 id="quellen">Quellen</h2>
+  {data.sources.length > 0 ? (
+    <ul>
+      {data.sources.map((s) => (
+        <li>
+          <a href={s.url} rel="noopener noreferrer">
+            {s.title}
+          </a>
+        </li>
+      ))}
+    </ul>
+  ) : (
+    <p class="none">Für diese Lektion sind noch keine Quellen eingetragen.</p>
+  )}
+  <dl>
+    <div>
+      <dt>Status</dt>
+      <dd>{STATUS_LABELS[data.status]}</dd>
+    </div>
+    {data.dotnetVersion && (
+      <div>
+        <dt>.NET-Version</dt>
+        <dd>{data.dotnetVersion}</dd>
+      </div>
+    )}
+    {data.verifiedWith && data.verifiedWith.length > 0 && (
+      <div>
+        <dt>Geprüft mit</dt>
+        <dd>{data.verifiedWith.join(', ')}</dd>
+      </div>
+    )}
+    <div>
+      <dt>Stand</dt>
+      <dd>
+        <time datetime={data.updated.toISOString().slice(0, 10)}>{updated}</time>
+      </dd>
+    </div>
+  </dl>
+</section>
+
+<style>
+  .sources {
+    margin-top: 40px;
+  }
+  h2 {
+    margin-bottom: 8px;
+  }
+  ul {
+    margin: 0 0 16px;
+    padding-left: 20px;
+  }
+  li {
+    margin-bottom: 4px;
+  }
+  .none {
+    color: var(--muted);
+    margin: 0 0 16px;
+  }
+  dl {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 24px;
+    margin: 0;
+    font-size: 14px;
+    color: var(--muted);
+  }
+  dl div {
+    display: flex;
+    gap: 6px;
+  }
+  dt::after {
+    content: ':';
+  }
+  dd {
+    margin: 0;
+    color: var(--ink);
+  }
+</style>

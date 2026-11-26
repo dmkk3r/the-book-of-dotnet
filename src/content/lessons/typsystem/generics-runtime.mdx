@@ -1,0 +1,233 @@
+---
+id: generics-runtime
+title: Generics zur Laufzeit
+summary: Wie .NET Generics bis zur Laufzeit erhält, wann der JIT eigenen Code pro Typargument erzeugt, wann sich Instanziierungen Code teilen und was das für Statics, Performance und Native AOT bedeutet.
+status: draft
+sources:
+  - title: 'Book of the Runtime: Shared Generics Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/shared-generics.md
+  - title: 'Generics in .NET (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/generics/
+  - title: 'Generics in der Laufzeit (C#-Programmierhandbuch, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/programming-guide/generics/generics-in-the-run-time
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './generics-runtime.steps';
+import staticsScript from './generics-runtime-statics.steps';
+
+<Block n={1} title="Das Problem">
+
+Bevor es Generics gab, hatte man zwei schlechte Möglichkeiten, eine wiederverwendbare Liste zu schreiben. Entweder eine `ArrayList`, die alles als `object` speichert: Werttypen werden dann geboxt, und beim Lesen muss man casten und hoffen, dass der Typ stimmt. Oder für jeden Elementtyp eine eigene Klasse von Hand: `IntList`, `StringList`, `CustomerList`.
+
+Generics lösen das, indem der Code einmal geschrieben und für jedes Typargument passend verwendet wird. Die spannende Frage ist, **wie** die Plattform das umsetzt. Andere Sprachen haben sich sehr unterschiedlich entschieden, und jede Entscheidung hat Folgen für Geschwindigkeit, Codegröße und was zur Laufzeit noch über die Typen bekannt ist.
+
+.NET geht einen Mittelweg: Generics bleiben bis zur Laufzeit vollständig erhalten. Der JIT erzeugt für Werttypen spezialisierten Code und teilt für Referenztypen einen gemeinsamen. Diese Lektion zeigt, wie das funktioniert und welche Folgen es hat.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+1. **Generics sind zur Laufzeit echte Typen.** `List<int>` und `List<string>` haben jeweils eine eigene MethodTable, `typeof(T)` funktioniert, und Reflection kennt die Typargumente.
+2. **Für Werttypen erzeugt der JIT eigenen Code pro Typargument.** Der Code kennt `T` genau und arbeitet direkt mit den Werten, ohne Boxing.
+3. **Für Referenztypen teilen sich alle Instanziierungen einen Code,** erzeugt für den Platzhalter `__Canon`. Ein Verweis ist immer gleich groß, also passt derselbe Maschinencode.
+4. **Braucht geteilter Code das konkrete `T`, liest er es aus einem Wörterbuch,** das am jeweiligen Typ oder an der Methode hängt.
+5. **Jede Instanziierung hat eigene statische Felder,** auch wenn der Code geteilt wird.
+
+<Callout kind="fehlannahme">
+  „Generics werden wie C++-Templates für jedes `T` neu kompiliert.“ Für Werttypen stimmt das, für
+  Referenztypen nicht. Alle Klassen als Typargument teilen sich einen Maschinencode.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Drei Listen mit drei verschiedenen Typargumenten. Achte darauf, auf welchen Maschinencode die MethodTables zeigen.
+
+<StepPlayer script={script} />
+
+Dass `List<string>` und `List<object>` eigene MethodTables haben, ist wichtig: `GetType()` muss sie unterscheiden können, Casts müssen sie unterscheiden, und, wie wir gleich sehen, ihre statischen Felder sind getrennt. Nur der Maschinencode ist gemeinsam.
+
+</Block>
+
+<Block n={4} title="Drei Wege zu Generics">
+
+Der Vergleich mit anderen Sprachen macht die Entscheidung von .NET verständlich:
+
+| | C++-Templates | Java-Generics | .NET-Generics |
+| --- | --- | --- | --- |
+| Umsetzung | neuer Code pro Typargument beim Kompilieren | Typen werden gelöscht, intern `Object` | Typen bleiben erhalten, JIT erzeugt Code |
+| Werttypen als `T` | spezialisiert | nicht direkt, nur geboxt | spezialisiert, ohne Boxing |
+| Referenztypen als `T` | spezialisiert | ein gemeinsamer Code | ein gemeinsamer Code (`__Canon`) |
+| Typinformation zur Laufzeit | nein | nein (`T` unbekannt) | ja (`typeof(T)`) |
+| Codegröße | wächst mit jeder Instanziierung | klein | wächst nur mit Werttyp-Instanziierungen |
+
+.NET nimmt sich von beiden Seiten das Beste: die Geschwindigkeit spezialisierten Codes dort, wo sie zählt, bei Werttypen, und einen gemeinsamen Code dort, wo er problemlos möglich ist, bei Referenztypen. Der Preis ist ein etwas aufwendigerer Mechanismus für die Fälle, in denen geteilter Code das konkrete `T` doch kennen muss.
+
+</Block>
+
+<Block n={5} title="Das generische Wörterbuch">
+
+Geteilter Code für `__Canon` weiß nicht, ob er gerade für `string`, `Uri` oder `Customer` läuft. Meistens muss er es auch nicht wissen: Einen Verweis speichern, kopieren oder vergleichen funktioniert für alle Referenztypen gleich. Es gibt aber Operationen, die das konkrete `T` brauchen:
+
+- `typeof(T)`, `default(T)` bei Strukturen, Casts wie `(T)obj` oder `obj is T`
+- `new T[]` oder `new T()`
+- Zugriff auf statische Felder eines generischen Typs, zum Beispiel `Counter<T>.Count`
+- Aufrufe weiterer generischer Methoden mit `T` als Typargument
+
+Für diese Fälle hängt an der MethodTable der Instanziierung (bei generischen Methoden an einer eigenen Struktur) ein **Wörterbuch** mit den nötigen Einträgen. Der geteilte Code bekommt Zugang dazu, über das Objekt (`this`) oder über einen versteckten zusätzlichen Parameter. Jeder Zugriff auf das Wörterbuch kostet einen oder mehrere zusätzliche Speicherzugriffe. Meist ist das vernachlässigbar, in sehr heißen Schleifen kann es messbar werden.
+
+{/* TODO(verify): How shared code obtains the dictionary (from this, from a hidden instantiation argument for generic methods and static methods) per BOTR shared-generics.md. */}
+
+</Block>
+
+<Block n={6} title="Statische Felder pro Instanziierung">
+
+Eine direkte Folge davon, dass jede Instanziierung ein eigener Typ ist: Statische Felder existieren pro Instanziierung.
+
+<StepPlayer script={staticsScript} />
+
+Das wird gern bewusst genutzt. Ein Muster ist der statische Cache pro Typ: `static class TypeCache<T> { public static readonly string Name = typeof(T).Name; }` berechnet den Wert für jedes `T` genau einmal, ganz ohne `Dictionary<Type, …>` und ohne Sperren, weil die Runtime die Initialisierung statischer Felder threadsicher erledigt.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Ein Zähler, der keiner ist
+
+Wer in einer generischen Basisklasse einen statischen Zähler für alle abgeleiteten Typen führen will, erlebt die Überraschung aus der Visualisierung: Jede Instanziierung zählt für sich. Gemeinsame Statics gehören in eine nicht-generische Klasse.
+
+### Viele Werttyp-Instanziierungen
+
+Jeder neue Werttyp als `T` erzeugt eigenen Maschinencode. Bei einer Handvoll Typen ist das genau richtig. Wer aber eine generische Klasse mit sehr vielen verschiedenen Structs instanziiert, erzeugt viel Code: längere Startzeit durch mehr JIT-Arbeit und bei Native AOT eine größere Binärdatei.
+
+### Generics und Native AOT
+
+Bei Native AOT wird aller Code vor der Ausführung erzeugt. Instanziierungen, die erst zur Laufzeit entstehen, etwa mit `typeof(List<>).MakeGenericType(someType)` für einen Werttyp, kann der Compiler nicht vorhersehen. Solcher Code funktioniert dann nicht oder nur eingeschränkt. Der AOT-Compiler warnt vor diesen Stellen. Mehr dazu in der Lektion „Native AOT“.
+
+{/* TODO(verify): Native AOT behaviour for MakeGenericType with value-type arguments (warning IL3050, runtime failure). */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Situation | Effekt | Tipp |
+| --- | --- | --- |
+| `List<int>` statt `ArrayList` | kein Boxing, typsicher | immer generische Collections verwenden |
+| generische Methode mit Struct-Typargument | spezialisierter, schneller Code | ideal für heiße Pfade |
+| generische Methode mit Klassen-Typargument | geteilter Code, gelegentliche Wörterbuch-Zugriffe | meist vernachlässigbar |
+| `where T : struct` | erzwingt Werttyp, damit spezialisierten Code | sinnvoll bei Mathe- und Puffer-Code |
+| statischer Cache pro Typ | ein Wert pro `T`, threadsicher initialisiert | `static class Cache<T>` statt `Dictionary<Type, …>` |
+| viele Struct-Instanziierungen | mehr JIT-Arbeit, größere AOT-Binärdatei | bewusst begrenzen |
+
+Wie Methodenaufrufe auf einem generischen `T` ohne Boxing auskommen, zeigt die Lektion „Boxing und Unboxing“ im Abschnitt über constrained-Aufrufe. Wie das für statische Member funktioniert, zeigt „Statische abstrakte Interface-Member“.
+
+</Block>
+
+<Block n={9} title="Was der JIT dazu tut">
+
+Spezialisierter Code für Werttypen ist besonders gut optimierbar: Der JIT kennt `T` genau, kann Methoden von `T` direkt aufrufen und inlinen, und Prüfungen wie `typeof(T) == typeof(int)` werden zu Konstanten. Ganze Zweige verschwinden dabei. Die Basisbibliothek nutzt das gezielt, um für bestimmte Typen schnellere Wege zu wählen, ohne dass es zur Laufzeit etwas kostet.
+
+```csharp
+static int Size<T>() where T : struct
+{
+    if (typeof(T) == typeof(int)) return 4;    // im Code für int bleibt nur: return 4
+    if (typeof(T) == typeof(long)) return 8;
+    return Unsafe.SizeOf<T>();
+}
+```
+
+Für geteilten Code geht das nicht, dort bleibt der Wörterbuch-Zugriff. Mit Dynamic PGO kann der JIT aber auch dort häufige Fälle beschleunigen, wenn die Laufzeitdaten einen eindeutigen Typ zeigen.
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+In SharpLab siehst du unter „JIT Asm“ die Namen der erzeugten Methoden. Für das Werttyp-Argument erscheint eigener Code, für die Referenztypen derselbe Code mit `System.__Canon` im Namen.
+
+{/* TODO(verify): Listing names in SharpLab JIT Asm (First[[System.__Canon]] vs First[[System.Int32]]). */}
+
+<VerifyCard
+  sharplab="Stelle in SharpLab die Ausgabe auf „JIT Asm“. Für A erscheint Code mit Int32 im Namen, für B und C derselbe Code mit System.__Canon. Führe danach den zweiten Teil mit „Run“ aus: Die Zähler sind getrennt."
+  code={`public static class Demo
+{
+    public static int First<T>(List<T> items) => items.Count;
+
+    public static int A(List<int> x)    => First(x);
+    public static int B(List<string> x) => First(x);
+    public static int C(List<object> x) => First(x);
+}
+
+class Counter<T> { public static int Count; }
+
+// Counter<string>.Count++; Counter<object>.Count++;
+// Console.WriteLine($"{Counter<string>.Count} {Counter<object>.Count}");`}
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="generics-runtime"
+  questions={[
+    {
+      q: 'Teilen sich List<int> und List<long> denselben Maschinencode?',
+      options: ['Ja', 'Nein'],
+      correct: 1,
+      explanation: 'Werttypen bekommen eigenen Code pro Typargument, weil Größe und Operationen verschieden sind.',
+    },
+    {
+      q: 'Teilen sich List<string> und List<Uri> denselben Maschinencode?',
+      options: ['Ja', 'Nein'],
+      correct: 0,
+      explanation: 'Beide sind Referenztypen. Ihr Code wird für __Canon erzeugt und gemeinsam genutzt.',
+    },
+    {
+      q: 'Haben List<string> und List<Uri> dieselbe MethodTable?',
+      options: ['Ja, weil der Code geteilt wird', 'Nein, jede Instanziierung ist ein eigener Typ'],
+      correct: 1,
+      explanation: 'Nur der Maschinencode ist gemeinsam. Typ, MethodTable und Statics sind getrennt.',
+    },
+    {
+      q: 'Counter<string>.Count++ und Counter<object>.Count++: Wie viele verschiedene Count-Felder gibt es?',
+      options: ['1', '2'],
+      correct: 1,
+      explanation: 'Statische Felder existieren pro Instanziierung.',
+    },
+    {
+      q: 'Wofür braucht geteilter Code das generische Wörterbuch?',
+      options: ['Für alle Zugriffe auf Variablen vom Typ T', 'Für Operationen, die das konkrete T kennen müssen, etwa typeof(T)'],
+      correct: 1,
+      explanation: 'Verweise speichern und kopieren geht ohne. typeof(T), new T[] oder generische Statics brauchen den Eintrag.',
+    },
+    {
+      q: 'Worin unterscheiden sich .NET-Generics von Java-Generics?',
+      options: [
+        'In .NET bleiben die Typargumente zur Laufzeit erhalten, Werttypen werden nicht geboxt',
+        'Es gibt keinen Unterschied',
+      ],
+      correct: 0,
+      explanation: 'Java löscht die Typargumente. .NET erhält sie und spezialisiert für Werttypen.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Generics bleiben in .NET zur Laufzeit erhalten. Jede Instanziierung ist ein eigener Typ mit eigener MethodTable.
+- Für Werttypen erzeugt der JIT spezialisierten Code, ohne Boxing und gut optimierbar.
+- Alle Referenztypen teilen sich einen Code für `__Canon`. Das konkrete `T` liest er bei Bedarf aus einem Wörterbuch.
+- Statische Felder existieren pro Instanziierung, auch bei geteiltem Code.
+- `typeof(T) == typeof(int)` wird im spezialisierten Code zur Konstante, ganze Zweige verschwinden.
+- Viele Werttyp-Instanziierungen kosten Codegröße. Zur Laufzeit erzeugte Instanziierungen sind bei Native AOT problematisch.
+
+</Block>

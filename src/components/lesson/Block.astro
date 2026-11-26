@@ -1,0 +1,109 @@
+---
+// Section of a lesson. `n` keeps the order explicit in the source;
+// headings are shown without numbers, as in documentation articles.
+import { slugify } from '@/lib/slug';
+
+interface Props {
+  n: number;
+  title: string;
+}
+const { n, title } = Astro.props;
+const id = slugify(title);
+---
+
+<section class="block" aria-labelledby={id} data-block={n}>
+  <h2 id={id}>{title}</h2>
+  <div class="block-body">
+    <slot />
+  </div>
+</section>
+
+<style>
+  .block {
+    margin: 0;
+  }
+  .block-body :global(> p),
+  .block-body :global(> ul),
+  .block-body :global(> ol) {
+    margin: 16px 0 0;
+  }
+  .block-body :global(> ul),
+  .block-body :global(> ol) {
+    padding-left: 38px;
+  }
+  .block-body :global(> h3) {
+    margin: 20px 0;
+  }
+  .block-body :global(> table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    margin: 16px 0 0;
+  }
+  .block-body :global(th) {
+    white-space: nowrap;
+  }
+  /* Markdown code blocks: grey header with the language, as on documentation sites */
+  .block-body :global(pre.astro-code) {
+    position: relative;
+    margin: 16px 0 0;
+    padding: 44px 12px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--code-bg) !important;
+    color: var(--ink) !important;
+    font-size: 14px;
+    line-height: 19px;
+    overflow-x: auto;
+  }
+  .block-body :global(pre.astro-code)::before {
+    content: 'Code';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 32px;
+    padding: 0 8px 0 12px;
+    border-bottom: 1px solid var(--line-strong);
+    background: var(--code-head-bg);
+    font: 600 14px/32px var(--font-sans);
+    color: var(--ink);
+  }
+  .block-body :global(pre.astro-code[data-language='csharp'])::before,
+  .block-body :global(pre.astro-code[data-language='cs'])::before {
+    content: 'C#';
+  }
+  .block-body :global(pre.astro-code[data-language='xml'])::before {
+    content: 'XML';
+  }
+  .block-body :global(pre.astro-code[data-language='json'])::before {
+    content: 'JSON';
+  }
+  .block-body :global(pre.astro-code[data-language='bash'])::before,
+  .block-body :global(pre.astro-code[data-language='sh'])::before,
+  .block-body :global(pre.astro-code[data-language='shell'])::before {
+    content: 'Bash';
+  }
+  .block-body :global(pre.astro-code[data-language='powershell'])::before {
+    content: 'PowerShell';
+  }
+  .block-body :global(pre.astro-code[data-language='asm'])::before {
+    content: 'Assembler';
+  }
+  .block-body :global(pre.astro-code[data-language='il'])::before {
+    content: 'IL';
+  }
+  .block-body :global(pre.astro-code[data-language='text'])::before,
+  .block-body :global(pre.astro-code[data-language='plaintext'])::before {
+    content: 'Text';
+  }
+  /* Visualizations may be wider than the text column: up to the full width of the main area. */
+  .block-body :global(> .player),
+  .block-body :global(> astro-island) {
+    --wide: min(100cqw, 1040px);
+    display: block;
+    width: var(--wide);
+    max-width: none;
+    margin-inline: calc((100% - var(--wide)) / 2);
+  }
+</style>

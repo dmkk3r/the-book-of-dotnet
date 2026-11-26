@@ -1,0 +1,13 @@
+---
+// Icon from the site's icon set (Fluent UI System Icons, see src/lib/icons.ts).
+// Sized 1em and set on the text baseline; override with a class if needed.
+import { iconSvg, type IconName } from '@/lib/icons';
+
+interface Props {
+  name: IconName;
+  class?: string;
+}
+const { name, class: className } = Astro.props;
+---
+
+<Fragment set:html={iconSvg(name, className ? `icon ${className}` : 'icon')} />

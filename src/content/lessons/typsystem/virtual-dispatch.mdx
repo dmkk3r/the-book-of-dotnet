@@ -1,0 +1,232 @@
+---
+id: virtual-dispatch
+title: Virtuelle Aufrufe und Interface-Dispatch
+summary: Wie ein virtueller Aufruf über die Slots der MethodTable sein Ziel findet, was override und new dabei unterscheidet und warum Interface-Aufrufe über Stubs laufen.
+status: draft
+sources:
+  - title: 'Book of the Runtime: Virtual Stub Dispatch'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/virtual-stub-dispatch.md
+  - title: 'Book of the Runtime: Type System Overview'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-system.md
+  - title: 'Book of the Runtime: Method Descriptor'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/method-descriptor.md
+  - title: 'Versionsverwaltung mit den Schlüsselwörtern „override“ und „new“ (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/programming-guide/classes-and-structs/versioning-with-the-override-and-new-keywords
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './virtual-dispatch.steps';
+import slotsScript from './virtual-dispatch-slots.steps';
+import interfaceScript from './virtual-dispatch-interface.steps';
+
+<Block n={1} title="Das Problem">
+
+Polymorphie ist eines der Grundprinzipien objektorientierter Programmierung: Du rufst `animal.Speak()` auf, und je nachdem, ob `animal` gerade ein Hund oder eine Katze ist, wird eine andere Methode ausgeführt. Der Compiler kann das Ziel nicht festlegen, denn welcher Typ zur Laufzeit ankommt, weiß er nicht.
+
+Die Entscheidung muss also zur Laufzeit fallen, und zwar bei jedem einzelnen Aufruf. Wäre das eine Suche nach dem Methodennamen in der Klassenhierarchie, wäre objektorientierter Code unerträglich langsam. Die Runtime braucht einen Mechanismus, der mit ein, zwei Speicherzugriffen auskommt.
+
+Für Klassen gibt es einen sehr eleganten Weg über die MethodTable. Bei Interfaces funktioniert er nicht, denn ein Typ kann beliebig viele Interfaces implementieren. Dafür hat CoreCLR einen eigenen Mechanismus, das **Virtual Stub Dispatch**. Beide schauen wir uns in dieser Lektion genau an.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+1. **Jede virtuelle Methode bekommt beim Laden ihres Typs einen festen Slot** in der MethodTable.
+2. **Abgeleitete Typen erben alle Slots an denselben Positionen.** `override` ersetzt den Inhalt eines Slots, eine neue virtuelle Methode hängt einen Slot an.
+3. **Ein virtueller Aufruf liest den MethodTable-Zeiger, dann den Slot, und springt.** Die Slot-Nummer steht schon beim Übersetzen fest.
+4. **Interface-Aufrufe laufen über Stubs,** kleine Codestücke, die sich gesehene Typen merken und das Ziel möglichst billig finden.
+5. **Nicht-virtuelle Aufrufe gehen direkt** an die Methode, ganz ohne Nachschlagen.
+
+<Callout kind="fehlannahme">
+  „Bei einem virtuellen Aufruf sucht die Runtime die passende Methode.“ Es wird nichts gesucht.
+  Die Position im Slot-Array steht vorher fest, zur Laufzeit wird nur gelesen und gesprungen.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Dieselbe Aufrufstelle `a.Speak()` wird zweimal ausgeführt, einmal mit einem `Dog`, einmal mit einer `Cat`. Achte darauf, welcher Slot gelesen wird.
+
+<StepPlayer script={script} />
+
+Im Maschinencode sieht ein virtueller Aufruf typischerweise so aus: das Objekt laden, daraus den MethodTable-Zeiger, daraus den Eintrag an einer festen Position, und indirekt dorthin springen. Den genauen Code zeigt dir SharpLab unter „JIT Asm“, wie im Abschnitt „Selbst nachweisen“ beschrieben.
+
+{/* TODO(verify): Exact x64 instruction sequence for a virtual call (mov from object, mov through chunk pointer, call indirect). */}
+
+</Block>
+
+<Block n={4} title="Slots im Detail: override und new">
+
+Wie die Slots vererbt werden, entscheidet über das Verhalten. Besonders deutlich wird das am Unterschied zwischen `override` und `new`.
+
+<StepPlayer script={slotsScript} />
+
+Die Regel dahinter: Der Compiler legt beim Übersetzen fest, **welcher Slot** aufgerufen wird. Dafür schaut er auf den statischen Typ der Variable. Zur Laufzeit entscheidet die MethodTable des Objekts, **was in diesem Slot steht**. `override` ändert den Inhalt eines bestehenden Slots und wirkt deshalb über alle Variablentypen hinweg. `new` legt einen weiteren Slot an, den nur Variablen des neuen Typs kennen.
+
+### call und callvirt
+
+Im IL gibt es zwei Aufrufbefehle: `call` ruft eine Methode direkt auf, `callvirt` über den Slot. Der C#-Compiler verwendet `callvirt` aber auch für viele **nicht-virtuelle** Instanzmethoden. Der Grund: `callvirt` prüft vorher, ob das Objekt `null` ist, und wirft dann eine `NullReferenceException`. Bei einer nicht-virtuellen Methode erzeugt der JIT daraus einen direkten Aufruf mit Nullprüfung. Der Name „callvirt“ verrät also nicht, ob wirklich virtuell aufgerufen wird.
+
+</Block>
+
+<Block n={5} title="Interface-Aufrufe im Detail">
+
+Bei Klassen funktioniert das Slot-Modell, weil jede Klasse genau eine Basisklasse hat und die Slots sich nach unten fortsetzen. Interfaces passen da nicht hinein: `Circle` kann `IShape`, `IComparable` und zehn weitere Interfaces implementieren, und jedes davon müsste an einer festen Position stehen, die für alle Typen gleich ist. Das ist nicht möglich.
+
+CoreCLR löst das mit **Virtual Stub Dispatch**. Eine Interface-Aufrufstelle springt nicht direkt in eine Methode, sondern in einen Stub. Die Runtime tauscht diesen Stub je nach beobachtetem Verhalten aus:
+
+<StepPlayer script={interfaceScript} />
+
+Die Idee dahinter ist dieselbe wie bei vielen Optimierungen: Die meisten Aufrufstellen sehen in der Praxis fast immer denselben Typ. Für diesen Fall soll der Aufruf so billig wie möglich sein. Für die selteneren Stellen mit vielen Typen gibt es einen stabilen, etwas langsameren Weg.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Virtuelle Aufrufe im Konstruktor
+
+```csharp
+class Base
+{
+    public Base() => Console.WriteLine(Describe());
+    protected virtual string Describe() => "Base";
+}
+class Derived : Base
+{
+    private readonly string _name;
+    public Derived() { _name = "Derived"; }
+    protected override string Describe() => _name ?? "(noch null)";
+}
+
+new Derived();   // gibt "(noch null)" aus
+```
+
+Ein Objekt hat schon während des Basis-Konstruktors seine endgültige MethodTable. Ein virtueller Aufruf im Konstruktor von `Base` landet deshalb in `Derived.Describe`, obwohl der Konstruktor von `Derived` noch gar nicht gelaufen ist. Zuweisungen im Konstruktorrumpf von `Derived` sind noch nicht passiert. Feldinitialisierer von `Derived` dagegen laufen in C# schon vor dem Basis-Konstruktor. Virtuelle Aufrufe in Konstruktoren sind deshalb eine bekannte Fehlerquelle, und Analysewerkzeuge warnen davor.
+
+### new statt override aus Versehen
+
+Lässt du `override` weg, warnt der Compiler und behandelt die Methode wie mit `new`. Der Code kompiliert, verhält sich aber je nach Variablentyp unterschiedlich. Diese Warnung solltest du nie ignorieren.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+| Aufrufart | Was zur Laufzeit passiert | Relativer Aufwand |
+| --- | --- | --- |
+| nicht-virtuell, statisch | direkter Sprung | am niedrigsten, kann geinlined werden |
+| virtuell | MethodTable lesen, Slot lesen, indirekter Sprung | gering, aber ohne Devirtualisierung kein Inlining |
+| Interface, ein Typ an der Stelle | Dispatch-Stub: Vergleich und Sprung | ähnlich wie virtuell |
+| Interface, viele Typen an der Stelle | Resolve-Stub: Suche im Cache | höher |
+| Delegate | Sprung über den gespeicherten Zeiger | ähnlich wie virtuell |
+
+Der größte Kostenfaktor ist selten der Sprung selbst, sondern das fehlende **Inlining**: Ein Aufruf, dessen Ziel erst zur Laufzeit feststeht, kann der JIT nicht in den Aufrufer einsetzen und dort weiter optimieren. Für Klassen, die nicht abgeleitet werden sollen, lohnt sich `sealed`: Der JIT weiß dann, dass es keine anderen Ziele geben kann.
+
+</Block>
+
+<Block n={8} title="Was der JIT dazu tut">
+
+Der JIT versucht, virtuelle und Interface-Aufrufe in direkte Aufrufe zu verwandeln. Das nennt man **Devirtualisierung**:
+
+- **Exakter Typ bekannt:** Steht kurz vorher `var d = new Dog();`, weiß der JIT, dass `d.Speak()` nur `Dog.Speak` sein kann.
+- **sealed:** Ist der Typ oder die Methode `sealed`, gibt es kein anderes mögliches Ziel.
+- **Geschützte Devirtualisierung mit Dynamic PGO:** Zeigen Laufzeitdaten, dass an einer Stelle fast immer `Dog` ankommt, erzeugt der JIT eine Prüfung „ist es ein Dog?“ mit einem direkten, oft geinlinten Aufruf, und nur im seltenen Fall den virtuellen Weg.
+
+<Callout kind="version">
+  Dynamic PGO ist ab .NET 8 standardmäßig aktiv. Damit werden auch Interface-Aufrufe in heißem
+  Code häufig devirtualisiert. Details zeigen die Lektionen „Dynamic PGO“ und
+  „Devirtualisierung“.
+</Callout>
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+In SharpLab siehst du unter „JIT Asm“ den Unterschied zwischen einem virtuellen und einem Interface-Aufruf. Beachte, dass SharpLab ohne Laufzeitdaten übersetzt, die Devirtualisierung durch PGO siehst du dort also nicht.
+
+{/* TODO(verify): JIT asm patterns in SharpLab (virtual: indirect call through MethodTable slot; interface: call through stub cell) and benchmark ratios. */}
+
+<VerifyCard
+  sharplab="Stelle in SharpLab die Ausgabe auf „JIT Asm“ (Release). In CallVirtual wird die MethodTable geladen und indirekt über einen Slot gesprungen. In CallInterface läuft der Aufruf über eine Stub-Zelle. In CallSealed steht ein direkter Aufruf oder sogar der eingesetzte Methodenrumpf."
+  code={`public static class Demo
+{
+    public static string CallVirtual(Animal a) => a.Speak();
+    public static string CallInterface(IPet p) => p.Name;
+    public static string CallSealed(Dog d) => d.Speak();
+}
+
+public abstract class Animal { public abstract string Speak(); }
+public sealed class Dog : Animal, IPet
+{
+    public override string Speak() => "Wuff";
+    public string Name => "Rex";
+}
+public interface IPet { string Name { get; } }`}
+/>
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="virtual-dispatch"
+  questions={[
+    {
+      q: 'Wie findet ein virtueller Aufruf die richtige Methode?',
+      options: ['Er sucht die Methode per Name', 'Er liest einen festen Slot in der MethodTable des Objekts'],
+      correct: 1,
+      explanation: 'Die Slot-Position steht beim Laden fest. Zur Laufzeit wird nur gelesen und gesprungen.',
+    },
+    {
+      q: 'Animal a = new Cat(); Cat verdeckt Speak mit new. Was ruft a.Speak() auf?',
+      options: ['Cat.Speak', 'Animal.Speak'],
+      correct: 1,
+      explanation: 'Über Animal kennt der Compiler nur den alten Slot. new legt einen neuen Slot an, den nur Cat-Variablen benutzen.',
+    },
+    {
+      q: 'Warum brauchen Interface-Aufrufe einen eigenen Mechanismus?',
+      options: [
+        'Weil Interface-Methoden keine einheitliche Slot-Position in allen Typen haben',
+        'Weil Interfaces auf dem Heap liegen',
+      ],
+      correct: 0,
+      explanation: 'Ein Typ kann viele Interfaces implementieren. CoreCLR löst das mit Stubs, die sich gesehene Typen merken.',
+    },
+    {
+      q: 'Wann ist ein Interface-Aufruf am teuersten?',
+      options: ['Wenn an der Stelle immer derselbe Typ ankommt', 'Wenn an der Stelle viele verschiedene Typen abwechselnd ankommen'],
+      correct: 1,
+      explanation: 'Dann landet die Stelle beim Resolve-Stub, der das Ziel in einem Cache sucht.',
+    },
+    {
+      q: 'Was bedeutet callvirt im IL bei einer nicht-virtuellen Methode?',
+      options: ['Der Aufruf wird trotzdem über einen Slot ausgeführt', 'Vor allem eine Nullprüfung, der JIT ruft direkt auf'],
+      correct: 1,
+      explanation: 'C# nutzt callvirt wegen der Nullprüfung. Der JIT erzeugt bei nicht-virtuellen Methoden einen direkten Aufruf.',
+    },
+    {
+      q: 'Was ist meist der größte Kostenfaktor eines virtuellen Aufrufs?',
+      options: ['Der indirekte Sprung', 'Dass der JIT ihn nicht inlinen und weiter optimieren kann'],
+      correct: 1,
+      explanation: 'Ohne bekanntes Ziel entfällt das Inlining. Devirtualisierung holt das zurück.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Virtuelle Methoden haben feste Slots in der MethodTable, abgeleitete Typen erben sie an denselben Positionen.
+- `override` ersetzt den Inhalt eines Slots, `new` legt einen neuen an. Mit `new` entscheidet der statische Typ der Variable.
+- Ein virtueller Aufruf liest MethodTable und Slot und springt. Gesucht wird nichts.
+- Interface-Aufrufe laufen über Stubs: Lookup, Dispatch für einen Typ, Resolve für viele.
+- Der größte Nachteil virtueller Aufrufe ist das fehlende Inlining. `sealed` und Dynamic PGO ermöglichen Devirtualisierung.
+- Virtuelle Aufrufe im Konstruktor landen im abgeleiteten Typ, bevor dessen Konstruktor gelaufen ist.
+
+</Block>

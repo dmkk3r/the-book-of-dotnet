@@ -1,0 +1,369 @@
+---
+id: runtime-repo
+title: Orientierung im dotnet/runtime-Repo
+summary: Wie das Repository dotnet/runtime aufgebaut ist, wo VM, JIT, GC, CoreLib, Klassenbibliothek und Host liegen, wie verwalteter und nativer Code über FCalls und QCalls zusammenkommen und wie du eine API von C# bis in die Runtime verfolgst, und zwar in der Version, die auf deinem Rechner läuft.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'dotnet/runtime: README'
+    url: https://github.com/dotnet/runtime/blob/main/README.md
+  - title: 'dotnet/runtime: Workflow Guide'
+    url: https://github.com/dotnet/runtime/blob/main/docs/workflow/README.md
+  - title: 'Book of the Runtime: System.Private.CoreLib and calling into the runtime'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/corelib.md
+  - title: 'Book of the Runtime: Übersicht'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/README.md
+  - title: 'dotnet/runtime: Glossar des Projekts'
+    url: https://github.com/dotnet/runtime/blob/main/docs/project/glossary.md
+  - title: 'GC.CoreCLR.cs bei Tag v9.0.0'
+    url: https://github.com/dotnet/runtime/blob/v9.0.0/src/coreclr/System.Private.CoreLib/src/System/GC.CoreCLR.cs
+  - title: 'ecalllist.h bei Tag v9.0.0'
+    url: https://github.com/dotnet/runtime/blob/v9.0.0/src/coreclr/vm/ecalllist.h
+  - title: 'comutilnative.cpp bei Tag v9.0.0'
+    url: https://github.com/dotnet/runtime/blob/v9.0.0/src/coreclr/vm/comutilnative.cpp
+  - title: '.NET Source Browser'
+    url: https://source.dot.net
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './runtime-repo.steps';
+import fcallScript from './runtime-repo-fcall.steps';
+import { commitCode } from './runtime-repo-verify';
+
+<Block n={1} title="Das Problem">
+
+Diese Plattform erklärt dir mentale Modelle der Runtime: wie ein Host die Version wählt, wie die Runtime startet, wie ein Typ geladen wird. Jedes Modell ist eine Vereinfachung, und jede Vereinfachung kann an der entscheidenden Stelle falsch sein. Dokumentation veraltet, Blogposts beziehen sich auf eine Version von vor drei Jahren, und Antworten in Foren wiederholen oft, was vor .NET Core galt. Irgendwann stehst du vor einer Frage, die keine dieser Quellen sicher beantwortet: Wirft diese Methode hier wirklich? Alloziert sie? Was macht `GC.Collect()` eigentlich, bevor der GC anfängt?
+
+Die letzte Instanz ist der Quellcode. .NET ist seit Jahren quelloffen, und fast alles, was in dieser Plattform beschrieben wird, liegt in einem einzigen Repository: **dotnet/runtime** auf GitHub. Darin stecken die Runtime CoreCLR mit VM, JIT und GC, die komplette Klassenbibliothek, die Host-Komponenten, die zweite Runtime Mono und die Design-Dokumente des .NET-Teams, darunter das Book of the Runtime.
+
+Das Problem ist die Größe. Das Repo enthält Millionen Zeilen C# und C++, und wer es zum ersten Mal öffnet, sieht hunderte Ordner ohne erkennbare Ordnung. Dazu kommen zwei Fallen, die selbst erfahrene Entwickler regelmäßig erwischen: Die Grenze zwischen C# und C++ verläuft nicht dort, wo man sie vermutet, und der Code auf der Startseite ist nicht der Code, der auf deinem Rechner läuft.
+
+Diese Lektion gibt dir eine Landkarte, zeigt die Übergänge zwischen verwaltetem und nativem Code und spielt eine Suche von einer öffentlichen API bis in den GC einmal vollständig durch. Bauen musst du dafür nichts. Lesen reicht.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen das Modell:
+
+1. **Ein Repo, drei große Teile.** Laut Workflow-Dokumentation besteht dotnet/runtime aus den Runtimes (CoreCLR und Mono), den Bibliotheken und den Hosts mit Installern. Jeder Teil hat seinen eigenen Bereich unter `src/`.
+2. **Die meiste Klassenbibliothek ist C#.** Auch `System.Private.CoreLib` ist überwiegend verwalteter Code. Nur an wenigen, klar markierten Stellen ruft sie in die Runtime.
+3. **Übergänge sind markiert.** Ein Aufruf aus C# in die Runtime ist entweder ein **FCall** (`extern` mit `MethodImplOptions.InternalCall`) oder ein **QCall** (ein P/Invoke auf die Pseudobibliothek `"QCall"`). Jede dieser Markierungen führt über einen Namen zu genau einer C++-Funktion.
+4. **Ein Name ist der Suchschlüssel.** Methodenname, `EntryPoint`, Eintrag in einer Tabelle: Wer den richtigen Bezeichner kopiert und sucht, folgt dem Aufruf durch alle Schichten.
+5. **Die Version entscheidet.** Lies den Stand, der zu deiner Runtime passt: einen Tag wie `v9.0.0` oder den Zweig `release/9.0`. `main` ist die nächste Version, die es noch nicht gibt.
+
+<Callout kind="fehlannahme">
+  „Die Klassenbibliothek ist in C++ geschrieben, C# ist nur eine dünne Hülle.“ Nein: `List<T>`,
+  `Dictionary<TKey, TValue>`, `string.Split`, LINQ, `HttpClient` und der größte Teil von CoreLib
+  sind C#. Nativer Code beginnt erst an markierten Übergängen, und das .NET-Team verschiebt seit
+  Jahren Code aus C++ nach C#, weil der JIT verwalteten Code gut optimiert und er sicherer zu
+  schreiben ist.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Der Weg von `GC.Collect()` bis zum GC, gelesen beim Tag `v9.0.0`. Achte darauf, welcher Bezeichner dich jeweils zur nächsten Datei führt. Ab Schritt 3 ist es immer derselbe.
+
+<StepPlayer script={script} />
+
+Der Code-Tab zeigt die vier Fundstellen untereinander, die ersten Zeilen wörtlich aus `GC.CoreCLR.cs`, die C++-Teile als Kommentar. Bemerkenswert ist, wie wenig nativer Code zwischen der öffentlichen API und dem GC liegt: eine Zeile in einer Tabelle und eine Funktion mit einem echten Befehl. Prüfung der Argumente, Umrechnung der Modi und Überladungen sind alle C#.
+
+{/* TODO(verify): Line excerpts in runtime-repo.steps.ts were checked against raw files at tag v9.0.0 on 2026-11-25; recheck when pinning to a commit permalink. */}
+
+</Block>
+
+<Block n={4} title="Die Landkarte des Repos">
+
+### Die oberste Ebene
+
+Im Wurzelordner liegen die Skripte `build.sh` und `build.cmd`, die README, die Ordner `docs/`, `eng/` (Infrastruktur für den Build) und `src/`. Unter `src/` beginnt die eigentliche Arbeit:
+
+| Ordner | Inhalt | Sprache |
+| --- | --- | --- |
+| `src/coreclr/` | die Runtime CoreCLR: VM, JIT, GC, Binder, Native AOT, CoreCLR-spezifischer Teil von CoreLib | C++, C# |
+| `src/libraries/` | die Klassenbibliothek: je Assembly ein Ordner, dazu der gemeinsame Teil von CoreLib | C# |
+| `src/native/` | nativer Code, den mehrere Teile teilen: die Host-Komponenten, Bibliotheken wie `System.Native` | C, C++ |
+| `src/mono/` | die Runtime Mono für Mobilplattformen und WebAssembly | C, C# |
+| `src/installer/` | Pakete, Installer und Tests der Host-Komponenten | C#, MSBuild |
+| `src/tests/` | Tests der Runtime selbst, also für VM, JIT und GC | C#, IL |
+
+{/* TODO(verify): Purpose of eng/ and src/tests/ (src/tests/README.md) and that src/installer/ holds packaging and host tests (listing on main 2026-11: managed, pkg, tests). */}
+
+### Innerhalb von src/coreclr
+
+Die Unterordner von `src/coreclr/` entsprechen fast eins zu eins den Bausteinen aus der Lektion „Die Bausteine von .NET“:
+
+| Ordner | Baustein |
+| --- | --- |
+| `vm/` | die VM: Typladen, MethodTable, Threads, Exceptions, Interop, Start der Runtime (`ceemain.cpp`), FCall- und QCall-Tabellen |
+| `jit/` | RyuJIT, der JIT-Compiler |
+| `gc/` | der Garbage Collector, nur über eine Schnittstelle mit der VM verbunden |
+| `binder/` | der native Teil des Assembly-Binders, der Namen in Dateien auflöst |
+| `System.Private.CoreLib/` | der CoreCLR-spezifische Teil von CoreLib, erkennbar an Dateien wie `GC.CoreCLR.cs` |
+| `classlibnative/` | native Implementierungen einiger CoreLib-Funktionen |
+| `nativeaot/` | Runtime und CoreLib-Teil von Native AOT |
+| `md/` | Lesen und Schreiben von Metadaten |
+| `hosts/` | einfache Test-Hosts und die Header-Datei der Hosting-Schnittstelle |
+
+{/* TODO(verify): Folder roles for src/coreclr/md (metadata), src/coreclr/hosts (corerun, coreclrhost.h) and src/coreclr/classlibnative on main and release/9.0. */}
+
+### Eine CoreLib aus drei Quellen
+
+`System.Private.CoreLib` liegt nicht an einer Stelle. Der größte Teil, etwa `String.cs`, `Object.cs` oder `List.cs`, steht unter `src/libraries/System.Private.CoreLib/src/` und wird von allen drei Runtimes geteilt. Was nur für eine Runtime gilt, steht in deren Ordner und ergänzt die gemeinsame Klasse als `partial class`: `src/coreclr/System.Private.CoreLib/` für CoreCLR, `src/mono/System.Private.CoreLib/` für Mono, `src/coreclr/nativeaot/System.Private.CoreLib/` für Native AOT.
+
+Am Beispiel `GC`: Die gemeinsame Datei ist `GC.cs`, dazu kommen `GC.CoreCLR.cs`, `GC.Mono.cs` und `GC.NativeAot.cs`. Die Endung im Dateinamen sagt dir sofort, für welche Runtime ein Stück Code gilt. Wenn du verstehen willst, was auf einem normalen Desktop- oder Serverprozess passiert, ist die Variante `.CoreCLR.cs` die richtige.
+
+### Klassenbibliothek: ref, src, tests
+
+Jede andere Assembly hat unter `src/libraries/` einen eigenen Ordner mit ihrem Namen, etwa `System.Collections/`. Darin gibt es fast immer drei Unterordner: `ref/` mit dem Quelltext der **Referenzassembly**, also nur der öffentlichen Signaturen, `src/` mit der Implementierung und `tests/` mit den Unit-Tests. Die Datei `src/libraries/System.Runtime/ref/System.Runtime.cs` ist damit die lesbarste Beschreibung der öffentlichen API von `System.Runtime`, gegen die dein Code kompiliert wird.
+
+### Wo der Host liegt
+
+Die Host-Komponenten aus „Der Host: dotnet, hostfxr, hostpolicy“ liegen unter `src/native/corehost/`, mit Unterordnern wie `fxr/`, `apphost/` und `dotnet/`. Das war nicht immer so: Bis .NET 5 lag derselbe Code unter `src/installer/corehost/`. Wer einen älteren Blogpost liest, findet deshalb Pfade, die es heute nicht mehr gibt.
+
+{/* TODO(verify): Host source moved from src/installer/corehost (present in release/5.0) to src/native/corehost (present in release/6.0); subfolders of src/native/corehost on main (fxr, apphost, dotnet, hostpolicy?). */}
+
+### Die Dokumentation im Repo
+
+Unter `docs/design/` liegen die Design-Dokumente. `docs/design/coreclr/botr/` ist das **Book of the Runtime** (BOTR), eine Sammlung von Kapiteln, in denen Entwickler der Runtime einzelne Teile erklären: Typsystem, GC, Typlader, Threading, CoreLib. `docs/design/features/` beschreibt einzelne Funktionen, etwa die Host-Komponenten, die Auflösung von Framework-Versionen oder die Konfliktauflösung zwischen App- und Framework-Assemblies. `docs/workflow/` erklärt Bauen, Testen und Debuggen. `docs/project/glossary.md` übersetzt die vielen Abkürzungen, auf die du im Code stößt.
+
+</Block>
+
+<Block n={5} title="Wo verwalteter und nativer Code sich treffen">
+
+### Warum es Übergänge braucht
+
+CoreLib ist eng mit der VM verwoben. Manches kann C# nicht selbst: ein Objekt im GC-Heap anlegen, eine Sammlung auslösen, die MethodTable eines Typs zur Laufzeit befragen. Dafür muss verwalteter Code in die C++-Runtime rufen. Das Book of the Runtime beschreibt in seinem Kapitel über CoreLib zwei Wege dafür, und beide sind im Quelltext eindeutig erkennbar.
+
+### QCall: ein P/Invoke in die Runtime
+
+Ein **QCall** ist im Kern ein gewöhnlicher P/Invoke. Er wird in C# mit `LibraryImport` (früher `DllImport`) deklariert, nennt als Bibliothek aber die Konstante `RuntimeHelpers.QCall` mit dem Wert `"QCall"`. Die Runtime lädt dafür keine Datei, sondern schaut in eine eingebaute Tabelle. Argumente werden wie bei jedem P/Invoke in native Typen umgewandelt, und der Thread wechselt in den **präemptiven** Modus, in dem der GC jederzeit laufen darf. Objektverweise reisen nur verpackt über spezielle Handles, etwa `ObjectHandleOnStack`, damit der GC sie sieht.
+
+Laut BOTR sind QCalls der bevorzugte Weg, weil sie schwer falsch zu benutzen sind. Auf der nativen Seite sind sie freie C-Funktionen mit `extern "C"` und `QCALLTYPE`, eingerahmt von `BEGIN_QCALL` und `END_QCALL`. Gefunden werden sie über ihren Namen: In .NET 8, 9 und 10 steht jeder QCall als `DllImportEntry(Name)` in `src/coreclr/vm/qcallentrypoints.cpp`.
+
+{/* TODO(verify): RuntimeHelpers.QCall = "QCall" in src/libraries/System.Private.CoreLib/src/System/Runtime/CompilerServices/RuntimeHelpers.cs (checked at release/9.0, "*" under NATIVEAOT); qcallentrypoints.cpp present in release/8.0, release/9.0 and release/10.0 (checked 2026-11). */}
+
+### FCall: direkt in die VM
+
+Ein **FCall** ist älter und direkter. In C# ist er eine `extern`-Methode mit `[MethodImpl(MethodImplOptions.InternalCall)]`, ohne Rumpf und ohne Bibliotheksnamen. Der Aufruf springt ohne Umwandlung und ohne Moduswechsel in eine C++-Funktion, die mit Makros wie `FCIMPL1` definiert ist. Objekte kommen als rohe Zeiger an.
+
+Das ist schnell, aber gefährlich. Der Thread bleibt im kooperativen Modus, der GC kann also nicht nebenher laufen, und wenn die Funktion doch etwas tut, das einen GC auslöst, muss sie vorher von Hand einen Frame aufbauen und ihre Objektverweise schützen. Vergisst sie das, zeigen die Verweise nach dem GC auf alte Adressen. Das BOTR nennt so etwas ein **GC-Loch** und empfiehlt FCalls nur noch für sehr kurze, häufige Wege, die weder allozieren noch Locks nehmen noch werfen.
+
+Wie ein FCall zu seiner Implementierung findet, hängt von der Version ab, und genau das zeigt das folgende Beispiel:
+
+<StepPlayer script={fcallScript} />
+
+Bis .NET 10 steht die Zuordnung in `src/coreclr/vm/ecalllist.h`: pro Klasse eine Liste, die Methodennamen auf C++-Funktionen abbildet. Im aktuellen `main` hat das .NET-Team FCalls und QCalls in eine gemeinsame, nach Namen sortierte Tabelle in `src/coreclr/vm/runtimehelpers.cpp` überführt, in der ein FCall unter „Typname, Unterstrich, Methodenname“ steht, etwa `String_IsInterned`. Für dich heißt das: Was du suchst, hängt davon ab, welche Version du liest.
+
+{/* TODO(verify): Unified entrypoint table s_RuntimeHelpers in src/coreclr/vm/runtimehelpers.cpp on main (BOTR corelib.md "Registering your QCall or FCall method", main 2026-11); ecalllist.h and qcallentrypoints.cpp no longer exist on main. Which .NET version ships this (11?). */}
+
+### Intrinsics: weder noch
+
+Es gibt einen dritten Fall, der beim Lesen verwirrt. Manche Methoden tragen `[Intrinsic]`. Das heißt: Der JIT kennt sie beim Namen und darf ihren Aufruf durch eigenen Code ersetzen. `string.Length` ist so ein Fall. Im Quelltext ist der Getter eine Zeile C#, die das Feld `_stringLength` liest, und der JIT erkennt ihn als `NI_System_String_get_Length`, kann ihn bei einem konstanten String sogar durch die Zahl ersetzen. Einen Übergang in C++ gibt es hier gar nicht. Willst du wissen, was der JIT mit einem Intrinsic macht, suchst du den Namen im Ordner `src/coreclr/jit/`.
+
+{/* TODO(verify): NI_System_String_get_Length handling in src/coreclr/jit/importercalls.cpp (release/9.0: constant folding for ldstr + get_Length). */}
+
+### Und der Rest der Bibliothek?
+
+Assemblies außerhalb von CoreLib dürfen weder FCalls noch QCalls benutzen, die Runtime prüft das. Brauchen sie das Betriebssystem, gehen sie über ganz normale P/Invokes: unter Windows direkt in Systembibliotheken, unter Unix meist in die Hilfsbibliothek `System.Native`, deren C-Quelltext unter `src/native/libs/` liegt. Die C#-Seite dieser Aufrufe liegt in Klassen namens `Interop` mit Unterklassen wie `Interop.Sys`, die meist in Dateien unter `src/libraries/Common/src/Interop/` stehen.
+
+{/* TODO(verify): FCalls outside CoreLib throw (ECall::GetFCallImpl checks pMT->GetModule()->IsSystem(), seen on main); QCalls are only resolved for CoreLib; location src/libraries/Common/src/Interop/Unix/System.Native/ for Interop.Sys declarations. */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### main ist nicht deine Version
+
+Die Startseite von dotnet/runtime zeigt den Zweig `main`. Dort entsteht die nächste Hauptversion, und dort wird kräftig umgebaut. Das Beispiel oben ist kein Sonderfall: Zwischen zwei Versionen wandern FCalls nach C#, Tabellen werden zusammengelegt, Dateien umbenannt. Wer mit .NET 9 arbeitet und auf `main` liest, sieht womöglich Verhalten, das sein Prozess gar nicht hat.
+
+Jede veröffentlichte Version hat einen **Tag** im Repo, etwa `v8.0.0`, `v9.0.0` oder `v10.0.0`, und jede Hauptversion einen Zweig `release/8.0`, `release/9.0` und so weiter, in dem die Patches entstehen. Auf GitHub wählst du ihn über das Auswahlfeld für Zweige und Tags, oder du ersetzt `main` in der Adresse durch den Namen. Mit welchem Commit deine installierte Runtime gebaut wurde, kannst du sogar direkt aus ihr auslesen, wie unten im Abschnitt zum Selbstnachweisen gezeigt.
+
+{/* TODO(verify): Tag naming for patch releases (e.g. v9.0.11) and that every servicing release gets a tag. */}
+
+### Links, die nicht wandern
+
+Ein Link wie `github.com/dotnet/runtime/blob/main/src/coreclr/vm/ecalllist.h` funktioniert heute schon nicht mehr, weil es die Datei auf `main` nicht mehr gibt. Ein Link mit Zeilennummer auf `main` zeigt nach ein paar Wochen auf eine andere Zeile. Wenn du eine Stelle festhalten willst, für ein Ticket, eine Code-Review oder deine eigenen Notizen, verlinke einen Tag oder einen Commit. Auf GitHub erzeugt die Taste `y` aus der aktuellen Ansicht einen **Permalink** mit dem vollständigen Commit-Hash.
+
+### Der Code gilt für eine andere Runtime
+
+Die zweite Falle ist die Dateiendung. `GC.Mono.cs` und `GC.CoreCLR.cs` sehen auf den ersten Blick ähnlich aus, beschreiben aber zwei verschiedene Runtimes. Wer über die Suche auf eine Datei unter `src/mono/` oder `src/coreclr/nativeaot/` stößt, liest Code, der in einer gewöhnlichen Desktop- oder Server-App nicht läuft. Prüf beim ersten Blick auf eine Fundstelle immer den Pfad.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Suchen statt klicken
+
+Drei Werkzeuge decken fast jede Frage ab:
+
+- **source.dot.net** ist ein Quellbrowser über die Klassenbibliothek. Er löst Bezeichner auf wie eine IDE: Klick auf eine Methode führt zur Definition, „Find references“ zu allen Aufrufern. Ideal für den C#-Teil, aber nicht für C++. Achte auf die angezeigte Version.
+- **GitHub-Codesuche** im Repo findet Bezeichner in C# und C++ zugleich. Das ist der schnellste Weg über die Sprachgrenze, etwa vom `EntryPoint` eines QCalls zur C++-Funktion.
+- **Ein lokaler Klon** mit `git grep` ist am verlässlichsten, weil du gezielt einen Tag auschecken kannst. Laut Workflow-Dokumentation überträgt ein vollständiger Klon rund 400 bis 500 MB. Bauen musst du zum Lesen nicht.
+
+{/* TODO(verify): Which version source.dot.net indexes (main or latest release) and its "Find references" feature name. */}
+
+### Welche Frage, welcher Ort
+
+| Frage | Wo suchen | Suchbegriff |
+| --- | --- | --- |
+| Was tut eine öffentliche Methode? | source.dot.net oder `src/libraries/` | Typ- und Methodenname |
+| Methode ist `extern` mit `InternalCall` | `ecalllist.h` (bis .NET 10), `runtimehelpers.cpp` (main) | Methodenname in Anführungszeichen bzw. `Typ_Methode` |
+| Methode ist `LibraryImport` auf `QCall` | ganzes Repo | Wert von `EntryPoint` |
+| Methode trägt `[Intrinsic]` | `src/coreclr/jit/` | `NI_` plus Namensraum, Typ und Methode |
+| Wie startet die Runtime? | `src/coreclr/vm/ceemain.cpp` | `EEStartupHelper` |
+| Welche Konfigurationsschalter gibt es? | `src/coreclr/inc/clrconfigvalues.h` | Name ohne Präfix `DOTNET_` |
+| Wie ist ein Feature gedacht? | `docs/design/` | Thema |
+
+{/* TODO(verify): src/coreclr/inc/clrconfigvalues.h (seen at v9.0.0, e.g. TieredCompilation, gcServer) is the complete list of runtime knobs readable as DOTNET_<name>; EEStartupHelper in ceemain.cpp at v9.0.0 confirmed; naming scheme NI_<Namespace>_<Type>_<Method> for JIT named intrinsics. */}
+
+### Tests als Dokumentation
+
+Wenn der Code eine Frage offenlässt, beantworten oft die Tests sie. Für die Bibliothek liegen sie neben dem Code in `src/libraries/<Assembly>/tests/`, für Runtime, JIT und GC unter `src/tests/`. Ein Test zeigt dir ein minimales, lauffähiges Beispiel und das erwartete Ergebnis, und weil er in CI läuft, ist er aktueller als jeder Blogpost. Gerade bei Grenzfällen, etwa was eine Methode bei leerer Eingabe tut, lohnt der Blick dort zuerst.
+
+### Bauen nur bei Bedarf
+
+Wer selbst Änderungen ausprobieren will, baut mit `build.sh` (Linux und macOS) oder `build.cmd` (Windows) im Wurzelordner. Die Workflow-Dokumentation beschreibt die Voraussetzungen je Plattform und die Konfigurationen Debug, Checked (nur CoreCLR, optimiert mit Assertions) und Release. Für alles in dieser Plattform reicht Lesen.
+
+</Block>
+
+<Block n={8} title="Was sich zwischen Versionen ändert">
+
+Der Code der Runtime ist in Bewegung, und die Richtung ist klar: weg von C++, hin zu C#. Das BOTR sagt ausdrücklich, dass Teile der CLR, die stark auf FCalls angewiesen waren, nach verwaltetem Code portiert wurden, etwa Reflection, Teile von Encoding und String-Operationen, und dass das .NET-Team diesen Weg fortsetzen will. `Object.GetType()` ist ein Beispiel aus jüngster Zeit, `GC.Collect()` hat zwischen .NET 9 und 10 einen zusätzlichen Parameter in seinem QCall bekommen.
+
+Auch die Struktur wandert. Der Host zog von `src/installer/` nach `src/native/`, die Tabellen für Übergänge wurden zusammengelegt. Pfade aus dieser Lektion sind deshalb Momentaufnahmen. Was stabil bleibt, ist das Vorgehen: Markierung im C#-Code erkennen, Bezeichner kopieren, im richtigen Stand suchen.
+
+<Callout kind="version">
+  Die Beispiele dieser Lektion sind beim Tag `v9.0.0` gelesen, ergänzt um Vergleiche mit
+  `release/10.0` und `main` (Stand November 2026). Bei einer anderen Version können Dateinamen,
+  Zeilen und Signaturen abweichen. Die Mechanismen FCall und QCall gibt es in allen Versionen seit
+  .NET Core.
+</Callout>
+
+{/* TODO(verify): That FCall and QCall exist since .NET Core 1.0 (both predate .NET Core in the desktop CLR); _Collect signature change (lowMemoryPressure) first shipped in .NET 10. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+### Den Commit deiner Runtime finden
+
+Jede Assembly der Runtime trägt eine Informationsversion, an die beim offiziellen Build der Commit-Hash aus dotnet/runtime angehängt wird. Damit findest du den exakten Stand, aus dem deine CoreLib gebaut ist. Führe das Programm lokal aus.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht: dotnet new console, Program.cs ersetzen, dotnet run. In SharpLab läuft eine andere Runtime-Version als bei dir."
+  code={commitCode}
+/>
+
+Erwartetes Ergebnis: Die dritte Zeile hat die Form `9.0.0+` gefolgt von einem 40-stelligen Hash, die vierte ist ein Link auf genau diesen Stand des Repos. Öffne ihn und navigiere zu `src/coreclr/System.Private.CoreLib/src/System/GC.CoreCLR.cs`. Das ist der Code, der in deinem Prozess läuft.
+
+{/* TODO(verify): Run on .NET 8 and 9 and confirm the "+<hash>" suffix and that the hash resolves on github.com/dotnet/runtime. */}
+
+### Den Weg selbst gehen
+
+Wiederhole das Durchspielen mit einer anderen API, zum Beispiel `GC.GetTotalMemory` oder `GC.GetGeneration`:
+
+```bash
+git clone --filter=blob:none https://github.com/dotnet/runtime
+cd runtime
+git checkout v9.0.0
+git grep -n "GCInterface_GetTotalMemory"
+git grep -n "\"GetGeneration\"" src/coreclr/vm
+```
+
+Erwartetes Ergebnis: Der erste Befehl findet drei Stellen, die Deklaration in `GC.CoreCLR.cs`, den Eintrag in `qcallentrypoints.cpp` und die Funktion in `comutilnative.cpp`. Der zweite findet `GetGeneration` in `ecalllist.h`, also einen FCall. Wechsle danach mit `git checkout main` auf den aktuellen Stand und such noch einmal: Die Tabelle liegt jetzt woanders.
+
+{/* TODO(verify): git grep results at v9.0.0 for GCInterface_GetTotalMemory (GC.CoreCLR.cs, qcallentrypoints.cpp, comutilnative.cpp, possibly comutilnative.h) and "GetGeneration" in ecalllist.h (seen in release/9.0). */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="runtime-repo"
+  questions={[
+    {
+      q: 'Wo liegt der Quelltext von List<T>?',
+      options: [
+        'In C++ unter src/coreclr/vm',
+        'In C# unter src/libraries/System.Private.CoreLib/src',
+        'Nur als Referenzassembly, die Implementierung ist nicht öffentlich',
+      ],
+      correct: 1,
+      explanation:
+        'List<T> ist gewöhnliches C# im gemeinsamen Teil von CoreLib. Die BCL ist überwiegend verwalteter Code, nativer Code beginnt erst an markierten Übergängen.',
+    },
+    {
+      q: 'Eine Methode ist als [LibraryImport(RuntimeHelpers.QCall, EntryPoint = "X_Y")] deklariert. Was ist das?',
+      options: [
+        'Ein P/Invoke in eine Systembibliothek des Betriebssystems',
+        'Ein QCall: ein P/Invoke in die Runtime selbst, aufgelöst über den Namen X_Y',
+        'Ein FCall',
+      ],
+      correct: 1,
+      explanation:
+        'QCalls sind P/Invokes auf die Pseudobibliothek "QCall". Die Runtime sucht den EntryPoint in ihrer eingebauten Tabelle. Der Name ist zugleich der Suchschlüssel für die C++-Funktion.',
+    },
+    {
+      q: 'Woran erkennst du einen FCall im C#-Code?',
+      options: [
+        'An [Intrinsic]',
+        'An extern zusammen mit [MethodImpl(MethodImplOptions.InternalCall)]',
+        'An der Dateiendung .CoreCLR.cs',
+      ],
+      correct: 1,
+      explanation:
+        'FCalls sind extern-Methoden mit InternalCall. [Intrinsic] markiert Methoden, die der JIT ersetzen darf, und .CoreCLR.cs sagt nur, dass der Code CoreCLR-spezifisch ist.',
+    },
+    {
+      q: 'Warum empfiehlt das Book of the Runtime QCalls statt FCalls?',
+      options: [
+        'QCalls sind immer schneller',
+        'QCalls wechseln wie P/Invoke in den präemptiven Modus und machen GC-Löcher schwer, FCalls verlangen Handarbeit beim Schutz von Objektverweisen',
+        'FCalls funktionieren nur unter Windows',
+      ],
+      correct: 1,
+      explanation:
+        'FCalls bekommen Objekte als rohe Zeiger und laufen im kooperativen Modus. Wer dort einen GC auslöst, ohne Verweise zu schützen, erzeugt ein GC-Loch. QCalls vermeiden das durch ihr Programmiermodell.',
+    },
+    {
+      q: 'Du hast .NET 9 installiert und liest Object.GetType() auf main. Was ist das Risiko?',
+      options: [
+        'Keins, main entspricht der neuesten installierten Version',
+        'main ist die nächste Version, dort kann die Methode anders implementiert sein als in deinem Prozess',
+      ],
+      correct: 1,
+      explanation:
+        'In v9.0.0 ist GetType() ein FCall in ecalllist.h, in release/10.0 ist es C#. Lies den Tag oder Release-Zweig, der zu deiner Runtime passt.',
+    },
+    {
+      q: 'Du willst einen Link auf eine bestimmte Zeile im Runtime-Code in ein Ticket schreiben. Was ist am stabilsten?',
+      options: [
+        'Ein Link auf main mit Zeilennummer',
+        'Ein Permalink mit Commit-Hash oder ein Link auf einen Tag',
+      ],
+      correct: 1,
+      explanation:
+        'Auf main verschieben sich Zeilen, und Dateien verschwinden. Ein Commit-Hash oder ein Tag zeigt für immer auf denselben Inhalt.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- **dotnet/runtime** enthält CoreCLR (VM, JIT, GC), Mono, die ganze Klassenbibliothek, die Host-Komponenten und die Design-Dokumente samt Book of the Runtime. Der Quellcode ist die letzte Instanz für jede Frage zur Runtime.
+- `src/coreclr/` ist die Runtime, `src/libraries/` die Bibliothek mit `ref/`, `src/` und `tests/` je Assembly, `src/native/corehost/` der Host, `docs/design/` die Dokumentation.
+- Die Klassenbibliothek ist **überwiegend C#**. CoreLib besteht aus einem gemeinsamen Teil und runtime-spezifischen Dateien wie `GC.CoreCLR.cs`.
+- Übergänge in die Runtime sind markiert: **QCall** als `LibraryImport` auf `"QCall"`, **FCall** als `extern` mit `InternalCall`. `[Intrinsic]` heißt, der JIT darf den Aufruf ersetzen.
+- Ein Bezeichner ist der Suchschlüssel: `EntryPoint` oder Methodenname kopieren und über die Sprachgrenze hinweg suchen.
+- **main ist nicht deine Version.** Lies den Tag oder `release/x.0` deiner Runtime und verlinke Commits statt `main`.
+- Zum Lesen musst du nichts bauen. source.dot.net, GitHub-Suche und `git grep` auf einem Klon reichen.
+
+</Block>

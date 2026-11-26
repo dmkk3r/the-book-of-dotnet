@@ -1,0 +1,137 @@
+---
+import Icon from '@/components/Icon.astro';
+import CodeBlock from './CodeBlock.astro';
+
+interface ExpectedRow {
+  method: string;
+  allocated?: string;
+  mean?: string;
+}
+
+interface Props {
+  /** How to check it in SharpLab. */
+  sharplab?: string;
+  /** Code to paste into SharpLab. */
+  code?: string;
+  /** BenchmarkDotNet class. */
+  benchmark?: string;
+  /** What the benchmark should show. */
+  expected?: ExpectedRow[];
+  /** Short note on the measurement (e.g. runtime version). */
+  note?: string;
+}
+
+const { sharplab, code, benchmark, expected = [], note } = Astro.props;
+const showMean = expected.some((r) => r.mean !== undefined);
+const showAllocated = expected.some((r) => r.allocated !== undefined);
+---
+
+<div class="verify">
+  {(sharplab || code) && (
+    <div class="card">
+      <h3>In SharpLab ansehen</h3>
+      {sharplab && <p>{sharplab}</p>}
+      {code && <CodeBlock code={code} />}
+      <p class="link">
+        <a href="https://sharplab.io/" rel="noopener noreferrer" target="_blank">
+          sharplab.io öffnen<span class="sr-only"> (neues Fenster)</span> <Icon name="external" />
+        </a>
+      </p>
+    </div>
+  )}
+  {benchmark && (
+    <div class="card">
+      <h3>Mit BenchmarkDotNet messen</h3>
+      <p>Der MemoryDiagnoser zeigt pro Aufruf, wie viele Bytes alloziert werden.</p>
+      <CodeBlock code={benchmark} />
+      {expected.length > 0 && (
+        <div class="res-wrap">
+          <table class="res">
+            <caption class="sr-only">Erwartetes Ergebnis</caption>
+            <thead>
+              <tr>
+                <th scope="col">Methode</th>
+                {showMean && <th scope="col">Mean</th>}
+                {showAllocated && <th scope="col">Allocated</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {expected.map((row) => (
+                <tr>
+                  <td>{row.method}</td>
+                  {showMean && <td>{row.mean ?? ''}</td>}
+                  {showAllocated && (
+                    <td class={row.allocated && row.allocated !== '-' ? 'hot' : ''}>
+                      {row.allocated && row.allocated !== '-' ? row.allocated : 'keine'}
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {note && <p class="note">{note}</p>}
+    </div>
+  )}
+</div>
+
+<style>
+  .verify {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    padding: 16px 20px;
+    min-width: 0;
+  }
+  h3 {
+    margin: 0 0 6px;
+    font-size: 1.125rem;
+  }
+  .card > p {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 15px;
+  }
+  .card > p.link {
+    margin: 12px 0 0;
+    font-size: 14px;
+  }
+  .card > p.note {
+    margin: 10px 0 0;
+    font-size: 13px;
+  }
+  .res {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    margin-top: 12px;
+  }
+  .res th,
+  .res td {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .res th {
+    font-weight: 600;
+    border-bottom-color: var(--line-strong);
+  }
+  .res-wrap {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  .res td {
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+  }
+  .res td.hot {
+    font-weight: 600;
+  }
+</style>

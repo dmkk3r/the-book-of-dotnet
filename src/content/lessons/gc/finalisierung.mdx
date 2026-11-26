@@ -1,0 +1,384 @@
+---
+id: finalisierung
+title: Finalisierung
+summary: Was mit einem Objekt passiert, das einen Finalizer hat, warum es dadurch mindestens eine Collection länger lebt und weshalb SafeHandle und Dispose fast immer die bessere Wahl sind.
+status: draft
+dotnetVersion: '5+'
+sources:
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Finalizer (C#-Programmierhandbuch, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/programming-guide/classes-and-structs/finalizers
+  - title: 'Object.Finalize (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.object.finalize
+  - title: 'Implementieren einer Dispose-Methode (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/implementing-dispose
+  - title: 'Implementieren einer DisposeAsync-Methode (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/implementing-disposeasync
+  - title: 'Bereinigen von nicht verwalteten Ressourcen (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/unmanaged
+  - title: 'GC.SuppressFinalize (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.suppressfinalize
+  - title: 'SafeHandle (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.interopservices.safehandle
+  - title: 'CriticalFinalizerObject (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.constrainedexecution.criticalfinalizerobject
+  - title: 'Quellcode des GC in dotnet/runtime (gc.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gc.cpp
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './finalisierung.steps';
+import suppressScript from './finalisierung-suppress.steps';
+import threadScript from './finalisierung-thread.steps';
+import { lifecycleCode, benchmarkCode } from './finalisierung-verify';
+
+<Block n={1} title="Das Problem">
+
+Der GC verwaltet Speicher, und zwar nur Speicher auf dem verwalteten Heap. Viele Objekte halten aber mehr als das: Ein `FileStream` besitzt ein Datei-Handle des Betriebssystems, ein `Socket` einen Socket-Deskriptor, ein Wrapper um eine native Bibliothek vielleicht einen Zeiger auf Speicher, den `malloc` geliefert hat. Solche Dinge heißen **nicht verwaltete Ressourcen**. Für den GC sind sie unsichtbar. Er sieht im Objekt ein Feld vom Typ `IntPtr`, also eine Zahl, und weiß nicht, dass dahinter eine geöffnete Datei steckt.
+
+Gibt der GC so ein Objekt einfach frei, ist die Zahl weg, die Datei aber bleibt offen. Das Handle ist verloren, bis der Prozess endet. Bei ein paar Dateien fällt das nicht auf, bei einem Server, der pro Anfrage eine Verbindung öffnet, gehen irgendwann die Handles aus.
+
+Der richtige Weg ist, solche Ressourcen ausdrücklich freizugeben, sobald man sie nicht mehr braucht. Dafür gibt es `IDisposable` und `using`. Aber was passiert, wenn jemand `Dispose` vergisst? Die Runtime bietet dafür ein Sicherheitsnetz: den **Finalizer**, eine Methode, die der GC aufrufen lässt, bevor er den Speicher eines Objekts zurückholt.
+
+Das klingt nach einer einfachen Idee, ist aber eine der teuersten und am häufigsten missverstandenen Funktionen der Runtime. Der Zielkonflikt: Der GC soll Speicher schnell und ohne Rücksicht auf Programmlogik einsammeln, ein Finalizer ist aber genau das, beliebiger Code, der noch einmal auf das tote Objekt zugreifen will. Wie die Runtime beides vereinbart, erklärt diese Lektion.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+In C# schreibst du einen Finalizer mit der Destruktor-Syntax `~ClassName()`. Der Compiler macht daraus eine Überschreibung von `Object.Finalize`. Für alles Weitere reichen fünf Sätze:
+
+1. **Registrierung bei der Allokation.** Wird ein Objekt eines Typs mit Finalizer angelegt, trägt die Runtime es in die **Finalization Queue** ein. Diese Liste ist keine Root, sie hält nichts am Leben.
+2. **Tot, aber nicht frei.** Findet eine Collection so ein Objekt unerreichbar, gibt sie es nicht frei. Sie verschiebt den Eintrag in die **F-Reachable Queue** („finalization reachable“).
+3. **Die F-Reachable Queue ist eine Root.** Das Objekt und alles, worauf es verweist, überlebt diese Collection und wird promotet.
+4. **Der Finalizer läuft später, auf einem eigenen Thread.** Ein dedizierter **Finalizer-Thread** arbeitet die F-Reachable Queue ab und entfernt danach die Einträge.
+5. **Frei erst bei der nächsten Collection.** Erst wenn eine spätere Collection die Generation einschließt, in der das Objekt inzwischen liegt, wird sein Speicher frei.
+
+Das Book of the Runtime beschreibt genau diese Rolle: Objekte, die finalisiert werden müssen, werden während der Markierphase „wiederbelebt“, damit ihr Finalizer laufen kann, und erst danach behandelt der GC sie wie normalen Müll.
+
+{/* TODO(verify): Wording in BOTR garbage-collection.md about finalization ("f-reachable", promotion of finalizable objects). The names "finalization queue" and "f-reachable queue" are the conventional names (SOS !FinalizeQueue output), check against gc.cpp class CFinalize. */}
+
+<Callout kind="fehlannahme">
+  „Ein Finalizer ist ein Destruktor wie in C++: Er läuft, sobald das Objekt nicht mehr gebraucht
+  wird.“ Nein. Er läuft irgendwann nach einer Collection, auf einem fremden Thread, in keiner
+  festen Reihenfolge, und in .NET Core und .NET 5+ beim Beenden des Prozesses unter Umständen gar
+  nicht. Ein Finalizer ist ein Notnagel, kein Werkzeug für deterministisches Aufräumen.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel legt ein Objekt mit Finalizer und eines ohne an und lässt beide sofort fallen. Achte auf Schritt 5, in dem `LogFile` über die F-Reachable Queue wieder erreichbar wird, und auf Schritt 8, in dem eine Gen0-Collection den Speicher trotzdem nicht freigibt.
+
+<StepPlayer script={script} />
+
+Der entscheidende Punkt ist der Puffer. Er hat selbst keinen Finalizer, überlebt aber trotzdem, weil `LogFile` auf ihn zeigt. Ein Finalizer verlängert also nicht nur das Leben eines Objekts, sondern das seines ganzen erreichbaren Teilgraphen. Hängt an einem Objekt mit Finalizer eine große Liste oder ein Cache, wandert all das mit nach Gen1, und vielleicht sogar nach Gen2, wenn zwischen den Collections ungünstig viel passiert. Wie Promotion selbst funktioniert, zeigt „Generationen“.
+
+</Block>
+
+<Block n={4} title="Was ein Finalizer kostet">
+
+### Was der Compiler erzeugt
+
+Der C#-Compiler übersetzt den Finalizer in eine Methode `Finalize`, die den Code in ein `try` packt und im `finally` den Finalizer der Basisklasse aufruft. Die Microsoft-Dokumentation zeigt das so:
+
+```csharp
+// Was du schreibst
+class LogFile
+{
+    ~LogFile() { /* aufräumen */ }
+}
+
+// Was der Compiler daraus macht (vereinfacht)
+protected override void Finalize()
+{
+    try { /* aufräumen */ }
+    finally { base.Finalize(); }
+}
+```
+
+`Finalize` direkt zu überschreiben oder aufzurufen, verbietet C#. Die Destruktor-Syntax ist der einzige Weg, und das hat einen Grund: So ist garantiert, dass die Kette der Basisklassen-Finalizer nicht abreißt.
+
+### Die drei Kosten
+
+Erstens wird die **Allokation teurer**. Weil die Runtime das neue Objekt in die Finalization Queue eintragen muss, kann sie nicht den schnellsten Allokationspfad nehmen, bei dem nur ein Zeiger weitergeschoben wird.
+
+{/* TODO(verify): The JIT selects a slower allocation helper for types with finalizers (e.g. JIT_New instead of the fast inline allocator) and the object is registered via GCHeap::RegisterForFinalization. Measure the difference with the benchmark below. */}
+
+Zweitens kostet jedes Objekt mit Finalizer **mindestens eine zusätzliche Collection**, bevor sein Speicher frei wird. Ohne Finalizer stirbt ein kurzlebiges Objekt bei der ersten Gen0-Collection. Mit Finalizer überlebt es diese, landet in Gen1 und wird erst bei der nächsten Gen1-Collection frei, die viel seltener kommt.
+
+Drittens wird **der ganze Objektgraph promotet**. Alles, was das Objekt erreicht, überlebt mit. Das erhöht die Arbeit der Collection (Überlebende markieren und kopieren) und füllt ältere Generationen mit Objekten, die eigentlich schon tot sind. Das ist eine künstliche Midlife Crisis.
+
+### Dispose und SuppressFinalize
+
+Diese Kosten lassen sich größtenteils vermeiden, wenn das Objekt ordentlich freigegeben wird. `GC.SuppressFinalize(obj)` teilt der Runtime mit, dass der Finalizer nicht mehr laufen muss. Laut Dokumentation setzt die Methode dafür ein Bit im Object Header, das die Runtime prüft, bevor sie einen Finalizer aufruft. Ein Typ mit Finalizer ruft sie deshalb in `Dispose` auf:
+
+<StepPlayer script={suppressScript} />
+
+Die Registrierung bei der Allokation bleibt bestehen, die zusätzliche Collection und die Promotion fallen weg. Will ein Objekt später doch wieder finalisiert werden (etwa weil ein Pool es wiederverwendet), meldet `GC.ReRegisterForFinalize(obj)` es erneut an.
+
+</Block>
+
+<Block n={5} title="Reihenfolge, Threads und Wiederbelebung">
+
+### Keine Reihenfolge
+
+Zeigt Objekt A auf Objekt B und haben beide einen Finalizer, liegt die Vermutung nahe, dass A zuerst finalisiert wird, B ist ja Teil von A. Die Dokumentation von `Object.Finalize` schließt das ausdrücklich aus: Die Finalizer zweier Objekte laufen in keiner garantierten Reihenfolge, auch dann nicht, wenn eines das andere referenziert. Im Finalizer von A kann B also bereits finalisiert sein. Ein `FileStream`, auf den dein Finalizer zugreift, hat seine Datei womöglich schon geschlossen.
+
+Die einzige Abstufung bietet `CriticalFinalizerObject`. Für Objekte, die in derselben Collection eingesammelt werden, laufen alle normalen Finalizer vor allen kritischen. `SafeHandle` erbt von `CriticalFinalizerObject`. Das klassische Beispiel aus der Dokumentation: Der Finalizer eines Streams kann gepufferte Daten noch über sein `SafeHandle` schreiben, weil dessen Finalizer das Handle erst danach schließt.
+
+{/* TODO(verify): Whether FileStream in .NET 6+ (FileStreamStrategy rewrite) still has a finalizer that flushes, and the exact ordering guarantee wording in the CriticalFinalizerObject docs. */}
+
+### Ein fremder Thread
+
+Finalizer laufen nicht auf dem Thread, der das Objekt benutzt hat. In CoreCLR gibt es dafür einen einzigen dedizierten Finalizer-Thread, der nach einer Collection geweckt wird und die F-Reachable Queue abarbeitet. Das hat drei Folgen:
+
+- Ein Finalizer darf **keine Ausnahme werfen**. Eine unbehandelte Ausnahme im Finalizer beendet den Prozess, genau wie auf jedem anderen Thread.
+- Ein Finalizer darf **nicht blockieren**. Wartet er auf einen Lock, eine Netzwerkantwort oder einen UI-Thread, steht die gesamte Finalisierung.
+- Ein Finalizer braucht **Thread-Sicherheit**, falls er auf Zustand zugreift, den andere Threads gleichzeitig benutzen.
+
+{/* TODO(verify): CoreCLR uses exactly one finalizer thread (src/coreclr/vm/finalizerthread.cpp), and an unhandled exception in a finalizer terminates the process (Object.Finalize docs). */}
+
+<StepPlayer script={threadScript} />
+
+### Wiederbelebung
+
+Während der Finalizer läuft, ist das Objekt wieder ein ganz normales, erreichbares Objekt. Nichts hindert den Finalizer daran, `this` irgendwo zu speichern:
+
+```csharp
+class Phoenix
+{
+    public static Phoenix? Last;
+    ~Phoenix() => Last = this;   // Wiederbelebung
+}
+```
+
+Nach dem Finalizer ist das Objekt über `Last` wieder erreichbar und lebt weiter, mitsamt allem, worauf es zeigt. Das nennt man **Wiederbelebung** (Resurrection). Der Finalizer läuft dabei kein zweites Mal, wenn das Objekt später erneut stirbt, es sei denn, jemand ruft `GC.ReRegisterForFinalize(this)`. Wiederbelebung ist fast immer ein Fehler: Das Objekt hat seine Ressourcen bereits freigegeben, und andere Objekte im Graphen sind womöglich schon finalisiert. Interessant ist sie vor allem, weil sie erklärt, warum es zwei Arten schwacher Verweise gibt (siehe „WeakReference und GC-Handles“).
+
+### Beim Beenden des Prozesses
+
+In .NET Framework hat die Runtime beim Beenden des Prozesses versucht, ausstehende Finalizer noch auszuführen. .NET Core und .NET 5+ tun das nicht. Die C#-Dokumentation zu Finalizern sagt das ausdrücklich. Wer sich darauf verlässt, dass ein Finalizer am Programmende noch einen Puffer in eine Datei schreibt, verliert in modernem .NET Daten.
+
+{/* TODO(verify): Exact wording in the C# finalizer docs ("Whether or not finalizers are run as part of application termination is specific to each implementation of .NET ... .NET 5 (including .NET Core) or a later version doesn't call finalizers as part of application termination"). */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Finalizer ohne nicht verwaltete Ressource
+
+Der häufigste Fehler ist ein Finalizer in einer Klasse, die gar keine nicht verwaltete Ressource besitzt. Typisch ist ein „vollständiges“ Dispose-Pattern, das aus einer Vorlage übernommen wurde und einen leeren oder fast leeren Finalizer mitbringt. Er bewirkt nichts, außer dass jede Instanz langsamer alloziert wird, eine Collection länger lebt und ihren Objektgraphen mit nach Gen1 nimmt. Hält deine Klasse nur andere `IDisposable`-Objekte, braucht sie `Dispose`, aber keinen Finalizer: Die enthaltenen Objekte kümmern sich selbst um ihre Ressourcen.
+
+### Auf andere verwaltete Objekte zugreifen
+
+Ein Finalizer, der `_stream.Flush()` oder `_logger.Log(...)` aufruft, verlässt sich auf Objekte, die im selben Moment ebenfalls unerreichbar geworden sein können. Weil es keine Reihenfolge gibt, ist `_stream` vielleicht schon finalisiert und sein Handle geschlossen. Der Aufruf scheitert dann, und wenn die Ausnahme nicht abgefangen wird, beendet sie den Prozess. Die Regel aus dem Dispose-Pattern lautet deshalb: Im Finalizer nur die eigenen nicht verwalteten Ressourcen freigeben, keine anderen verwalteten Objekte anfassen.
+
+### Den Finalizer-Thread blockieren
+
+Weil es nur einen Finalizer-Thread gibt, reicht ein einziger hängender Finalizer, um die Finalisierung für den ganzen Prozess anzuhalten. Die Folge ist ein schleichendes Speicherleck: Jede Collection schiebt neue Objekte in die F-Reachable Queue, niemand arbeitet sie ab, und alles, was sie referenzieren, bleibt am Leben. Im Speicherabbild sieht das aus wie „der GC gibt nichts frei“. Ein klassischer Auslöser in Windows-Anwendungen sind COM-Objekte, deren Freigabe an einen blockierten STA-Thread gebunden ist. Mit SOS zeigt `!FinalizeQueue` die Zahl der Objekte, die auf ihren Finalizer warten, und ein Stack des Finalizer-Threads verrät, worauf er wartet (siehe „SOS mit WinDbg und lldb“).
+
+{/* TODO(verify): Output format of SOS !FinalizeQueue ("Ready for finalization N objects") and the COM STA example (RCW cleanup on the finalizer thread waiting for the STA). */}
+
+### Sich auf den Finalizer verlassen
+
+Ein Finalizer ist ein Sicherheitsnetz für vergessene Aufrufe, nicht der Plan. Wann er läuft, hängt davon ab, wann die nächste Collection der passenden Generation stattfindet, und das kann bei wenig Allokation Minuten dauern. Eine Datei bleibt so lange gesperrt, eine Datenbankverbindung so lange belegt. Und beim Prozessende läuft er womöglich gar nicht.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Wann du einen Finalizer schreibst
+
+Fast nie. Seit es `SafeHandle` gibt, ist die Empfehlung von Microsoft klar: Kapsle jedes Betriebssystem-Handle in eine von `SafeHandle` abgeleitete Klasse (oder nimm eine fertige wie `SafeFileHandle`). `SafeHandle` hat den einzigen Finalizer, den du brauchst, und bringt einiges mit, was ein selbst geschriebener nicht hat:
+
+- Es ist ein `CriticalFinalizerObject`, sein Finalizer läuft nach den normalen Finalizern.
+- Der P/Invoke-Marshaller zählt Referenzen auf das Handle mit, solange ein nativer Aufruf läuft. So kann der Finalizer das Handle nicht mitten in einem Aufruf schließen, und ein schon geschlossenes, vom Betriebssystem neu vergebenes Handle wird nicht versehentlich weiterverwendet.
+- Deine Klasse, die das `SafeHandle` hält, braucht selbst keinen Finalizer mehr, nur noch `Dispose`.
+
+Details zum Aufbau stehen in „SafeHandle“, das Marshalling in „P/Invoke und Marshalling“.
+
+### Das Dispose-Pattern
+
+Ein Typ, der ein `SafeHandle` oder andere `IDisposable`-Objekte hält, implementiert `IDisposable`. Ist er nicht `sealed`, empfiehlt die Dokumentation das Muster mit `Dispose(bool)`:
+
+```csharp
+public class NativeFile : IDisposable
+{
+    private readonly SafeFileHandle _handle;
+    private bool _disposed;
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);   // für abgeleitete Klassen mit Finalizer
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed) return;
+        if (disposing)
+        {
+            _handle.Dispose();       // verwaltete Objekte nur hier anfassen
+        }
+        _disposed = true;
+    }
+}
+```
+
+`disposing` unterscheidet die beiden Wege: `true` heißt „vom Code über `Dispose` aufgerufen“, dann darfst du andere Objekte freigeben. `false` heißt „aus einem Finalizer aufgerufen“, dann nur nicht verwaltete Ressourcen. Einen Finalizer `~NativeFile() => Dispose(false);` gibt es nur, wenn die Klasse selbst rohe Handles als `IntPtr` hält. Der Aufruf von `GC.SuppressFinalize` steht trotzdem in `Dispose`, damit eine abgeleitete Klasse mit Finalizer korrekt funktioniert. Die Code-Analyse meldet fehlende Aufrufe.
+
+{/* TODO(verify): Analyzer rule id for missing GC.SuppressFinalize in Dispose (CA1816) and its default severity. */}
+
+### Muster und ihre Wirkung
+
+| Code                                          | Wirkung                                          | Warum                                                | Ausweg                                         |
+| --------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------- |
+| Leerer Finalizer „für alle Fälle“             | Langsamere Allokation, Objekte überleben länger  | Registrierung und F-Reachable Queue                  | Finalizer entfernen                            |
+| `Dispose` ohne `GC.SuppressFinalize`          | Objekt wird trotz `Dispose` finalisiert          | Eintrag in der Finalization Queue bleibt aktiv       | `GC.SuppressFinalize(this)` in `Dispose`       |
+| `IntPtr`-Feld plus eigener Finalizer          | Fehleranfällig, Handle-Recycling möglich         | Keine Referenzzählung bei nativen Aufrufen           | `SafeHandle`                                   |
+| Finalizer ruft `Flush` auf anderem Objekt auf | Gelegentliche Ausnahmen, Prozessabsturz          | Keine Reihenfolge zwischen Finalizern                | Explizites `Dispose`, `using`                  |
+| Finalizer wartet auf Lock oder I/O            | Wachsender Speicher, Finalisierung steht still   | Ein einziger Finalizer-Thread                        | Im Finalizer nur Handle schließen              |
+| Datei wird erst „irgendwann“ geschlossen      | Datei gesperrt, Daten am Programmende verloren   | Finalizer laufen spät oder beim Beenden gar nicht    | `using`, `await using`                         |
+
+### using und await using
+
+Für den Aufrufer ist `using` der wichtigste Baustein. `using var file = new NativeFile(...);` ruft `Dispose` am Ende des Blocks auf, auch bei einer Ausnahme. Wie der Compiler das in ein `try`/`finally` übersetzt, zeigt „foreach, using und lock“.
+
+Muss die Freigabe asynchron passieren, etwa weil ein Stream beim Schließen noch Daten über das Netzwerk schreibt, implementiert der Typ `IAsyncDisposable` mit `DisposeAsync`, und der Aufrufer schreibt `await using`. Ein Finalizer kann so etwas nie leisten, denn er läuft synchron auf einem Thread, der nicht blockiert werden darf.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die Runtime verwaltet die Finalization Queue pro Generation. Eine Gen0-Collection muss deshalb nur die Einträge von Objekten in Gen0 prüfen, nicht alle Objekte mit Finalizer im Prozess. Wird ein Objekt promotet, wandert sein Eintrag mit.
+
+{/* TODO(verify): CFinalize in gc.cpp keeps segments per generation plus the f-reachable and free segments, and ScanForFinalization only scans the condemned generations. */}
+
+Beim Markieren kombiniert der GC die Finalisierung mit den schwachen Verweisen: Kurze schwache Handles werden geleert, bevor Objekte in die F-Reachable Queue wandern, lange schwache Handles erst danach. Deshalb sieht ein normaler `WeakReference` ein Objekt mit ausstehendem Finalizer schon als tot, ein `WeakReference` mit `trackResurrection: true` dagegen noch als lebendig. Das Experiment unten zeigt genau diesen Unterschied.
+
+<Callout kind="version">
+  Seit .NET Core führt die Runtime beim Beenden des Prozesses keine ausstehenden Finalizer mehr
+  aus. In .NET Framework war das anders. Code, der beim Programmende auf Finalizer angewiesen ist,
+  verhält sich beim Umstieg anders. Für Aufräumarbeiten beim Beenden gibt es
+  `AppDomain.CurrentDomain.ProcessExit` oder in gehosteten Anwendungen `IHostApplicationLifetime`.
+</Callout>
+
+{/* TODO(verify): ProcessExit still fires in .NET 5+ on normal termination, and IHostApplicationLifetime.ApplicationStopping as the recommended hook in Generic Host apps. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das erste Experiment macht die F-Reachable Queue sichtbar. Zwei schwache Verweise beobachten dasselbe Objekt, einer kurz, einer lang. Nach der ersten Collection wartet das Objekt auf seinen Finalizer: Für den kurzen Verweis ist es schon tot, für den langen noch nicht.
+
+{/* TODO(verify): Expected output in Release without debugger: "nach 1. GC: kurz=False, lang=True", "Finalizer läuft", "nach 2. GC: kurz=False, lang=False". */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ohne Debugger ausführen (dotnet run -c Release). Erwartet: nach der ersten Collection kurz=False und lang=True, dann die Ausgabe des Finalizers, nach der zweiten Collection kurz=False und lang=False. Die Allokation steckt in einer eigenen Methode mit NoInlining, damit keine lokale Variable das Objekt in Main festhält."
+  code={lifecycleCode}
+  benchmark={benchmarkCode}
+  note="Erwartet: AllocWithFinalizer ist pro Aufruf deutlich langsamer als AllocPlain, bei gleicher allozierter Größe. Die genauen Werte hängen von Hardware und .NET-Version ab."
+/>
+
+{/* TODO(verify): Benchmark result (ratio AllocWithFinalizer / AllocPlain, identical Allocated column) on .NET 8 and .NET 9, x64. */}
+
+Ein drittes Experiment zeigt die Promotion: Lege ein Objekt mit Finalizer an, das ein großes `byte[]` referenziert, lass es fallen und rufe `GC.Collect(0)` auf. Über einen `WeakReference` mit `trackResurrection: true` liefert `GC.GetGeneration(weakRef)` danach 1 für das Objekt mit Finalizer. Im Speicherabbild zeigt `dotnet-gcdump` oder SOS mit `!FinalizeQueue`, wie viele Objekte gerade auf ihren Finalizer warten.
+
+{/* TODO(verify): GC.GetGeneration(WeakReference) returns the generation of the target of a long weak reference while the object waits for finalization (and throws ArgumentException once collected). */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="finalisierung"
+  questions={[
+    {
+      q: 'Was passiert bei einer Collection mit einem unerreichbaren Objekt, das einen Finalizer hat?',
+      options: [
+        'Der GC ruft den Finalizer auf und gibt das Objekt sofort frei',
+        'Es wandert in die F-Reachable Queue, überlebt die Collection und wird promotet',
+        'Es wird ignoriert, bis jemand GC.WaitForPendingFinalizers aufruft',
+      ],
+      correct: 1,
+      explanation:
+        'Die F-Reachable Queue ist eine Root. Das Objekt und sein ganzer Teilgraph überleben, der Finalizer läuft später auf dem Finalizer-Thread, der Speicher wird erst bei einer späteren Collection frei.',
+    },
+    {
+      q: 'Wann wird ein Objekt mit Finalizer in die Finalization Queue eingetragen?',
+      options: [
+        'Bei der Allokation',
+        'Wenn es unerreichbar wird',
+        'Wenn Dispose aufgerufen wird',
+      ],
+      correct: 0,
+      explanation:
+        'Die Runtime registriert jedes Objekt eines Typs mit Finalizer schon beim Anlegen. Deshalb kostet bereits die Allokation mehr, auch wenn das Objekt später ordentlich freigegeben wird.',
+    },
+    {
+      q: 'Objekt A referenziert Objekt B, beide haben einen Finalizer und werden in derselben Collection unerreichbar. Was gilt?',
+      options: [
+        'A wird immer vor B finalisiert',
+        'B wird immer vor A finalisiert',
+        'Die Reihenfolge ist nicht festgelegt, B kann im Finalizer von A schon finalisiert sein',
+      ],
+      correct: 2,
+      explanation:
+        'Die Dokumentation von Object.Finalize garantiert keine Reihenfolge, auch nicht bei Verweisen. Nur zwischen normalen und kritischen Finalizern (CriticalFinalizerObject) gibt es eine Abstufung.',
+    },
+    {
+      q: 'Ein Finalizer wartet auf einen Lock, der nie frei wird. Was ist die Folge?',
+      options: [
+        'Die Runtime bricht den Finalizer nach einer Zeitüberschreitung ab',
+        'Kein weiterer Finalizer läuft, Objekte mit Finalizer und ihre Graphen sammeln sich im Speicher',
+        'Der GC startet einen zweiten Finalizer-Thread',
+      ],
+      correct: 1,
+      explanation:
+        'Es gibt einen einzigen Finalizer-Thread. Hängt er, wird die F-Reachable Queue nicht mehr abgearbeitet, und alles darin bleibt samt Teilgraph am Leben: ein Speicherleck.',
+    },
+    {
+      q: 'Was bewirkt GC.SuppressFinalize(this) in Dispose?',
+      options: [
+        'Es gibt das Objekt sofort frei',
+        'Der Finalizer läuft nicht, das Objekt kann bei der ersten Collection wie ein normales Objekt freigegeben werden',
+        'Es entfernt den Finalizer aus der Klasse für alle Instanzen',
+      ],
+      correct: 1,
+      explanation:
+        'SuppressFinalize markiert genau dieses Objekt. Die zusätzliche Collection und die Promotion über die F-Reachable Queue entfallen. Die Allokation war trotzdem schon teurer.',
+    },
+    {
+      q: 'Deine Klasse hält ein FileStream-Feld und sonst nichts. Braucht sie einen Finalizer?',
+      options: [
+        'Ja, sonst bleibt die Datei offen',
+        'Nein, sie braucht Dispose, aber keinen Finalizer',
+        'Ja, aber nur, wenn sie sealed ist',
+      ],
+      correct: 1,
+      explanation:
+        'Die nicht verwaltete Ressource steckt im SafeHandle des FileStream, der sich selbst darum kümmert. Ein eigener Finalizer würde nur kosten und dürfte den FileStream ohnehin nicht anfassen.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Objekte mit Finalizer werden **bei der Allokation** in die Finalization Queue eingetragen. Das macht schon das Anlegen teurer.
+- Ein unerreichbares Objekt mit Finalizer wandert in die **F-Reachable Queue**, eine Root. Es überlebt die Collection samt seinem ganzen Teilgraphen und wird **promotet**.
+- Der **Finalizer-Thread** ruft die Finalizer später auf. Erst eine weitere Collection der passenden Generation gibt den Speicher frei.
+- Zwischen Finalizern gibt es **keine Reihenfolge**. Ein Finalizer darf weder blockieren noch werfen und keine anderen verwalteten Objekte anfassen.
+- Ein hängender Finalizer hält die gesamte Finalisierung an und wird zum **Speicherleck**.
+- In .NET Core und .NET 5+ laufen Finalizer **beim Prozessende nicht** zuverlässig. Für deterministisches Aufräumen gibt es `Dispose`, `using` und `await using`.
+- Eigene Finalizer brauchst du fast nie: Kapsle Handles in **`SafeHandle`** und rufe in `Dispose` **`GC.SuppressFinalize`** auf.
+
+</Block>

@@ -1,0 +1,323 @@
+---
+id: assembly-load-context
+title: AssemblyLoadContext und Isolierung
+summary: Warum .NET Assemblies in Kontexte lädt, in welcher Reihenfolge ein Kontext eine Abhängigkeit sucht, warum derselbe Typ zweimal existieren kann und was beim Entladen wirklich passiert.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Dependency loading in .NET (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/dependency-loading/overview
+  - title: 'About AssemblyLoadContext (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/dependency-loading/understanding-assemblyloadcontext
+  - title: 'Managed assembly loading algorithm (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/dependency-loading/loading-managed
+  - title: 'Default probing (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/dependency-loading/default-probing
+  - title: 'How to use and debug assembly unloadability in .NET (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/assembly/unloadability
+  - title: 'Create a .NET application with plugins (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/tutorials/creating-app-with-plugin-support
+  - title: 'AssemblyLoadContext (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.loader.assemblyloadcontext
+  - title: 'AssemblyLoadContext.ContextualReflection (Design-Dokument, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/AssemblyLoadContext.ContextualReflection.md
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './assembly-load-context.steps';
+import identityScript from './assembly-load-context-identity.steps';
+import unloadScript from './assembly-load-context-unload.steps';
+import { alcCode } from './assembly-load-context-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine Anwendung, die Plugins lädt, hat ein Versionsproblem, das sie nicht selbst verursacht hat. Der Host benutzt `Newtonsoft.Json` in Version 12. Ein Plugin wurde gegen Version 13 gebaut, ein anderes gegen Version 11. Alle drei wollen eine Assembly mit demselben einfachen Namen laden. Ein Prozess, der pro Name nur eine Assembly kennt, kann höchstens einen von ihnen zufriedenstellen.
+
+Dazu kommen zwei weitere Wünsche. Ein Plugin soll **seine eigenen Abhängigkeiten** mitbringen dürfen, aus seinem eigenen Ordner, ohne dass der Host sie kennen muss. Und manche Anwendungen wollen Code **wieder loswerden**: ein Skript, das neu kompiliert wurde, ein Plugin, das aktualisiert wird, ein Test, der in einer frischen Umgebung laufen soll. Ohne Entladen wächst der Prozess mit jeder neuen Version.
+
+Im .NET Framework war die Antwort darauf die AppDomain, ein Prozess im Prozess mit eigenem Heap-Bereich für Typen, eigenen statischen Feldern und harter Grenze, über die Objekte nur per Remoting kamen. Das war mächtig, aber teuer und kompliziert. .NET (ehemals .NET Core) unterstützt nur noch eine einzige AppDomain. An ihre Stelle tritt ein leichteres Werkzeug: der **AssemblyLoadContext**. Er löst die Versions- und Entladeprobleme, aber er ist bewusst **keine** Sicherheits- oder Stabilitätsgrenze.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Wie ein einzelner Typ geladen wird, sobald seine Assembly bekannt ist, zeigt „Wie ein Typ geladen wird“. Hier geht es um die Frage davor: **Welche** Datei wird für einen Assembly-Namen geladen, und wohin? Fünf Sätze:
+
+1. **Ein Kontext ist ein Wörterbuch von Namen auf Assemblies.** Jeder `AssemblyLoadContext` bildet einfache Assembly-Namen auf genau eine geladene Assembly ab. Pro Kontext gibt es also jeden Namen höchstens einmal, in verschiedenen Kontexten kann derselbe Name auf verschiedene Assemblies zeigen.
+2. **Jede Assembly gehört zu genau einem Kontext.** Ihre Typen leben im Loader Heap dieses Kontexts, und ihre Verweise auf andere Assemblies werden **in diesem Kontext** aufgelöst.
+3. **Der Default-Kontext ist immer da.** Er wird beim Start aus der TPA-Liste des Hosts befüllt und enthält Framework und Anwendung. Eigene Kontexte fragen ihn, wenn sie selbst nichts finden.
+4. **Ein Typ ist durch seine Assembly-Instanz bestimmt.** Derselbe Typname aus zwei Kontexten sind zwei verschiedene Typen.
+5. **Entladen ist kooperativ.** Ein entladbarer Kontext verschwindet erst, wenn der GC nichts mehr findet, was hineinzeigt.
+
+Die Isolierung entsteht dabei nur durch Namensauflösung. Microsoft Learn sagt es knapp: Die Kontexte sind nicht binär voneinander getrennt, sie finden sich nur gegenseitig nicht per Name. Ein Objekt aus einem Plugin-Kontext liegt im selben GC-Heap und kann ohne Weiteres an den Host übergeben werden.
+
+<Callout kind="fehlannahme">
+  „Ein eigener AssemblyLoadContext schottet ein Plugin ab wie früher eine AppDomain.“ Er trennt nur
+  die Namensauflösung. Ein Plugin läuft im selben Prozess, auf denselben Threads, mit denselben
+  Rechten, und ein Absturz oder eine Endlosschleife darin trifft die ganze Anwendung. Für nicht
+  vertrauenswürdigen Code braucht es eine Prozess- oder Containergrenze.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Ein Host lädt ein Plugin in einen eigenen Kontext. Das Plugin braucht drei Assemblies: eine eigene Bibliothek, gemeinsame Schnittstellen und eine Datei, die es nicht gibt. Achte darauf, **in welcher Reihenfolge** gefragt wird und wo jede Suche endet.
+
+<StepPlayer script={script} />
+
+Die Reihenfolge stammt aus dem Artikel „Managed assembly loading algorithm“ auf Microsoft Learn. Sie gilt für Laden **per Name**, also für statische Verweise, `Assembly.Load(AssemblyName)` und `LoadFromAssemblyName`. Laden **per Pfad** oder aus einem Stream ist kürzer: Der Kontext prüft seinen Cache und lädt dann genau die angegebene Datei, ohne `Load` und ohne Ereignisse.
+
+</Block>
+
+<Block n={4} title="Kontexte im Detail">
+
+### Der Default-Kontext und die TPA-Liste
+
+`AssemblyLoadContext.Default` legt die Runtime beim Start selbst an. Seine Suchpfade bekommt er vom Host: `hostpolicy` liest die `.deps.json`-Dateien von Anwendung und Frameworks und übergibt der Runtime unter anderem die Eigenschaft `TRUSTED_PLATFORM_ASSEMBLIES`, die vollständigen Pfade aller bekannten Assemblies. Wie diese Liste entsteht, zeigen „Der Host: dotnet, hostfxr, hostpolicy“ und „runtimeconfig.json und deps.json“. Gibt es keine `.deps.json`, nimmt der Host stattdessen den Inhalt des Anwendungsordners.
+
+Für eine Assembly sucht der Default-Kontext zuerst in der TPA-Liste nach einer Datei mit passendem einfachen Namen, dann in den Ordnern aus `APP_PATHS`, das normalerweise leer ist. Eine Besonderheit hat er: Wenn du ihn mit `LoadFromAssemblyPath` bittest, eine Datei zu laden, deren Name auch in der TPA-Liste steht, gewinnt die Datei aus der TPA-Liste. Den Default-Kontext kannst du nicht ableiten, nur seine Ereignisse wie `Resolving` abonnieren.
+
+### Ein Name, eine Version pro Kontext
+
+Innerhalb eines Kontexts gilt eine einfache Regel: Ist eine Assembly mit dem gesuchten Namen schon geladen, wird ihre Version mit der gewünschten verglichen. Die Auflösung gelingt nur, wenn die geladene Version **gleich oder höher** ist. Ein zweites Laden derselben Assembly in anderer Version in denselben Kontext ist nicht möglich. Genau das ist der Grund für mehrere Kontexte: Wer zwei Versionen gleichzeitig braucht, braucht zwei Kontexte. Wie die Runtime Versionen vergleicht und was bei Abweichungen passiert, vertieft „Versionierung und Binding“.
+
+{/* TODO(verify): Which exception (FileLoadException?) results when a loaded version is lower than the requested one in the same ALC. */}
+
+### Ein eigener Kontext
+
+Ein eigener Kontext ist eine Klasse, die von `AssemblyLoadContext` erbt und `Load` überschreibt. `Load` bekommt einen `AssemblyName` und gibt entweder eine Assembly zurück oder `null`. Mit `null` sagst du: „Nicht meine Sache, frag den Default-Kontext.“ Die Basisimplementierung gibt immer `null` zurück, deshalb lädt ein Kontext ohne Überschreibung nur die Dateien, die du ihm per Pfad gibst, und alles andere aus dem Default-Kontext.
+
+Damit `Load` weiß, wo die Abhängigkeiten eines Plugins liegen, gibt es seit .NET Core 3.0 den `AssemblyDependencyResolver`. Er bekommt den Pfad der Haupt-Assembly des Plugins, liest die `.deps.json` daneben und beantwortet die Frage „Wo liegt die Datei zu diesem Namen?“ mit einem absoluten Pfad oder `null`. Er kann das auch für native Bibliotheken (`ResolveUnmanagedDllToPath`), die ein Kontext in `LoadUnmanagedDll` laden kann. Ein Plugin-Projekt bekommt dafür die Eigenschaft `EnableDynamicLoading`, die alle Abhängigkeiten in die Ausgabe kopiert.
+
+Microsoft Learn gibt für `Load` und die Ereignisse ein paar Regeln vor: Die Antwort auf denselben Namen muss immer dieselbe sein, denn das Ergebnis landet im Cache. Wer nichts findet, gibt `null` zurück, statt zu werfen. Und innerhalb von `Load` sollst du keine APIs aufrufen, die selbst per Name laden, sonst landest du rekursiv wieder in `Load`.
+
+</Block>
+
+<Block n={5} title="Typidentität und geteilte Verträge">
+
+### Zwei Kontexte, zwei Typen
+
+Wenn derselbe Typname in zwei Kontexten geladen ist, sind das zwei verschiedene Typen. Sie haben zwei MethodTables, zwei Sätze statischer Felder und zwei Kopien des JIT-Codes. Microsoft Learn formuliert die Regel so: Zwei Typen sind genau dann gleich, wenn sie aus derselben `Assembly`-Instanz stammen. Name, Version und Inhalt der Datei spielen keine Rolle.
+
+<StepPlayer script={identityScript} />
+
+Die Fehlermeldung ist berüchtigt, weil sie beide Typen nur mit ihrem Namen nennt und deshalb wie ein Widerspruch aussieht. Wenn du sie siehst, prüf für beide Seiten `obj.GetType().Assembly` und `AssemblyLoadContext.GetLoadContext(...)`. Zwei verschiedene Kontexte sind dann die Erklärung.
+
+{/* TODO(verify): Exact InvalidCastException message on .NET 8 for a cross-ALC cast. */}
+
+### Wer was teilt
+
+Daraus ergibt sich das übliche Muster für Plugin-Systeme:
+
+| Assembly | In welchen Kontext | Warum |
+| --- | --- | --- |
+| Framework (`System.*`, `System.Private.CoreLib`) | nur Default | Die Runtime-Assemblies können nur im Default-Kontext geladen werden. |
+| Verträge (`Contracts.dll` mit `IPlugin`) | nur Default | Host und Plugin müssen denselben Typ sehen, sonst scheitern Casts. |
+| Haupt-Assembly des Plugins | eigener Kontext | wird per Pfad geladen |
+| Private Abhängigkeiten des Plugins | eigener Kontext | dürfen andere Versionen haben als beim Host |
+
+Für die Verträge heißt das im Plugin-Projekt: `<Private>false</Private>` an der Projektreferenz oder `<ExcludeAssets>runtime</ExcludeAssets>` an der Paketreferenz. Dann liegt `Contracts.dll` nicht im Plugin-Ordner, der Resolver findet sie nicht, `Load` gibt `null` zurück, und der Default-Kontext liefert die gemeinsame Assembly. Eine Grenze gibt es dabei: Ein Plugin kann kein neues Framework in den Prozess bringen. Braucht es ASP.NET Core, muss schon der Host darauf verweisen.
+
+### Wenn der Kontext erraten werden muss
+
+Manche APIs haben keinen Kontext als Parameter, etwa `Assembly.Load(string)`, `Type.GetType` mit einem Assembly-qualifizierten Namen oder `Activator.CreateInstance(string, string)`. Sie leiten den Kontext aus der Assembly des **Aufrufers** ab. Das geht schief, wenn der Aufrufer im Default-Kontext liegt, etwa ein Serializer aus dem Framework, der im Auftrag eines Plugins einen Typnamen auflöst. Er sucht dann im Default-Kontext und findet die Plugin-Typen nicht.
+
+Dafür gibt es seit .NET Core 3.0 die **kontextuelle Reflection**. `ctx.EnterContextualReflection()` setzt `AssemblyLoadContext.CurrentContextualReflectionContext` für den aktuellen Ablauf, und diese APIs nehmen dann diesen Kontext statt des abgeleiteten:
+
+```csharp
+using (pluginContext.EnterContextualReflection())
+{
+    // Type.GetType mit Assembly-qualifiziertem Namen sucht jetzt im Plugin-Kontext
+    object settings = serializer.Deserialize(json);
+}
+```
+
+Der Wert fließt wie ein `AsyncLocal` mit `await` mit und wird am Ende des `using` zurückgesetzt. Solange er gesetzt ist, hält er einen Verweis auf den Kontext, was dessen Entladen verhindert.
+
+</Block>
+
+<Block n={6} title="Entladen">
+
+### Entladbare Kontexte
+
+Ein Kontext ist nur dann entladbar, wenn du ihn so anlegst: mit `isCollectible: true` im Konstruktor. Alle Typen, die in ihm geladen werden, bekommen dann einen eigenen Loader Heap, der mit dem Kontext verschwinden kann. Im Default-Kontext und in nicht entladbaren Kontexten bleiben MethodTables, EEClasses und JIT-Code dagegen bis zum Prozessende, wie „MethodTable und EEClass“ beschreibt.
+
+Microsoft Learn nennt zwei zusätzliche Einschränkungen für entladbare Kontexte: Assemblies aus C++/CLI werden nicht unterstützt, und vorkompilierter ReadyToRun-Code wird ignoriert, sodass alle Methoden mit dem JIT übersetzt werden. Ein entladbares Plugin startet also langsamer als dasselbe Plugin im Default-Kontext.
+
+{/* TODO(verify): Whether the ReadyToRun limitation for collectible ALCs still applies in .NET 9 and 10. */}
+
+### Warum Entladen kooperativ ist
+
+Eine AppDomain wurde beim Entladen **gewaltsam** abgeräumt: Die Runtime brach alle Threads ab, die darin liefen, und zerstörte die Objekte. Das hat in .NET keine Entsprechung mehr, denn Threads werden nicht mehr abgebrochen, und Objekte aus einem Kontext können überall im gemeinsamen Heap verteilt sein. Ein Kontext kann deshalb nur verschwinden, wenn **nichts mehr auf ihn zeigt**, und diese Frage beantwortet der GC.
+
+<StepPlayer script={unloadScript} />
+
+Laut Microsoft Learn ist das Entladen erst abgeschlossen, wenn kein Thread mehr eine Methode aus dem Kontext auf seinem Stack hat und nichts von außen auf Assemblies, Typen oder Instanzen des Kontexts zeigt, außer schwachen Verweisen. Die Liste der üblichen Verdächtigen ist lang:
+
+- lokale Variablen und Register, auch solche, die der JIT für Zwischenergebnisse anlegt, ohne dass du sie im Quelltext siehst
+- statische Felder im Host, Caches, Ereignis-Abonnements, die ein Plugin-Objekt festhalten
+- starke oder gepinnte GC-Handles, auch solche, die das Plugin selbst angelegt hat
+- Threads, die noch Code des Plugins ausführen, etwa ein Timer oder ein Hintergrund-Thread
+- Felder in deiner eigenen Kontextklasse, die auf Assemblies oder Typen des Plugins zeigen
+- ein gesetzter Kontext für kontextuelle Reflection
+
+Das Ereignis `Unloading` gibt dem Plugin die Chance, beim Anstoßen des Entladens selbst aufzuräumen, also Threads zu beenden und Handles freizugeben. Ob das Entladen gelungen ist, prüfst du mit einer `WeakReference` auf den Kontext, wie es „WeakReference und GC-Handles“ für Objekte allgemein beschreibt. Klappt es nicht, findest du mit SOS über `dumpheap -type LoaderAllocator` und `gcroot` die Wurzel, die den Kontext festhält.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Der Vertrag liegt doppelt vor
+
+Die häufigste Panne in Plugin-Systemen ist ein Vertrag, der im Plugin-Ordner mitgeliefert wurde. Der Host findet dann keine Plugins, weil `typeof(IPlugin).IsAssignableFrom(type)` für jeden Plugin-Typ `false` liefert, oder er bekommt eine `InvalidCastException` mit zweimal demselben Namen. Ursache ist immer dieselbe: Der Resolver hat die Kopie im Plugin-Ordner gefunden, und `Load` hat sie in den Plugin-Kontext geladen. Prüfe den Ordner des Plugins auf Dateien, die eigentlich vom Host kommen sollten.
+
+### Das Entladen scheitert still
+
+`Unload()` meldet keinen Fehler, wenn das Entladen nicht gelingt. Der Speicher bleibt einfach belegt, und bei jedem Neuladen eines Plugins kommt ein weiterer Kontext hinzu. Typische Ursachen sind unauffällig: ein Logger im Host, der den Typ des Plugins in einem Wörterbuch merkt, ein `static event`, das ein Plugin abonniert hat, ein `Timer`, den das Plugin gestartet und nie beendet hat. Auch ein `MethodInfo` aus dem Plugin in einer lokalen Variablen des Hosts genügt. Deshalb steht der Code, der mit dem Plugin arbeitet, im Beispiel von Microsoft Learn in einer eigenen Methode mit `[MethodImpl(MethodImplOptions.NoInlining)]`: So können keine vom JIT angelegten Zwischenwerte im Aufrufer weiterleben.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Wo du es triffst | Was passiert | Worauf du achtest |
+| --- | --- | --- |
+| Plugin-Systeme | ein Kontext pro Plugin, Verträge im Default-Kontext | Verträge nicht mitliefern, `EnableDynamicLoading` im Plugin |
+| Skripting, Code zur Laufzeit kompiliert | entladbarer Kontext pro Version des Skripts | alle Verweise lösen, Entladen mit `WeakReference` prüfen |
+| Testframeworks, Build-Werkzeuge | Assemblies isoliert laden, um Versionen nicht zu vermischen | kontextuelle Reflection für Code, der Typnamen auflöst |
+| `Assembly.LoadFrom(path)` | lädt in den Default-Kontext und registriert einen Handler für Abhängigkeiten aus demselben Ordner | keine Isolierung, Altlast aus dem .NET Framework |
+| `Assembly.LoadFile(path)`, `Assembly.Load(byte[])` | jeweils ein **neuer** Kontext | kann unbeabsichtigt doppelte Typen erzeugen |
+| `InvalidCastException` mit gleichem Typnamen | zwei Kontexte, zwei Typen | `AssemblyLoadContext.GetLoadContext` für beide Seiten prüfen |
+
+{/* TODO(verify): That Assembly.LoadFile creates a new ALC per distinct path (and reuses it for the same path). */}
+
+Für die Diagnose gibt es zwei Wege. `AssemblyLoadContext.All` liefert alle lebenden Kontexte, `ctx.Assemblies` die Assemblies darin. Und die Runtime meldet über Laufzeitereignisse, wie jede einzelne Auflösung verlaufen ist: welcher Kontext gefragt wurde, ob `Load`, der Default-Kontext oder ein Ereignis die Assembly geliefert hat und warum ein Schritt nichts fand.
+
+{/* TODO(verify): Assembly loader tracing events (AssemblyLoadStart/Stop, ResolutionAttempted, keyword AssemblyLoader) in the Microsoft-Windows-DotNETRuntime provider, available since .NET 5, and the dotnet-trace command to collect them. */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Für die Runtime ist ein Kontext mehr als ein Wörterbuch. Jeder entladbare Kontext bekommt einen eigenen **LoaderAllocator**, dem der Loader Heap seiner Typen gehört, der JIT-Code seiner Methoden und die Speicherbereiche für seine statischen Felder. Im GC-Heap gibt es dazu ein verwaltetes Gegenstück, das System-Objekt `LoaderAllocator`, nach dem du beim Debuggen suchst. Instanzen von Typen aus einem entladbaren Kontext halten über ihre MethodTable diesen LoaderAllocator am Leben. Darum genügt ein einziges vergessenes Objekt, um den ganzen Kontext festzuhalten.
+
+{/* TODO(verify): LoaderAllocator ownership (loader heaps, code heap, statics) and the managed LoaderAllocator/LoaderAllocatorScout pair in src/coreclr/vm/loaderallocator.hpp; that collectible MethodTables keep the managed LoaderAllocator reachable during GC. */}
+
+Weil Typen aus entladbaren Kontexten verschwinden können, muss die Runtime alle Stellen kennen, an denen sie gespeichert sind. Eine generische Instanz wie `List<Bericht>` mit einem Typ aus dem Plugin darf deshalb nicht dauerhaft dem Default-Kontext gehören, sondern muss mit dem Plugin verschwinden können. Solche Regeln machen entladbaren Code für die Runtime aufwendiger, und sie sind ein Grund für Einschränkungen wie die fehlende Unterstützung von ReadyToRun.
+
+{/* TODO(verify): Cross-allocator references (e.g. generic instantiations over collectible types are owned by the collectible LoaderAllocator) and which JIT optimizations are restricted for collectible code. */}
+
+<Callout kind="version">
+  `AssemblyLoadContext` gibt es seit .NET Core 1.0, entladbare Kontexte, `AssemblyDependencyResolver`
+  und die kontextuelle Reflection seit .NET Core 3.0. Seit .NET Core 3.0 ist die Klasse auch nicht
+  mehr abstrakt, sodass `new AssemblyLoadContext("Name", isCollectible: true)` ohne eigene Ableitung
+  funktioniert. Native AOT kennt kein dynamisches Laden von Assemblies, dort gibt es nur die
+  Assemblies, die beim Veröffentlichen einkompiliert wurden.
+</Callout>
+
+{/* TODO(verify): ALC in .NET Core 1.0 (System.Runtime.Loader package), non-abstract since 3.0, and that Assembly.LoadFrom/LoadFromAssemblyPath throw PlatformNotSupportedException under Native AOT. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Das Programm braucht keine zweite Assembly: Es lädt **sich selbst** ein zweites Mal in einen entladbaren Kontext. Damit gibt es die Klasse `Message` zweimal, einmal im Default-Kontext und einmal im Kontext „Kopie“. Danach entlädt es die Kopie und beobachtet über eine `WeakReference`, wann sie wirklich verschwunden ist.
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung ausführen (dotnet run -c Release), SharpLab kann keine Dateien laden. Erwartet: „Name gleich: True“ und „Typ gleich: False“, als Kontexte „Kopie / Default“ und eine InvalidCastException, deren Meldung zweimal Message nennt. „Unload() ist zurückgekehrt“ erscheint, bevor irgendetwas entladen ist. Nach einer oder wenigen Collections meldet die Schleife „Kontext lebt noch? False“. Speichere zum Gegenversuch das Objekt o in einem statischen Feld: Dann bleibt IsAlive bei allen zehn Versuchen True."
+  code={alcCode}
+/>
+
+{/* TODO(verify): Expected output of the sample on .NET 8, including how many collections are needed. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="assembly-load-context"
+  questions={[
+    {
+      q: 'Ein Plugin-Kontext überschreibt Load. Code im Plugin verweist auf Newtonsoft.Json. Wer wird zuerst gefragt, nachdem der Cache des Plugin-Kontexts nichts liefert?',
+      options: [
+        'Der Default-Kontext',
+        'Die Load-Methode des Plugin-Kontexts',
+        'Das Resolving-Ereignis',
+      ],
+      correct: 1,
+      explanation:
+        'Die Reihenfolge ist: eigener Cache, Load, Default-Kontext, Resolving, AppDomain.AssemblyResolve. Weil Load Vorrang hat, kann ein Plugin eine andere Version benutzen als der Host.',
+    },
+    {
+      q: 'Host und Plugin haben je eine Kopie derselben Contracts.dll, Version 1.0.0.0, in ihrem Kontext geladen. Gelingt der Cast eines Plugin-Objekts auf Contracts.Message im Host?',
+      options: [
+        'Ja, Name und Version stimmen überein',
+        'Nein, es sind zwei Assembly-Instanzen und damit zwei verschiedene Typen',
+      ],
+      correct: 1,
+      explanation:
+        'Typidentität hängt an der Assembly-Instanz und damit am Kontext. Gemeinsame Verträge müssen deshalb aus genau einem Kontext kommen, in der Regel dem Default-Kontext.',
+    },
+    {
+      q: 'Was bedeutet es, wenn die Load-Überschreibung eines Kontexts null zurückgibt?',
+      options: [
+        'Die Assembly fehlt, das Laden scheitert sofort',
+        'Die Suche geht beim Default-Kontext weiter',
+        'Die Assembly wird ohne Abhängigkeiten geladen',
+      ],
+      correct: 1,
+      explanation:
+        'null heißt „nicht meine Sache“. Danach fragt die Runtime den Default-Kontext und erst dann die Ereignisse. So werden Framework und Verträge geteilt.',
+    },
+    {
+      q: 'Direkt nach ctx.Unload() prüfst du weak.IsAlive auf den Kontext. Was siehst du?',
+      options: [
+        'false, Unload gibt alles sofort frei',
+        'true, Unload stößt das Entladen nur an, fertig wird es erst durch den GC',
+      ],
+      correct: 1,
+      explanation:
+        'Entladen ist kooperativ. Erst wenn nichts mehr in den Kontext zeigt und der GC gelaufen ist, verschwinden Kontext, Typen und Code.',
+    },
+    {
+      q: 'Ein Plugin wurde entladen, aber IsAlive bleibt auch nach zehn Collections true. Welche Ursache passt?',
+      options: [
+        'Der Host merkt sich ein Objekt des Plugins in einem statischen Feld',
+        'Das Plugin hat zu viele Typen',
+        'Der GC räumt Kontexte grundsätzlich nur beim Prozessende ab',
+      ],
+      correct: 0,
+      explanation:
+        'Jedes Objekt aus dem Kontext hält über seine MethodTable den LoaderAllocator am Leben. Ein statisches Feld im Host ist eine Wurzel, die das verhindert.',
+    },
+    {
+      q: 'Ist ein eigener AssemblyLoadContext ein guter Schutz gegen ein nicht vertrauenswürdiges Plugin?',
+      options: [
+        'Ja, er ersetzt die AppDomain mit allen Sicherheitsgrenzen',
+        'Nein, er trennt nur die Namensauflösung, Code läuft im selben Prozess mit denselben Rechten',
+      ],
+      correct: 1,
+      explanation:
+        'Kontexte isolieren nur, indem sie Assemblies nicht gegenseitig per Name finden. Für eine echte Grenze braucht es einen eigenen Prozess oder Container.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Ein **AssemblyLoadContext** bildet einfache Assembly-Namen auf genau eine geladene Assembly ab. Mehrere Kontexte erlauben mehrere Versionen derselben Bibliothek in einem Prozess.
+- Verweise einer Assembly werden in **ihrem** Kontext aufgelöst, in der Reihenfolge: eigener Cache, `Load`, Default-Kontext, `Resolving`, `AppDomain.AssemblyResolve`.
+- Der **Default-Kontext** wird aus der TPA-Liste des Hosts befüllt und lädt Framework und Anwendung. Framework und gemeinsame Verträge gehören dorthin.
+- **Typidentität = Typ plus Assembly-Instanz.** Derselbe Typname aus zwei Kontexten ergibt zwei Typen und beim Cast eine `InvalidCastException`.
+- `AssemblyDependencyResolver` findet die Abhängigkeiten eines Plugins über dessen `.deps.json`. Kontextuelle Reflection hilft APIs, die den Kontext sonst aus dem Aufrufer ableiten.
+- **Entladen ist kooperativ:** `Unload()` stößt es nur an, der GC vollendet es, sobald kein Thread, kein statisches Feld, kein Handle und keine Variable mehr in den Kontext zeigt.
+- Ein Kontext ist **keine Sicherheitsgrenze**. .NET kennt nur eine AppDomain, echte Isolierung gibt es nur über Prozesse.
+
+</Block>

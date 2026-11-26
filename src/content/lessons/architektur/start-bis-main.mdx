@@ -1,0 +1,337 @@
+---
+id: start-bis-main
+title: 'Vom Prozessstart bis Main'
+summary: Was die Runtime zwischen coreclr_initialize und deinem Main tut, welcher Code dabei schon läuft, welche Threads entstehen, warum der Prozess nach Main nicht sofort endet und wie du den Start selbst misst und beobachtest.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'dotnet/runtime: Startup hooks'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-startup-hook.md
+  - title: 'dotnet/runtime: Runtime properties the host passes to the runtime'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-runtime-information.md
+  - title: 'dotnet/runtime: Host components'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-components.md
+  - title: 'dotnet/runtime: ceemain.cpp (EEStartupHelper)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/ceemain.cpp
+  - title: 'dotnet/runtime: corhost.cpp (CreateAppDomainWithManager, ExecuteAssembly)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/corhost.cpp
+  - title: 'dotnet/runtime: assembly.cpp (ExecuteMainMethod, RunMain)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/assembly.cpp
+  - title: 'Book of the Runtime: Introduction to the Common Language Runtime'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/intro-to-clr.md
+  - title: 'Book of the Runtime: ReadyToRun Overview'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/readytorun-overview.md
+  - title: '.NET Runtime config options (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/runtime-config/
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './start-bis-main.steps';
+import threadsScript from './start-bis-main-threads.steps';
+import codeScript from './start-bis-main-code.steps';
+import { hookCode, timingCode } from './start-bis-main-verify';
+
+<Block n={1} title="Das Problem">
+
+Für die meisten Entwickler beginnt ein Programm mit der ersten Zeile in `Main`. Für den Prozess ist das ein später Moment. Bis dahin hat der Host schon Dateien gelesen und Versionen gewählt, und die Runtime hat einen Garbage Collector aufgebaut, Threads gestartet, die Klassenbibliothek geladen und Code übersetzt. Bei einer kleinen Konsolen-App dauert das nur Sekundenbruchteile. Bei einer Funktion in der Cloud, die pro Anfrage neu startet, oder einem Kommandozeilenwerkzeug, das hundertmal am Tag aufgerufen wird, ist genau diese Zeit die Zeit, die der Nutzer spürt.
+
+Dahinter steckt ein echter Zielkonflikt. Die Runtime möchte möglichst wenig vorab erledigen, damit der Start schnell ist: Typen erst laden, wenn sie gebraucht werden, Methoden erst übersetzen, wenn sie aufgerufen werden. Gleichzeitig muss einiges zwingend vor dem ersten verwalteten Befehl stehen: ein Heap, auf dem Objekte entstehen können, `System.Object` und `System.String`, ein Thread-Objekt für den laufenden Thread, eine Liste der ladbaren Assemblies.
+
+Die Lektion „Der Host: dotnet, hostfxr, hostpolicy“ endete mit dem Aufruf von `coreclr_initialize` und `coreclr_execute_assembly`. Diese Lektion öffnet die beiden Aufrufe: was in welcher Reihenfolge passiert, welcher Code dabei schon läuft, und was nach dem Ende von `Main` noch kommt. Die Reihenfolge folgt dem Quellcode der Runtime. Wo sie sich zwischen Versionen verschiebt oder nicht eindeutig belegt ist, steht das dabei.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen das Modell:
+
+1. **Zwei Aufrufe, zwei Phasen.** `coreclr_initialize` baut die Runtime auf: Ausführungsumgebung, GC, CoreLib, AppDomain und AppContext. `coreclr_execute_assembly` lädt die App, führt Startup Hooks und `Main` aus und wartet auf das Ende.
+2. **Alles auf einem Thread.** Host, Initialisierung, Startup Hooks und `Main` laufen auf dem Hauptthread des Prozesses. Die Runtime startet daneben eigene Threads, etwa den Finalizer-Thread.
+3. **Fast alles ist faul.** Typen werden beim ersten Gebrauch geladen, Methoden beim ersten Aufruf übersetzt. Vorab geschieht nur, was für den ersten verwalteten Befehl nötig ist.
+4. **Vor Main läuft schon Code.** CoreLib-Code, Startup Hooks und statische Konstruktoren laufen, bevor die erste Zeile von `Main` dran ist.
+5. **Nach Main ist noch nicht Schluss.** Die Runtime wartet auf Vordergrund-Threads, löst `ProcessExit` aus und gibt den Rückgabewert von `Main` als Exitcode zurück.
+
+<Callout kind="fehlannahme">
+  „Die Runtime übersetzt beim Start erst einmal alles, deshalb ist der Start langsam.“ Übersetzt
+  wird nur, was aufgerufen wird, und der Großteil des Framework-Codes liegt bereits vorkompiliert
+  vor. Die Startzeit verteilt sich auf Host, Initialisierung, Typladen und JIT für deine eigenen
+  Methoden.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Eine Konsolen-App mit einem Startup Hook und einem statischen Konstruktor. Achte auf die Ausgabe: Zwei Zeilen erscheinen, bevor `Main` überhaupt beginnt. Und achte darauf, welche Methode der JIT übersetzt und welche er nicht anfassen muss.
+
+<StepPlayer script={script} />
+
+Die Stufen folgen den Funktionen im Quellcode der Runtime: `EEStartupHelper` in `ceemain.cpp` für den EE-Start, `CorHost2::CreateAppDomainWithManager` für AppDomain und AppContext, `CorHost2::ExecuteAssembly` und `Assembly::ExecuteMainMethod` für alles ab dem Laden der App. EE steht für Execution Engine, so heißt der Teil der Runtime, der verwalteten Code ausführt.
+
+{/* TODO(verify): That coreclr_initialize (unixinterface.cpp) calls CorHost2::Start (EEStartup) and then CreateAppDomainWithManager, and coreclr_execute_assembly calls ExecuteAssembly. */}
+
+</Block>
+
+<Block n={4} title="Was coreclr_initialize aufbaut">
+
+### Erst die Eigenschaften, dann die Engine
+
+Der Aufruf bekommt vom Host den Pfad der App und die Liste der Eigenschaften, darunter die TPA-Liste und alle `configProperties` aus der `runtimeconfig.json`. Bevor irgendetwas gestartet wird, macht die Runtime diese Eigenschaften für ihre eigene Konfiguration lesbar. Das ist der Grund, warum Einstellungen wie der GC-Modus oder Tiered Compilation in der `runtimeconfig.json` stehen können: Sie werden gelesen, bevor die betroffene Komponente entsteht, und danach nicht mehr. Wie die Werte dorthin kommen, beschreibt die Lektion „runtimeconfig.json und deps.json“.
+
+{/* TODO(verify): That coreclr_initialize initializes the configuration knobs (Configuration::InitializeConfigurationKnobs) from the properties before EEStartup. */}
+
+### Der EE-Start
+
+Dann folgt der eigentliche Start der Execution Engine. Im Quellcode ist das eine lange Funktion, die nacheinander die Teilsysteme hochfährt. Vereinfacht in der Reihenfolge des aktuellen Quellcodes:
+
+| Schritt | Was entsteht |
+| --- | --- |
+| Thread-Verwaltung | Datenstrukturen für verwaltete Threads, Vorbereitung für Tiered Compilation |
+| Binder für CoreLib | die Möglichkeit, `System.Private.CoreLib` zu laden |
+| GC (erster Teil) | der Garbage Collector wird ausgewählt und konfiguriert, GC-Handles |
+| Codeverwaltung | Verwaltung von JIT- und R2R-Code, Stubs für virtuelle Aufrufe |
+| Domains | die System-Domain und die Standard-AppDomain |
+| JIT-Schnittstelle, Debugger, Profiler | Anschlussstellen, falls ein Debugger oder Profiler aktiv ist |
+| Finalizer-Thread | der Thread, der später Finalizer ausführt |
+| GC-Heap | `Initialize` des GC: der Heap wird angelegt |
+| Hauptthread | der laufende Thread bekommt ein Thread-Objekt der Runtime |
+| CoreLib | `System.Private.CoreLib` wird geladen, die grundlegenden Typen stehen bereit |
+
+{/* TODO(verify): Order against release/8.0 and release/9.0 (EEStartupHelper in src/coreclr/vm/ceemain.cpp). In main: InitThreadManager, CoreLibBinder::Startup, InitializeGarbageCollector, ExecutionManager::Init, SystemDomain::Attach, JitHost::Init, InitializeDebugger, InitializeProfiling, FinalizerThreadCreate (Windows early, Unix later), g_pGCHeap->Initialize, SetupThread, SystemDomain::System()->Init, LoadSystemAssemblies. */}
+
+Zwei Dinge fallen auf. Erstens entsteht der GC-Heap, bevor auch nur ein Typ aus CoreLib geladen ist. Das ist nötig, denn schon das Laden von CoreLib legt Objekte an. Zweitens ist der Finalizer-Thread einer der ersten Threads der Runtime. Unter Windows entsteht er besonders früh, weil er COM-Einstellungen vornehmen muss, bevor andere Threads angemeldet werden. Auf anderen Plattformen kommt er etwas später, weil dort erst der Debugger bereitstehen muss.
+
+### CoreLib auf dem Sonderweg
+
+`System.Private.CoreLib` ist die einzige Assembly, die die Runtime ohne den normalen Ladeweg lädt. Das hat einen einfachen Grund: Der normale Weg über den Standard-Ladekontext ist selbst in C# geschrieben und lebt in CoreLib. Der Host übergibt deshalb mit `SYSTEM_CORELIB_DIRECTORY` den Ordner, in dem die Datei liegt. Schlägt das Laden dort fehl, gibt es keinen Ausweichweg, und der Start bricht ab.
+
+{/* TODO(verify): That CoreLib is located via SYSTEM_CORELIB_DIRECTORY (or the TPA list as fallback in older versions) and not through the managed AssemblyLoadContext. */}
+
+### Eine AppDomain und der AppContext
+
+Unter .NET Framework konnte ein Prozess viele AppDomains haben, voneinander isolierte Bereiche mit eigenen Assemblies. Seit .NET Core gibt es genau eine. `AppDomain.CurrentDomain` existiert weiter, aber `AppDomain.CreateDomain` wirft eine `PlatformNotSupportedException`. Isolierung übernimmt heute der `AssemblyLoadContext`, beschrieben in der Lektion „AssemblyLoadContext und Isolierung“.
+
+Beim Einrichten dieser einen Domain passieren drei Dinge, die du später in deinem Code bemerkst. Die Runtime ruft eine verwaltete Methode in CoreLib auf und übergibt ihr alle Eigenschaften, ab da liefert `AppContext.GetData` sie. Der Standard-Binder bekommt die TPA-Liste und die Suchpfade für Ressourcen und native Bibliotheken. Und unter Unix lädt die Runtime vorab die native Hilfsbibliothek `libSystem.Native`, damit ein Problem mit ihr sofort beim Start auffällt statt mitten im Programm.
+
+Mit diesen Schritten kehrt `coreclr_initialize` zurück. Die Runtime läuft, aber von deiner App ist außer ihrem Pfad noch nichts bekannt.
+
+</Block>
+
+<Block n={5} title="Vom Laden der App bis Main">
+
+### Laden und Einstiegspunkt
+
+`coreclr_execute_assembly` bekommt den Pfad zu `App.dll` und die Kommandozeilenargumente. Die Runtime lädt die Assembly in den Standard-Ladekontext, legt die Argumente für `Environment.GetCommandLineArgs` ab und sucht den Einstiegspunkt. Der steht nicht als Name in der Datei, sondern als Token im CLI-Header: ein Verweis auf genau eine Methodendefinition. Ein C#-Programm kann deshalb `Main` in jeder Klasse haben, solange es nur eine gibt oder du mit `StartupObject` eine wählst.
+
+Bevor die Methode aufgerufen wird, prüft die Runtime ihre Signatur. Sie muss statisch und nicht generisch sein, `void`, `int` oder `uint` zurückgeben und entweder keinen Parameter oder ein `string[]` haben. Mehr kennt die Runtime nicht. Alles Weitere ist Arbeit des C#-Compilers:
+
+| Du schreibst | Der Compiler erzeugt als Einstiegspunkt |
+| --- | --- |
+| `static void Main(string[] args)` | genau diese Methode |
+| Anweisungen auf oberster Ebene | `Program.<Main>$(string[] args)` |
+| `static async Task<int> Main()` | eine zusätzliche Methode `<Main>`, die das Task mit `GetAwaiter().GetResult()` abwartet |
+
+Die Runtime weiß also nichts von `async Main`. Sie ruft eine gewöhnliche synchrone Methode auf, die auf dem Hauptthread blockiert, bis das Task fertig ist.
+
+{/* TODO(verify): Synthesized entry point names in a Release build (SharpLab): Program.<Main>$ for top-level statements, <Main> for async Main. */}
+
+### Startup Hooks
+
+Zwischen Einstiegspunkt und `Main` liegt ein Erweiterungspunkt, den viele nicht kennen: die **Startup Hooks**. Über die Umgebungsvariable `DOTNET_STARTUP_HOOKS` nennst du eine oder mehrere Assemblies, als absoluten Pfad oder als einfachen Assemblynamen, getrennt durch `;` unter Windows und `:` unter Unix. Der Host reicht die Liste als Laufzeiteigenschaft `STARTUP_HOOKS` an die Runtime weiter.
+
+Jede dieser Assemblies muss eine Klasse `StartupHook` ohne Namespace mit einer Methode `public static void Initialize()` enthalten. Die Runtime ruft die Methoden in der angegebenen Reihenfolge auf, synchron und auf demselben Thread, der danach `Main` ausführt. Erst wenn alle zurückgekehrt sind, geht es weiter. Wirft ein Hook eine Ausnahme, verhält sie sich wie eine unbehandelte Ausnahme aus `Main`: Der Prozess endet, und im Stack Trace steht `StartupHookProvider.ProcessStartupHooks`.
+
+Wozu das gut ist: Werkzeuge können Code in eine App bringen, ohne sie neu zu bauen. So arbeiten etwa Agenten für Diagnose und Telemetrie. Aus demselben Grund ist das Feature eine Angriffsfläche, wenn jemand die Umgebung deiner Prozesse kontrolliert, und es ist bei getrimmten Apps standardmäßig abgeschaltet.
+
+{/* TODO(verify): Feature switch name System.StartupHookProvider.IsSupported and that it defaults to false for trimmed and Native AOT apps. */}
+{/* TODO(verify): Design doc says hooks run "before the main assembly is loaded", but assembly.cpp calls RunManagedStartup inside ExecuteMainMethod after the main assembly was loaded and the entry point resolved. Check which describes .NET 8 and 9. */}
+
+### Statische Konstruktoren und Modulinitialisierer
+
+Bevor `Main` läuft, muss der Typ, der `Main` enthält, initialisiert sein. Hat `Program` einen expliziten statischen Konstruktor, läuft er deshalb vor der ersten Zeile von `Main`. Ähnliches gilt für Modulinitialisierer, also Methoden mit `[ModuleInitializer]`: Die Runtime garantiert, dass sie laufen, bevor Code aus ihrem Modul ausgeführt wird. In beiden Fällen läuft dein Code früher, als `Main` vermuten lässt, und eine Ausnahme dort erscheint als `TypeInitializationException`, bevor `Main` überhaupt begonnen hat.
+
+{/* TODO(verify): Exact timing of the module initializer of the entry assembly relative to startup hooks, and that an exception in Program's static constructor surfaces as TypeInitializationException. */}
+
+### Main wird übersetzt
+
+Erst jetzt kommt der JIT für deinen Code ins Spiel. `Main` hat noch keinen Maschinencode, also übersetzt der JIT die Methode beim ersten Aufruf, im Standardfall mit **Tier0**: schnell übersetzt, kaum optimiert. Jede Methode, die `Main` aufruft, folgt demselben Muster, sobald sie zum ersten Mal dran ist. Methoden aus dem Framework dagegen bringen meist ReadyToRun-Code mit und müssen nicht übersetzt werden.
+
+</Block>
+
+<Block n={6} title="Welcher Code beim Start läuft">
+
+Ob eine Methode beim ersten Aufruf übersetzt werden muss, hängt von der Konfiguration ab. Die folgende Visualisierung spielt dasselbe kleine Programm in fünf Varianten durch.
+
+<StepPlayer script={codeScript} />
+
+Drei Mechanismen teilen sich die Arbeit. **ReadyToRun** (R2R) legt vorkompilierten Maschinencode in die Assembly, das Framework wird so ausgeliefert. **Tiered Compilation** übersetzt zuerst schnell und optimiert heiße Methoden später im Hintergrund nach. **Native AOT** übersetzt alles beim Veröffentlichen und kommt ohne JIT und ohne Host-Kette aus. Die Einzelheiten stehen in den Lektionen „Tiered Compilation und OSR“, „ReadyToRun und Crossgen“ und „Native AOT“, die Abwägung in „Startzeit gegen Spitzenleistung“.
+
+R2R-Code ist dabei nicht ganz so gut wie Tier1-Code. Er muss mit späteren Versionen abhängiger Assemblies zusammenpassen und darf deshalb manche Annahmen nicht treffen, etwa beim Inlining über Versionsgrenzen hinweg. Mit Tiered Compilation ist das kein Problem: Wird eine R2R-Methode heiß, übersetzt die Runtime sie wie jede andere neu.
+
+{/* TODO(verify): That R2R code cannot inline across version bubble boundaries and that hot R2R methods get call counting and Tier1 rejit (BOTR readytorun-overview.md, Microsoft Learn tiered compilation). */}
+
+</Block>
+
+<Block n={7} title="Stolperfalle: Das Ende von Main ist nicht das Ende">
+
+Viele erwarten, dass der Prozess endet, sobald `Main` zurückkehrt. Die Runtime sieht das anders. Achte in der folgenden Zeitleiste darauf, welcher Thread den Prozess am Leben hält und was beim Herunterfahren nicht mehr passiert.
+
+<StepPlayer script={threadsScript} />
+
+Nach der Rückkehr aus `Main` wartet der Hauptthread auf alle **Vordergrund-Threads**. Ein mit `new Thread` erzeugter Thread ist das standardmäßig, Threads aus dem ThreadPool sind Hintergrund-Threads. Erst wenn kein Vordergrund-Thread mehr läuft, fährt die Runtime herunter, löst `AppDomain.ProcessExit` aus und gibt den Exitcode an `hostpolicy` zurück.
+
+Der Exitcode entsteht so:
+
+| Situation | Exitcode |
+| --- | --- |
+| `Main` gibt `int` zurück | dieser Wert |
+| `Main` ist `void` | `0`, oder was zuvor in `Environment.ExitCode` gesetzt wurde |
+| `Environment.Exit(n)` | `n`, sofort, ohne auf Vordergrund-Threads zu warten |
+| unbehandelte Ausnahme | ein Fehlercode des Betriebssystems, der Prozess wird abgebrochen |
+
+{/* TODO(verify): Concrete exit codes for unhandled exceptions (Windows 0xE0434352, Linux SIGABRT, shell shows 134) on .NET 8 and 9; that Environment.Exit does not wait for foreground threads. */}
+
+Und noch etwas fehlt beim Herunterfahren: Anders als unter .NET Framework führt .NET Core ausstehende Finalizer beim Beenden des Prozesses nicht aus. Ein Finalizer ist also kein Ort, um vor dem Ende noch Daten zu sichern. Dafür gibt es `Dispose` und `ProcessExit`.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Beobachtung | Ursache | Ausweg |
+| --- | --- | --- |
+| Konsolen-App hängt nach der letzten Ausgabe | ein Vordergrund-Thread läuft noch | `IsBackground = true` oder den Thread sauber beenden |
+| Ausnahme, bevor die erste Zeile von `Main` läuft | statischer Konstruktor, Modulinitialisierer oder Startup Hook | Stack Trace auf `.cctor` oder `ProcessStartupHooks` prüfen |
+| fremde Ausgabe oder Verhalten vor `Main` in einem Container | `DOTNET_STARTUP_HOOKS` in der Umgebung gesetzt | Umgebung prüfen, bei Bedarf Feature abschalten |
+| erster Request einer Web-App deutlich langsamer | JIT für viele App-Methoden, Typladen, Tier0-Code | R2R für die App, Aufwärmen, Native AOT wo möglich |
+| Aufräumcode im Finalizer läuft beim Beenden nie | Finalizer werden beim Herunterfahren nicht ausgeführt | `Dispose`, `using`, `ProcessExit` |
+| gemessene Startzeit wirkt zu gut | Messung beginnt erst in `Main` | ab `Process.StartTime` messen |
+
+Für Startzeit gilt eine einfache Faustregel: Was vor `Main` passiert, ist für eine gegebene .NET-Version weitgehend fest. Was du beeinflussen kannst, ist, wie viel deine App bis zur ersten nützlichen Arbeit lädt und übersetzt. Jede zusätzliche Assembly, jeder statische Konstruktor mit Arbeit und jede große Abhängigkeitsinjektion beim Start zahlen auf dieses Konto ein.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Runtime versucht an mehreren Stellen, den Weg bis `Main` kurz zu halten. Der Framework-Code wird als ReadyToRun ausgeliefert, sodass der JIT beim Start fast nur deinen Code sieht. Tiered Compilation verschiebt teure Optimierung nach hinten, und die Aufrufzählung für heiße Methoden beginnt erst nach einer kurzen Verzögerung, damit die Startphase nicht mit Neuübersetzungen belastet wird. Seit .NET 7 werden auch Methoden mit Schleifen zunächst mit Tier0 übersetzt und über On-Stack Replacement später gewechselt.
+
+{/* TODO(verify): Call counting delay (100 ms, reset while new Tier0 activity happens) and that QuickJitForLoops with OSR is on by default since .NET 7 on x64 and Arm64. */}
+
+Für Apps, die ihren Startablauf jedes Mal gleich durchlaufen, gibt es außerdem **Multicore JIT**: Die Runtime zeichnet auf, welche Methoden beim Start übersetzt wurden, und übersetzt sie beim nächsten Start parallel auf einem Hintergrund-Thread vorab. ASP.NET Core nutzt eigene Wege, und für maximale Startgeschwindigkeit bleibt Native AOT.
+
+{/* TODO(verify): That Multicore JIT is opt-in via ProfileOptimization.SetProfileRoot/StartProfile in .NET Core and that AutoStartProfile in ExecuteAssembly only acts when configured. */}
+
+<Callout kind="version">
+  Die Reihenfolge der Schritte in dieser Lektion folgt dem aktuellen Quellcode von dotnet/runtime
+  und gilt im Kern seit .NET Core 3.0. Einzelheiten wie der genaue Zeitpunkt des Finalizer-Threads
+  unterscheiden sich zwischen Windows und Unix und verschieben sich zwischen Versionen. Die
+  Beispiele verwenden .NET 8 und 9.
+</Callout>
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+### Ein eigener Startup Hook
+
+Lege neben deiner App eine Klassenbibliothek `Hook` mit dem folgenden Code an, baue sie und starte die App mit `DOTNET_STARTUP_HOOKS` auf den vollen Pfad von `Hook.dll`.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht. Lege mit dotnet new classlib die Bibliothek an, baue sie und setze dann DOTNET_STARTUP_HOOKS auf den absoluten Pfad der erzeugten Hook.dll, bevor du die App startest."
+  code={hookCode}
+/>
+
+Erwartetes Ergebnis: Die Zeile des Hooks erscheint vor jeder Ausgabe aus `Main`. Die Thread-Kennung ist dieselbe wie die, die `Main` ausgibt. Danach erscheinen beim Laden die Namen weiterer Assemblies, darunter deine App, falls sie erst nach dem Hook geladen wird, und Framework-Assemblies wie `System.Console`.
+
+{/* TODO(verify): Run on .NET 8 and 9: whether App itself appears in the AssemblyLoad list (depends on whether the main assembly is loaded before the hooks run). */}
+
+### Startzeit messen
+
+`Environment.TickCount64` zählt Millisekunden seit dem Start des Betriebssystems, nicht seit dem Start deines Prozesses. Für die Zeit bis `Main` brauchst du den Startzeitpunkt, den das Betriebssystem für den Prozess kennt, und den liefert `Process.StartTime`.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht. Lege mit dotnet new console ein Projekt an, ersetze Program.cs und starte die App mehrmals, einmal normal und einmal mit DOTNET_ReadyToRun=0. Mit echo $? (Unix) oder $LASTEXITCODE (PowerShell) siehst du den Exitcode."
+  code={timingCode}
+/>
+
+Erwartetes Ergebnis: Die Zeit bis `Main` liegt bei einer kleinen Konsolen-App im Bereich weniger Dutzend Millisekunden und steigt mit `DOTNET_ReadyToRun=0` deutlich an. Der Exitcode entspricht der Anzahl der übergebenen Argumente.
+
+{/* TODO(verify): Measure time to Main for a console app on .NET 8 (with and without DOTNET_ReadyToRun=0) before stating any range; the "few dozen milliseconds" is an unmeasured estimate. */}
+
+### Den Start mit Werkzeugen beobachten
+
+Welche Methoden der JIT beim Start übersetzt, zeigt die Runtime selbst, wenn du `DOTNET_JitStdOutFile=jit.txt` und `DOTNET_JitDisasmSummary=1` setzt. Die Datei listet jede übersetzte Methode mit ihrer Stufe. Du wirst `Program.Main` mit Tier0 finden und kaum Methoden aus CoreLib, solange R2R aktiv ist.
+
+{/* TODO(verify): That DOTNET_JitDisasmSummary and DOTNET_JitStdOutFile work in release runtimes since .NET 7 and the output format shows the tier per method. */}
+
+Für eine Zeitachse aller Schritte eignet sich `dotnet-trace`. Mit `dotnet-trace collect --providers Microsoft-Windows-DotNETRuntime:0x18:5 -- ./App` startet das Werkzeug die App selbst und zeichnet von Anfang an Lade- und JIT-Ereignisse auf. Im Ergebnis siehst du für jede Assembly ein Ladeereignis und für jede übersetzte Methode Beginn und Ende der Übersetzung.
+
+{/* TODO(verify): Keyword values (Loader 0x8, Jit 0x10) and that dotnet-trace collect -- <command> captures from process start via the diagnostic port. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="start-bis-main"
+  questions={[
+    {
+      q: 'Auf welchem Thread läuft Main bei einer Konsolen-App?',
+      options: ['Auf einem eigens von der Runtime erzeugten Thread', 'Auf dem Hauptthread, auf dem auch Host und Initialisierung liefen', 'Auf einem ThreadPool-Thread'],
+      correct: 1,
+      explanation:
+        'Host, coreclr_initialize, Startup Hooks und Main laufen nacheinander auf demselben Thread. Die Runtime meldet ihn nur als verwalteten Thread an.',
+    },
+    {
+      q: 'Was entsteht beim EE-Start zuerst: der GC-Heap oder die geladene System.Private.CoreLib?',
+      options: ['Der GC-Heap', 'CoreLib'],
+      correct: 0,
+      explanation:
+        'Schon das Laden von CoreLib legt Objekte an. Deshalb wird der GC-Heap vorher initialisiert, CoreLib folgt am Ende des EE-Starts.',
+    },
+    {
+      q: 'DOTNET_STARTUP_HOOKS nennt eine Assembly. Wann läuft deren StartupHook.Initialize?',
+      options: ['Parallel zu Main auf einem eigenen Thread', 'Vor Main, synchron auf demselben Thread', 'Nach Main, beim Herunterfahren'],
+      correct: 1,
+      explanation:
+        'Die Runtime ruft alle Hooks nacheinander und synchron auf dem Thread auf, der danach Main ausführt. Erst wenn alle zurückgekehrt sind, läuft Main.',
+    },
+    {
+      q: 'Main startet mit new Thread einen Thread, der zehn Sekunden arbeitet, und kehrt sofort zurück. Wann endet der Prozess?',
+      options: ['Sofort nach Main', 'Nach etwa zehn Sekunden, wenn der Thread fertig ist'],
+      correct: 1,
+      explanation:
+        'new Thread erzeugt einen Vordergrund-Thread. Die Runtime wartet nach Main auf alle Vordergrund-Threads, bevor sie herunterfährt.',
+    },
+    {
+      q: 'Was übersetzt der JIT beim Start einer gewöhnlichen framework-abhängigen Konsolen-App?',
+      options: ['Die ganze App und das ganze Framework', 'Nur aufgerufene Methoden, beim Framework meist gar nichts dank ReadyToRun', 'Gar nichts, alles ist vorkompiliert'],
+      correct: 1,
+      explanation:
+        'Übersetzt wird beim ersten Aufruf. Das Framework bringt ReadyToRun-Code mit, die App-Methoden übersetzt der JIT mit Tier0.',
+    },
+    {
+      q: 'Ein Objekt hat einen Finalizer, der beim Beenden eine Datei schreiben soll. Was passiert, wenn der Prozess normal endet?',
+      options: ['Der Finalizer läuft garantiert', 'Der Finalizer läuft nicht, .NET führt beim Beenden keine ausstehenden Finalizer aus'],
+      correct: 1,
+      explanation:
+        'Seit .NET Core werden ausstehende Finalizer beim Herunterfahren nicht mehr ausgeführt. Für Aufräumarbeit beim Beenden gibt es Dispose und ProcessExit.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Der Start hat zwei Phasen: **coreclr_initialize** baut die Runtime auf, **coreclr_execute_assembly** lädt die App, führt Startup Hooks und `Main` aus und wartet auf das Ende.
+- Beim EE-Start entstehen Thread-Verwaltung, GC samt Heap, die eine AppDomain und der **Finalizer-Thread**. `System.Private.CoreLib` wird auf einem Sonderweg geladen, danach bekommt der Standard-Binder die TPA-Liste.
+- Seit .NET Core gibt es genau **eine AppDomain**. Alle Eigenschaften vom Host landen im `AppContext`.
+- Der Einstiegspunkt ist ein **Token im CLI-Header**. `async Main` und Anweisungen auf oberster Ebene sind Arbeit des Compilers, die Runtime ruft eine gewöhnliche synchrone Methode auf.
+- Vor `Main` laufen **Startup Hooks** aus `DOTNET_STARTUP_HOOKS` und statische Konstruktoren, alles auf dem Hauptthread.
+- Der JIT übersetzt nur aufgerufene Methoden, meist nur deine eigenen: Das Framework bringt **ReadyToRun**-Code mit, Tiered Compilation optimiert heiße Methoden später.
+- Nach `Main` wartet die Runtime auf **Vordergrund-Threads**, löst `ProcessExit` aus und gibt den Rückgabewert als Exitcode zurück. Ausstehende Finalizer laufen dabei nicht.
+
+</Block>

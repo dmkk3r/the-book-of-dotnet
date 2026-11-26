@@ -1,0 +1,113 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Breadcrumbs from '@/components/layout/Breadcrumbs.astro';
+import { glossary, letterOf } from '@/lib/glossary';
+import { curriculum, lessonPath } from '@/lib/curriculum';
+import { withBase } from '@/lib/paths';
+
+const letters = [...new Set(glossary.map(letterOf))];
+const lessonOf = (id?: string) => curriculum.lessons.find((l) => l.id === id);
+---
+
+<BaseLayout title="Glossar" description="Begriffe rund um die .NET-Runtime, kurz erklärt.">
+  <article data-pagefind-body>
+    <Breadcrumbs items={[{ label: 'Übersicht', href: withBase('') }, { label: 'Glossar' }]} />
+    <h1 data-pagefind-meta="title">Glossar</h1>
+    <p class="lead">
+      Die wichtigsten Begriffe, kurz erklärt. In den Lektionen ist das erste Vorkommen eines
+      Begriffs automatisch hierher verlinkt.
+    </p>
+
+    <nav class="letters" aria-label="Buchstaben" data-pagefind-ignore>
+      {letters.map((l) => (
+        <a href={`#buchstabe-${l.toLowerCase()}`}>{l}</a>
+      ))}
+    </nav>
+
+    {letters.map((letter) => (
+      <section aria-labelledby={`buchstabe-${letter.toLowerCase()}`}>
+        <h2 id={`buchstabe-${letter.toLowerCase()}`}>{letter}</h2>
+        <dl>
+          {glossary
+            .filter((e) => letterOf(e) === letter)
+            .map((entry) => {
+              const lesson = lessonOf(entry.lesson);
+              return (
+                <div class="entry" id={entry.id}>
+                  <dt>{entry.term}</dt>
+                  <dd>
+                    {entry.aliases.length > 0 && (
+                      <p class="aliases">Auch: {entry.aliases.join(', ')}</p>
+                    )}
+                    <p>{entry.definition}</p>
+                    {lesson && (
+                      <p class="more">
+                        Mehr dazu:{' '}
+                        <a href={withBase(lessonPath(lesson.chapter.id, lesson.id))}>
+                          {lesson.title}
+                        </a>
+                      </p>
+                    )}
+                  </dd>
+                </div>
+              );
+            })}
+        </dl>
+      </section>
+    ))}
+  </article>
+</BaseLayout>
+
+<style>
+  .letters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 0 0 24px;
+  }
+  .letters a {
+    display: inline-grid;
+    place-items: center;
+    min-width: 32px;
+    height: 32px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    font-weight: 600;
+  }
+  section h2 {
+    margin-top: 32px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  dl {
+    margin: 0;
+  }
+  .entry {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+    max-width: 80ch;
+    scroll-margin-top: calc(var(--header-height) + 16px);
+  }
+  .entry:target {
+    background: var(--hl);
+    outline: 8px solid var(--hl);
+  }
+  dt {
+    font-weight: 600;
+    font-size: 1.125rem;
+  }
+  dd {
+    margin: 4px 0 0;
+  }
+  dd p {
+    margin: 0 0 4px;
+  }
+  .aliases,
+  .more {
+    font-size: 14px;
+    color: var(--muted);
+  }
+  .more a {
+    text-decoration: underline;
+  }
+</style>

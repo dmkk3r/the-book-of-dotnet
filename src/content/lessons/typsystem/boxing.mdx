@@ -1,0 +1,279 @@
+---
+id: boxing
+title: Boxing und Unboxing
+summary: Warum ein Werttyp manchmal in ein Heap-Objekt verpackt werden muss, was dabei im Speicher genau passiert und wie du unnötiges Boxing erkennst und vermeidest.
+status: draft
+sources:
+  - title: 'Boxing und Unboxing (C#-Programmierhandbuch, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/programming-guide/types/boxing-and-unboxing
+  - title: 'Book of the Runtime: Type System Overview'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-system.md
+  - title: 'ECMA-335 (CLI-Standard), Partition III: box, unbox, unbox.any'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'Nullable-Werttypen: Boxing und Unboxing (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/language-reference/builtin-types/nullable-value-types
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './boxing.steps';
+import layoutScript from './boxing-layout.steps';
+import mutationScript from './boxing-mutation.steps';
+
+<Block n={1} title="Das Problem">
+
+C# hat ein einheitliches Typsystem: Jeder Typ leitet sich von `object` ab, auch `int`, `bool` und jedes selbst geschriebene `struct`. Du kannst also schreiben `object o = 42;` und später `o.ToString()` aufrufen. Das klingt selbstverständlich, verbirgt aber einen echten Widerspruch.
+
+Eine Variable vom Typ `object` enthält immer einen **Verweis**, also eine Adresse auf dem Heap. Ein `int` dagegen ist ein **Werttyp**: Er hat keine Adresse auf dem Heap, keinen Object Header und keinen MethodTable-Zeiger, er besteht nur aus seinen 4 Byte. Es gibt schlicht nichts, worauf `o` zeigen könnte.
+
+Die Runtime löst diesen Widerspruch, indem sie bei Bedarf ein echtes Objekt baut: Sie legt auf dem Heap ein neues Objekt an, das wie eine Hülle um eine **Kopie** des Werts liegt. Dieser Vorgang heißt **Boxing**. Der umgekehrte Weg, den Wert wieder aus der Hülle herauszuholen, heißt **Unboxing**.
+
+Damit hat Boxing zwei Seiten. Es macht Werttypen überall dort verwendbar, wo ein Objekt erwartet wird. Und es kostet: eine Allokation, Arbeit für den GC und, wie du sehen wirst, ein paar Überraschungen, weil man es plötzlich mit einer Kopie zu tun hat.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir drei Sätze, dann erklärt sich fast alles in dieser Lektion von selbst:
+
+1. **Boxing kopiert.** Die Box enthält eine Kopie des Werts zum Zeitpunkt des Boxings. Spätere Änderungen am Original erreichen die Box nicht, und umgekehrt.
+2. **Jedes Boxing erzeugt ein neues Objekt.** Zweimal dieselbe Zahl boxen ergibt zwei verschiedene Objekte an zwei Adressen.
+3. **Unboxing prüft und kopiert zurück.** Es kontrolliert den Typ in der Box und kopiert den Wert heraus. Es alloziert nichts.
+
+Wann boxt der Compiler? Immer dann, wenn ein Werttyp in eine Variable, einen Parameter oder ein Feld vom Typ `object`, `ValueType`, `Enum` oder eines Interfaces gelangt. Der C#-Compiler fügt dafür die IL-Instruktion `box` ein, ohne dass du es im Quelltext siehst. Genau das macht Boxing so leicht zu übersehen.
+
+<Callout kind="fehlannahme">
+  „Die Box ist nur eine andere Sicht auf dieselbe Variable.“ Nein: Nach dem Boxing gibt es zwei
+  unabhängige Werte, einen auf dem Stack und einen im Heap-Objekt. Sie haben nur zufällig denselben
+  Inhalt.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das folgende Beispiel zeigt alle drei Sätze des Modells hintereinander. Achte besonders auf Schritt 4, in dem sich `x` ändert, und auf die beiden letzten Schritte, in denen zwei Boxen mit gleichem Inhalt verglichen werden.
+
+<StepPlayer script={script} />
+
+Im Tab „IL“ siehst du, was der Compiler daraus macht. Zweimal steht dort `box`, einmal `unbox.any`. Beachte auch die Zeile mit `ceq`: Das ist der Vergleich von `o == o2`, und `ceq` vergleicht bei Verweisen schlicht die Adressen.
+
+</Block>
+
+<Block n={4} title="Wie eine Box aussieht">
+
+Eine Box ist kein besonderes Konstrukt der Runtime, sondern ein ganz gewöhnliches Objekt. Sie hat einen Object Header und einen MethodTable-Zeiger wie jedes andere Objekt auch. Der Clou liegt in der MethodTable: Sie ist die des **Werttyps**. Eine Box mit einem `int` darin hat die MethodTable von `Int32`. Deshalb liefert `o.GetType()` auch `System.Int32` und nicht irgendeinen Box-Typ.
+
+<StepPlayer script={layoutScript} />
+
+Daraus ergeben sich die Kosten einer Box: Für 4 Byte Nutzdaten belegt sie auf einem 64-Bit-System 24 Byte. Die Allokation selbst ist billig, die Runtime schiebt im Gen0-Bereich nur einen Zeiger weiter. Teuer wird es durch die Menge: Wer in einer Schleife millionenfach boxt, erzeugt Millionen kurzlebiger Objekte, die der GC einsammeln muss.
+
+{/* TODO(verify): 24 B for a boxed int and 32 B for Pair on x64 (BenchmarkDotNet MemoryDiagnoser). */}
+
+</Block>
+
+<Block n={5} title="Unboxing im Detail">
+
+Unboxing ist strenger, als viele erwarten. Die IL kennt dafür zwei Instruktionen:
+
+- `unbox` prüft den Typ und liefert einen **Zeiger** auf den Wert innerhalb der Box, ohne ihn zu kopieren.
+- `unbox.any` prüft den Typ und kopiert den Wert heraus. Diese Variante erzeugt C# bei einem Cast wie `(int)o`.
+
+### Nur der exakte Typ
+
+Die Typprüfung verlangt genau den Typ, der geboxt wurde. Eine Umwandlung findet nicht statt:
+
+```csharp
+object o = 42;          // geboxter int
+long l = (long)o;       // InvalidCastException
+long ok = (int)o;       // erst unboxen, dann umwandeln: funktioniert
+```
+
+Der Grund: Unboxing ist keine Konvertierung, sondern das Herauskopieren eines Speicherinhalts. Die Runtime prüft nur, ob die MethodTable der Box zum Zieltyp passt. Einen `int` als `long` zu lesen, würde 8 Byte aus einem 4-Byte-Feld lesen. Eine Ausnahme erlaubt die Runtime: Ein geboxtes Enum lässt sich als sein zugrunde liegender Ganzzahltyp unboxen und umgekehrt, weil beide dasselbe Speicherlayout haben.
+
+{/* TODO(verify): Enum and underlying type unboxing rule in ECMA-335 and CoreCLR (also for int/uint?). */}
+
+### Nullable&lt;T&gt; wird besonders behandelt
+
+Ein `int?` ist eigentlich ein Struct `Nullable<int>` mit den Feldern `HasValue` und `Value`. Beim Boxing behandelt die Runtime es aber nicht wie ein normales Struct:
+
+- Hat es **keinen Wert**, entsteht gar keine Box. Das Ergebnis ist ein echter `null`-Verweis.
+- Hat es **einen Wert**, wird nur dieser Wert geboxt, als gewöhnlicher geboxter `int`. Eine Box vom Typ `Nullable<int>` gibt es nie.
+
+```csharp
+int? a = null;
+object oa = a;          // null, keine Allokation
+int? b = 5;
+object ob = b;          // Box mit Int32, nicht mit Nullable<int>
+int? back = (int?)ob;   // Unboxing in int? funktioniert
+```
+
+So verhält sich `null` nach dem Boxing genau so, wie man es erwartet: `oa == null` ist wahr.
+
+</Block>
+
+<Block n={6} title="Stolperfalle: Änderungen an der Kopie">
+
+Am deutlichsten wird der Kopiercharakter, wenn ein veränderliches Struct ein Interface implementiert. Eine Interface-Variable ist immer ein Verweis. Wer ein Struct einer solchen Variable zuweist, boxt es, und jede Methode, die man über das Interface aufruft, verändert die Box, nicht das Original.
+
+<StepPlayer script={mutationScript} />
+
+In echtem Code fällt das selten so offensichtlich auf. Typisch ist ein Struct in einer `List<ICounter>` oder ein Struct, das an eine Methode mit Interface-Parameter übergeben wird. Die Lösung ist fast immer, Structs unveränderlich zu entwerfen. Mit `readonly struct` erzwingt der Compiler das sogar.
+
+</Block>
+
+<Block n={7} title="Wo Boxing versteckt passiert">
+
+Selten schreibt man `object o = 42;` hin. Viel häufiger passiert Boxing beiläufig, weil eine API `object` oder ein Interface erwartet. Diese Tabelle zeigt die wichtigsten Fälle:
+
+| Code                                     | Boxt? | Warum                                                                       | Ausweg                          |
+| ---------------------------------------- | ----- | --------------------------------------------------------------------------- | ------------------------------- |
+| `object o = 42;`                         | ja    | Zuweisung an `object`                                                       | generische Typen statt `object` |
+| `IComparable c = 42;`                    | ja    | Interface-Variablen sind Verweise                                           | Generics mit Constraint         |
+| `new ArrayList().Add(42)`                | ja    | Parameter vom Typ `object`                                                  | `List<int>`                     |
+| `string.Format("{0}", 42)`               | ja    | Parameter vom Typ `object`                                                  | String-Interpolation            |
+| `$"Wert: {42}"`                          | nein  | Interpolated String Handler mit generischem `AppendFormatted<T>` (ab C# 10) |                                 |
+| `s.ToString()` ohne Override im Struct   | ja    | Die geerbte Methode von `object` braucht ein Objekt                         | `ToString` überschreiben        |
+| `s.Equals(t)` ohne `IEquatable<T>`       | ja    | `Equals(object)` boxt das Argument                                          | `IEquatable<T>` implementieren  |
+| `M<T>(T x) where T : IFoo` mit `x.Bar()` | nein  | constrained-Aufruf direkt auf dem Wert                                      |                                 |
+| `flags.HasFlag(Flag.A)`                  | nein  | Der JIT erkennt den Aufruf und vermeidet die Box                            |                                 |
+
+{/* TODO(verify): Each row in SharpLab (IL "box" present or not), C# 10 interpolation handler, HasFlag JIT intrinsic version. */}
+
+Der rote Faden: Boxing entsteht an den Grenzen zwischen generischer, typsicherer Welt und der alten Welt aus `object`-Parametern. Seit es Generics gibt, lässt es sich in fast allen Fällen vermeiden.
+
+### Warum Generics nicht boxen
+
+Bei `List<int>` erzeugt der JIT eigenen Maschinencode, in dem `T` fest `int` ist. Die Liste speichert echte `int`-Werte in einem `int[]`. Bei `ArrayList` dagegen ist jedes Element ein `object`, also wird jede Zahl beim Hinzufügen geboxt. Wie das zur Laufzeit funktioniert, zeigt die Lektion „Generics zur Laufzeit“.
+
+Auch Methodenaufrufe auf einem generischen `T` kommen ohne Box aus. Der Compiler erzeugt dafür einen sogenannten **constrained-Aufruf**: Er sagt der Runtime „ruf diese Interface-Methode auf diesem Wert auf“. Implementiert der Werttyp die Methode selbst, ruft der JIT sie direkt auf, ganz ohne Box.
+
+</Block>
+
+<Block n={8} title="Was der JIT dagegen tut">
+
+Der JIT kennt die typischen Muster und entfernt viele Boxen von selbst, bevor sie je entstehen:
+
+- **Box gefolgt von Unbox:** Wird ein Wert geboxt und sofort wieder in denselben Typ ausgepackt, streicht der JIT beides.
+- **Box nur für einen null-Vergleich:** In generischem Code wie `if (value == null)` mit einem Werttyp als `T` kann eine Box nie null sein. Der JIT ersetzt den Vergleich durch `false`.
+- **Bekannte Methoden:** Für Aufrufe wie `Enum.HasFlag` erzeugt der JIT direkten Code statt einer Box.
+- **Escape-Analyse:** Neuere .NET-Versionen können eine Box, die die Methode nachweislich nicht verlässt, auf dem Stack statt auf dem Heap anlegen. Dann entfällt die Allokation ganz.
+
+<Callout kind="version">
+  Welche dieser Optimierungen greifen, hängt von der .NET-Version und vom Tiering ab. Die
+  Escape-Analyse für Boxen ist eine neuere Entwicklung. Verlass dich deshalb nicht darauf, sondern
+  miss im Zweifel nach.
+</Callout>
+
+{/* TODO(verify): .NET version that stack-allocates non-escaping boxes (escape analysis), and that the box+unbox and null-check eliminations apply in Tier 0 or only in Tier 1. */}
+
+Daraus folgt eine wichtige Regel für das Messen: Der IL-Code zeigt, wo der Compiler `box` einfügt. Ob dort zur Laufzeit wirklich eine Allokation passiert, zeigt erst der Benchmark mit dem MemoryDiagnoser oder der JIT-Assembler.
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Zwei Experimente: das IL in SharpLab ansehen und die Allokationen mit BenchmarkDotNet messen.
+
+{/* TODO(verify): Expected allocations for the four benchmarks on x64 and the .NET version used. */}
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „IL“. Jede Instruktion box ist eine Stelle, an der der Compiler boxt. Vergleiche danach mit „JIT Asm“: Dort siehst du, ob tatsächlich ein Allokations-Helfer aufgerufen wird."
+  code={`int x = 42;
+object o = x;
+int y = (int)o;
+object o2 = y;
+Console.WriteLine(o == o2);
+Console.WriteLine(o.Equals(o2));
+
+string s = $"Wert: {x}";
+var list = new System.Collections.ArrayList();
+list.Add(x);`}
+  benchmark={`[MemoryDiagnoser]
+public class BoxingBench
+{
+    int _v = 42;
+    readonly ArrayList _old = new();
+    readonly List<int> _new = new();
+
+    [Benchmark] public object Box()        => _v;
+    [Benchmark] public int    NoBox()      => _v;
+    [Benchmark] public void   ArrayListAdd() { _old.Clear(); _old.Add(_v); }
+    [Benchmark] public void   ListAdd()      { _new.Clear(); _new.Add(_v); }
+}`}
+expected={[
+{ method: 'Box', allocated: '24 B' },
+{ method: 'NoBox', allocated: '-' },
+{ method: 'ArrayListAdd', allocated: '24 B' },
+{ method: 'ListAdd', allocated: '-' },
+]}
+note="Werte für 64-Bit-Prozesse. ArrayListAdd alloziert pro Aufruf eine Box, ListAdd nichts."
+/>
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="boxing"
+  questions={[
+    {
+      q: 'int x = 42; object o = x; x = 7; Was steht danach in der Box?',
+      options: ['42', '7'],
+      correct: 0,
+      explanation: 'Boxing hat eine Kopie angelegt. Die Änderung an x erreicht die Box nicht.',
+    },
+    {
+      q: 'object a = 5; object b = 5; Was ergibt a == b?',
+      options: ['True', 'False'],
+      correct: 1,
+      explanation:
+        'Jedes Boxing erzeugt ein neues Objekt. == auf object vergleicht Verweise, also zwei verschiedene Adressen. a.Equals(b) wäre True.',
+    },
+    {
+      q: 'object o = 42; Was passiert bei long l = (long)o;?',
+      options: ['l ist 42', 'InvalidCastException'],
+      correct: 1,
+      explanation:
+        'Unboxing verlangt den exakten Typ. Richtig wäre (long)(int)o: erst unboxen, dann umwandeln.',
+    },
+    {
+      q: 'int? n = null; object o = n; Was enthält o?',
+      options: ['Eine Box mit Nullable<int> ohne Wert', 'null'],
+      correct: 1,
+      explanation:
+        'Ein Nullable ohne Wert wird zu einem echten null-Verweis, es entsteht keine Box.',
+    },
+    {
+      q: 'Ein veränderliches Struct wird einer Interface-Variable zugewiesen und über sie verändert. Was ändert sich?',
+      options: ['Das Original', 'Nur die Box'],
+      correct: 1,
+      explanation:
+        'Die Interface-Variable zeigt auf eine geboxte Kopie. Methodenaufrufe über sie verändern nur diese Kopie.',
+    },
+    {
+      q: 'Wird bei List<int>.Add(5) geboxt?',
+      options: ['Ja', 'Nein'],
+      correct: 1,
+      explanation:
+        'List<int> hat eigenen Code für int und speichert die Werte direkt in einem int[]. Geboxt wurde bei ArrayList.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Boxing macht aus einem Werttyp ein Objekt, indem es eine **Kopie** in ein neues Heap-Objekt legt. Die Box trägt die MethodTable des Werttyps.
+- Jedes Boxing ist eine **neue Allokation**. Zwei Boxen mit gleichem Inhalt sind verschiedene Objekte, `==` auf `object` vergleicht ihre Adressen.
+- Unboxing **prüft den exakten Typ** und kopiert den Wert zurück. Es alloziert nichts. `Nullable<T>` und Enums haben Sonderregeln.
+- Über ein Interface veränderte Structs verändern nur die Box. Structs deshalb möglichst `readonly` entwerfen.
+- Boxing entsteht meist versteckt an `object`- und Interface-Parametern. Generics, `IEquatable<T>`, überschriebenes `ToString` und String-Interpolation vermeiden es.
+- Der JIT entfernt viele Boxen selbst. Ob wirklich alloziert wird, zeigt nur die Messung.
+
+</Block>

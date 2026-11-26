@@ -1,0 +1,31 @@
+---
+import type { Lesson } from '@/lib/curriculum';
+import { lessonPath } from '@/lib/curriculum';
+import { withBase } from '@/lib/paths';
+
+interface Props {
+  prev?: Lesson;
+  next?: Lesson;
+}
+
+const { prev, next } = Astro.props;
+---
+
+<div class="page-end">
+  <nav aria-label="Vorherige und nächste Lektion">
+    {prev ? (
+      <a class="pn" rel="prev" href={withBase(lessonPath(prev.chapter.id, prev.id))}>
+        <span class="pn-label">Zurück</span>
+        <span class="pn-title">{prev.title}</span>
+      </a>
+    ) : (
+      <span />
+    )}
+    {next && (
+      <a class="pn next" rel="next" href={withBase(lessonPath(next.chapter.id, next.id))}>
+        <span class="pn-label">Weiter</span>
+        <span class="pn-title">{next.title}</span>
+      </a>
+    )}
+  </nav>
+</div>

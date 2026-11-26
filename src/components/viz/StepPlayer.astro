@@ -1,0 +1,44 @@
+---
+// Prepares a step script at build time (validation, highlighting, Markdown) and renders
+// the interactive React island. Usage in MDX: <StepPlayer script={script} />
+import StepPlayerIsland from './StepPlayer.tsx';
+import { highlightLines } from '@/lib/viz/highlight';
+import { renderInlineMarkdown } from '@/lib/viz/inline-markdown';
+import type { PlayerProps, PreparedTab } from '@/lib/viz/prepared';
+import { CODE_TAB_LABELS, CODE_TABS, type StepScript } from '@/lib/viz/types';
+import { validateStepScript } from '@/lib/viz/validate';
+
+interface Props {
+  script: StepScript;
+}
+
+const { script } = Astro.props;
+const problems = validateStepScript(script);
+if (problems.length > 0) {
+  throw new Error(`Invalid step script "${script.title}":\n  - ${problems.join('\n  - ')}`);
+}
+
+const tabs: PreparedTab[] = await Promise.all(
+  CODE_TABS.filter((t) => script.code[t] !== undefined).map(async (t) => ({
+    id: t,
+    label: CODE_TAB_LABELS[t],
+    lines: await highlightLines(script.code[t]!, t),
+  })),
+);
+
+const props = {
+  view: script.view,
+  title: script.title,
+  layout: script.layout ?? 'side',
+  tabs,
+  steps: script.steps.map((s) => ({
+    codeLine: s.codeLine,
+    highlight: s.highlight,
+    state: s.state,
+    changed: s.changed ?? [],
+    explanationHtml: renderInlineMarkdown(s.explanation),
+  })),
+} as PlayerProps;
+---
+
+<StepPlayerIsland client:visible {...props} />

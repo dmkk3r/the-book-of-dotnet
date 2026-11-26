@@ -1,0 +1,330 @@
+---
+id: gc-modi
+title: Workstation, Server und DATAS
+summary: Warum es mehrere GC-Modi gibt, wie Workstation GC mit einem Heap und Server GC mit einem Heap pro Kern arbeiten und wie DATAS die Zahl der Heaps an die Last anpasst.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Workstation and server garbage collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/workstation-server-gc
+  - title: 'Dynamic adaptation to application sizes (DATAS) (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/datas
+  - title: 'Garbage collector config settings (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector
+  - title: 'Memory management and patterns in ASP.NET Core (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/aspnet/core/performance/memory
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'Maoni Stephens: Middle ground between server and workstation GC (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/middle-ground-between-server-and-workstation-gc/
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './gc-modi.steps';
+import heapsScript from './gc-modi-heaps.steps';
+import datasScript from './gc-modi-datas.steps';
+import { verifyCode } from './gc-modi-verify';
+
+<Block n={1} title="Das Problem">
+
+Derselbe Garbage Collector soll sehr verschiedene Programme bedienen. Ein Kommandozeilenwerkzeug, das ein paar Sekunden läuft. Eine Desktopanwendung, die neben Browser und IDE auf einem Laptop mit vier Kernen läuft und deren Oberfläche nicht ruckeln soll. Ein Webdienst, der allein auf einer Maschine mit 64 Kernen Zehntausende Anfragen pro Sekunde beantwortet. Und ein Microservice, der mit zwanzig Geschwistern in Containern mit je einem Gigabyte Speicherlimit auf einem gemeinsamen Knoten läuft.
+
+Die Anforderungen widersprechen sich. Der Webdienst auf der großen Maschine will maximalen **Durchsatz**: Alle Kerne sollen allozieren können, ohne sich gegenseitig zu behindern, GCs sollen selten sein und ihre Arbeit parallel erledigen. Speicher ist reichlich da, also darf der Heap groß werden. Die Desktopanwendung und die Microservices wollen dagegen einen **kleinen Speicherbedarf**: Sie teilen sich die Maschine mit anderen, und jedes Megabyte, das ein Prozess hortet, fehlt einem anderen.
+
+Ein einziges Budget, eine einzige Thread-Strategie kann nicht beides optimal leisten. Ein großes Gen0-Budget bedeutet seltenere Collections, aber auch mehr Speicher, der zwischen zwei Collections mit Müll gefüllt sein darf. Viele GC-Threads bedeuten kürzere Pausen auf einer großen Maschine, aber Konkurrenz um die Kerne, wenn viele Prozesse dasselbe tun. Deshalb hat .NET mehrere **GC-Modi**, und seit .NET 8 einen dritten Weg, der zwischen ihnen vermittelt.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen den Rest der Lektion:
+
+1. **Workstation GC** hat **einen** Heap. Eine Collection läuft auf dem Anwendungs-Thread, der sie ausgelöst hat, mit dessen normaler Priorität. Die Budgets sind eher klein, der Speicherbedarf auch.
+2. **Server GC** hat **einen Heap und einen dedizierten GC-Thread pro logischem Kern**. Alle Heaps werden gleichzeitig eingesammelt. Die Budgets sind groß, der Durchsatz hoch, der Speicherbedarf ebenfalls.
+3. **Background GC ist unabhängig davon.** Beide Modi können volle Collections im Hintergrund oder blockierend ausführen. Das regelt eine eigene Einstellung (siehe „Background GC“).
+4. **DATAS** (Dynamic Adaptation To Application Sizes) ist ein Server GC, der mit **einem** Heap startet und die Zahl der Heaps je nach Last erhöht oder senkt. Die Budgets richten sich nach der Größe der langlebigen Daten, nicht nach der Maschine.
+5. **Der Standard hängt vom Host ab.** Eigenständige Anwendungen bekommen Workstation GC, ASP.NET Core Anwendungen Server GC. Seit .NET 9 ist DATAS bei Server GC standardmäßig aktiv.
+
+{/* TODO(verify): Mechanism by which ASP.NET Core apps get Server GC by default (Microsoft.NET.Sdk.Web setting ServerGarbageCollection=true in the generated runtimeconfig.json). Microsoft Learn (ASP.NET Core memory) only states that Server GC is the default for ASP.NET Core apps. */}
+
+Ein Sonderfall vorweg: Auf einem Rechner mit nur einem logischen Kern verwendet die Runtime laut Microsoft Learn immer Workstation GC, egal was konfiguriert ist. Das ist auch in Containern relevant, denen nur ein Kern zugeteilt ist.
+
+{/* TODO(verify): Whether a container CPU limit below 2 (e.g. cpus=1) makes the runtime treat the process as single-CPU and fall back to workstation GC. */}
+
+<Callout kind="fehlannahme">
+  „Server GC ist der schnellere GC, also immer die bessere Wahl für Dienste.“ Server GC tauscht
+  Speicher und Threads gegen Durchsatz. Auf einer Maschine, die einem einzigen großen Dienst gehört,
+  ist das ein guter Tausch. Teilen sich viele Prozesse die Kerne oder ist Speicher knapp, kann
+  Workstation GC oder DATAS insgesamt besser abschneiden.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Die Visualisierung zeigt eine einzelne Gen0-Collection auf einem Rechner mit zwei Kernen, oben mit Workstation GC, unten mit Server GC. Achte darauf, **auf welchem Thread** die Collection läuft und wie viele Threads gleichzeitig daran arbeiten.
+
+<StepPlayer script={script} />
+
+Die Zeiteinheiten sind abstrakt. Microsoft Learn sagt nur, dass Server GC auf einem gleich großen Heap schneller ist als Workstation GC, weil mehrere GC-Threads zusammenarbeiten. Das Verhältnis im Bild ist nicht gemessen. Wichtiger ist der strukturelle Unterschied: Bei Workstation GC ist der auslösende Anwendungs-Thread selbst der GC, bei Server GC gibt es eigene GC-Threads, auf Windows mit der höchsten Thread-Priorität (`THREAD_PRIORITY_HIGHEST`). Das Book of the Runtime beschreibt es so: Bei Server GC werden die GC-Threads geweckt, sie suspendieren die verwalteten Threads und erledigen dieselben Phasen wie Workstation GC, nur parallel.
+
+</Block>
+
+<Block n={4} title="Mehrere Heaps im Detail">
+
+### Ein Heap pro Kern
+
+„Ein Heap pro Kern“ klingt, als hätte jeder Thread seinen eigenen Speicher. So ist es nicht. Alle Heaps zusammen bilden den einen verwalteten Heap deines Prozesses. Jedes Objekt liegt in genau einem davon, jeder Heap hat eigene Generationen, einen eigenen Small und Large Object Heap, und Objekte auf verschiedenen Heaps dürfen beliebig aufeinander verweisen. Für deinen Code ist nicht sichtbar, in welchem Heap ein Objekt liegt.
+
+Der Sinn der Aufteilung liegt in zwei Stellen. Beim **Allozieren** bekommt jeder Thread seinen Allocation Context aus einem bestimmten Heap, sodass viele Threads gleichzeitig Speicherblöcke anfordern können, ohne sich an einer gemeinsamen Stelle zu drängen. Bei der **Collection** bearbeitet jeder GC-Thread vor allem seinen eigenen Heap, sodass die Arbeit sich auf alle Kerne verteilt. Wie Allocation Contexts funktionieren, zeigt die Lektion „Allokation und Allocation Contexts“.
+
+<StepPlayer script={heapsScript} />
+
+### Budgets und Heap Balancing
+
+Jeder Heap hat ein eigenes Gen0-Budget. Maoni Stephens beschreibt zwei Eigenschaften, die man kennen sollte: Der GC gleicht die Budgets an, sodass alle Heaps dasselbe Budget haben, und sobald **irgendein** Heap sein Gen0-Budget erschöpft, wird die nächste Collection ausgelöst, und zwar für alle Heaps. Server GC setzt diese Budgets außerdem recht aggressiv, also groß.
+
+Daraus folgt ein Problem bei ungleicher Last. Alloziert ein einzelner Thread viel mehr als die anderen, würde er sein Heap-Budget immer wieder als Erster erschöpfen und GCs auslösen, obwohl die anderen Heaps noch fast leer sind. Der Allokator gleicht das aus, indem er einen Thread bei Bedarf auf einen weniger belasteten Heap umlenkt. Dieser Mechanismus heißt **Heap Balancing**. Auch bei der Collection selbst wird ausgeglichen: Seit .NET 5 kann der GC Markierarbeit zwischen den GC-Threads verteilen, damit nicht ein Thread mit einem großen Heap alle anderen warten lässt.
+
+{/* TODO(verify): Heap balancing details (balance_heaps in gc.cpp: when a thread's allocation context is moved to another heap, role of the current CPU / heap affinity). Maoni (mem-doc) confirms that .NET 5 balances work between GC threads; the exact technique (mark stealing) is not verified. */}
+
+### Threads und Affinität
+
+Standardmäßig bindet Server GC jeden GC-Thread an einen bestimmten Kern (Affinität). Ein GC-Thread läuft dann nur auf seinem Kern, und pro GC-Thread gibt es einen Heap. Das lässt sich steuern:
+
+| Einstellung (`runtimeconfig.json`) | Umgebungsvariable | Wirkung |
+| --- | --- | --- |
+| `System.GC.HeapCount` | `DOTNET_GCHeapCount` | Begrenzt die Zahl der Heaps. Mit Affinität werden die Heaps an die ersten n Kerne gebunden. |
+| `System.GC.NoAffinitize` | `DOTNET_GCNoAffinitize` | `true` schaltet die Bindung der GC-Threads an Kerne ab. |
+| `System.GC.HeapAffinitizeMask` | `DOTNET_GCHeapAffinitizeMask` | Bitmaske der Kerne, die die GC-Threads verwenden dürfen. |
+| `System.GC.HeapAffinitizeRanges` | `DOTNET_GCHeapAffinitizeRanges` | Wie die Maske, aber als Liste von Bereichen, auch für mehr als 64 Kerne. |
+
+Alle vier wirken nur bei Server GC. Zahlen werden in `runtimeconfig.json` dezimal, in Umgebungsvariablen hexadezimal angegeben: 16 Heaps sind also `16` in der JSON-Datei und `10` (oder `0x10`) in `DOTNET_GCHeapCount`. Die Kombination aus `GCHeapCount` und `GCNoAffinitize` beschreibt Maoni Stephens im Blogartikel über den „Middle ground between server and workstation GC“: Server GC mit wenigen Heaps, ohne dass die GC-Threads an Kerne gebunden sind, liegt zwischen den beiden Modi.
+
+</Block>
+
+<Block n={5} title="DATAS im Detail">
+
+### Was klassischer Server GC falsch macht
+
+Klassischer Server GC behandelt den Prozess laut Microsoft Learn als **den dominanten Prozess** der Maschine. Wie viel er vor der nächsten Collection allozieren lässt, richtet sich nach Durchsatz, nicht nach der Größe der Anwendung. Er lässt den Heap kräftig wachsen, wenn Speicher da ist. Dieselbe Anwendung kann so auf einer Maschine mit mehr Kernen und mehr Speicher einen viel größeren Heap haben, obwohl sie dieselbe Arbeit tut. Und wird die Last leichter, verkleinert Server GC den Heap nicht unbedingt.
+
+Für Container, in denen viele Dienste dicht gepackt laufen und Lastspitzen nur zeitweise auftreten, ist das genau falsch herum. DATAS wurde dafür gebaut.
+
+### Die vier Bausteine
+
+Microsoft Learn beschreibt, was DATAS tut:
+
+- **Budget nach Anwendungsgröße.** Die Obergrenze dafür, wie viel bis zur nächsten Collection alloziert werden darf, richtet sich nach der Größe der langlebigen Daten. Das begrenzt den Heap.
+- **Tatsächliches Budget nach Durchsatz.** Innerhalb dieser Grenze bestimmt der Durchsatzbedarf, wie viel wirklich alloziert werden darf.
+- **Zahl der Heaps nach Bedarf.** DATAS startet mit einem Heap und erhöht oder senkt die Zahl der Heaps, von einem (wie Workstation GC) bis zur Zahl der Kerne (wie Server GC).
+- **Volle kompaktierende Collections bei Bedarf**, damit Fragmentierung den Heap nicht aufbläht.
+
+<StepPlayer script={datasScript} />
+
+### Wie DATAS die Zahl der Heaps wählt
+
+Das Maß heißt **Throughput Cost Percentage** (TCP): der Anteil der Zeit, den der GC das Programm kostet, aus GC-Pausen und aus Wartezeiten beim Allozieren. Meist dominieren die Pausen, sodass der Prozentsatz der Pausenzeit eine gute Näherung ist. Liegt die TCP über dem Ziel, standardmäßig 2 Prozent, nimmt DATAS Heaps hinzu, liegt sie deutlich darunter, nimmt es Heaps weg. Das Ziel lässt sich ab .NET 9 mit `System.GC.DTargetTCP` ändern.
+
+{/* TODO(verify): How DATAS samples TCP over several GCs and the hysteresis for reducing heap count (dynamic heap count logic in gc.cpp). */}
+
+Microsoft Learn nennt die beiden Momente, in denen die Wartezeiten beim Allozieren spürbar werden: beim Prozessstart, weil DATAS immer mit einem Heap beginnt, und beim Übergang von leichter zu schwerer Last, weil es einige GCs dauert, bis die Zahl der Heaps steigt.
+
+Für das Gen0-Budget berechnet DATAS eine Obergrenze aus der Anwendungsgröße. Microsoft Learn gibt die Formel an: Ein Faktor `(20 - conserve_memory) / sqrt(Anwendungsgröße in MB)`, begrenzt auf den Bereich 0,1 bis 10, multipliziert mit der Anwendungsgröße. Ohne eigene `GCConserveMemory`-Einstellung verwendet DATAS dafür den Wert 5. Bei 1 GB langlebigen Daten ergibt das (20 minus 5) geteilt durch die Wurzel aus 1000, also etwa 0,474, und damit ein Gen0-Budget von insgesamt etwa 474 MB. Bei einer winzigen Anwendung mit 1 MB greift die Obergrenze 10, das Budget liegt bei 10 MB. Klassischer Server GC kennt eine solche Bindung an die Anwendungsgröße nicht.
+
+### Was DATAS kostet
+
+Microsoft Learn zeigt Messungen mit den TechEmpower-Benchmarks auf einer Linux-Maschine mit 48 Kernen: über 80 Prozent weniger Working Set, bei 2 bis 3 Prozent weniger maximalem Durchsatz. Mit DATAS gibt es deutlich mehr Gen0- und Gen1-Collections, weil die Budgets kleiner sind. Wer jedes Prozent Durchsatz braucht und die Maschine für sich hat, kann DATAS abschalten.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Viele Prozesse mit Server GC
+
+Microsoft Learn rechnet ein Beispiel vor: Zwölf Prozesse mit Server GC auf einer Maschine mit vier logischen Kernen. Jeder hat vier GC-Threads mit hoher Priorität. Sammeln alle gleichzeitig ein, konkurrieren zwölf GC-Threads um jeden Kern. Bei Hunderten Instanzen einer Anwendung empfiehlt die Dokumentation sogar Workstation GC mit abgeschaltetem Concurrent GC, weil das Kontextwechsel spart. Wer viele .NET-Prozesse auf einen Rechner packt, sollte den GC-Modus also bewusst wählen oder die Heaps mit `GCHeapCount` begrenzen.
+
+### Speicherüberraschungen im Container
+
+Ein typisches Bild: Ein Dienst braucht lokal mit Workstation GC wenige hundert Megabyte, im Cluster mit Server GC ein Vielfaches. Die ASP.NET Core Dokumentation zeigt ein Beispiel, in dem das Working Set unter gleicher Last mit Workstation GC von etwa 500 MB auf 70 MB fällt. Ursache sind die großen Gen0-Budgets pro Heap: Zwischen zwei Collections darf in jedem Heap viel Müll liegen, und mehr Heaps heißen mehr Budget.
+
+Im Container kommt hinzu, dass die Zahl der Heaps von den Kernen abhängt, die die Runtime sieht, und der Heap durch das Speicherlimit begrenzt wird. Ohne eigene Einstellung gilt im Container mit Speicherlimit eine harte Heapgrenze von 75 Prozent des Limits (mindestens 20 MB). Ein Dienst, der diese Grenze ausreizt, bekommt häufigere und teurere Collections oder im schlimmsten Fall eine `OutOfMemoryException`, obwohl er mit kleineren Budgets gut ausgekommen wäre. DATAS mildert genau das, weil es die Budgets an die Anwendungsgröße bindet. Die Einstellungen für Container behandelt „GC-Konfiguration und Container“.
+
+{/* TODO(verify): How the runtime derives the processor count used for Server GC heap count in containers (CPU quota rounding, DOTNET_PROCESSOR_COUNT) in .NET 8/9. */}
+
+### Benchmarks über Modi hinweg vergleichen
+
+BenchmarkDotNet und eigene Messungen laufen meist in einer Konsolenanwendung, also mit Workstation GC. Der Dienst in Produktion läuft mit Server GC oder DATAS. Allokationsintensiver Code kann sich dort ganz anders verhalten: weniger Gen0-Collections, andere Pausen, ein anderes Speicherprofil. Wer GC-Verhalten misst, sollte den Modus der Produktion nachbilden und ihn in den Ergebnissen notieren. BenchmarkDotNet erlaubt das über die Job-Konfiguration (siehe „BenchmarkDotNet richtig nutzen“).
+
+{/* TODO(verify): BenchmarkDotNet job API for GC mode (Job.WithGcServer(true), WithGcConcurrent) in current versions. */}
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Welcher Modus für welche Last
+
+| Anwendung | Empfehlung | Warum |
+| --- | --- | --- |
+| Desktop, Kommandozeile, Werkzeuge | Workstation (Standard) | Wenig Speicher, GC auf dem auslösenden Thread genügt |
+| Webdienst, allein auf großer Maschine, Durchsatz zählt | Server GC, eventuell ohne DATAS | Alle Kerne allozieren und sammeln parallel, Speicher ist da |
+| Webdienst im Container mit wechselnder Last | Server GC mit DATAS (Standard ab .NET 9) | Heap folgt der Last, Speicher wird bei wenig Last frei |
+| Viele kleine Dienste auf einem Knoten | DATAS oder Workstation | Kleinere Heaps, weniger konkurrierende GC-Threads |
+| Hunderte Instanzen auf einer Maschine | Workstation, Concurrent aus | Laut Microsoft Learn weniger Kontextwechsel |
+| Batchverarbeitung mit hoher Allokationsrate | Server GC, Heaps eventuell begrenzen | Paralleles Sammeln, `GCHeapCount` gegen zu viel Speicher |
+
+Die Tabelle ist ein Ausgangspunkt, keine Regel. Messe mit der realen Last und schaue auf drei Größen: Durchsatz, Latenz der Anfragen und Speicherbedarf.
+
+### Umschalten
+
+| Ort | Server GC | Background GC | DATAS |
+| --- | --- | --- | --- |
+| Projektdatei (MSBuild) | `ServerGarbageCollection` | `ConcurrentGarbageCollection` | `GarbageCollectionAdaptationMode` |
+| `runtimeconfig.json` | `System.GC.Server` | `System.GC.Concurrent` | `System.GC.DynamicAdaptationMode` |
+| Umgebungsvariable | `DOTNET_gcServer` | `DOTNET_gcConcurrent` | `DOTNET_GCDynamicAdaptationMode` |
+
+Server GC und Background GC sind `true` oder `false` (in Umgebungsvariablen `1` oder `0`), DATAS ist `1` für an und `0` für aus. Alle Werte liest die Runtime nur beim Start. Zum Beispiel für einen ASP.NET Core Dienst, der klassischen Server GC ohne DATAS verwenden soll:
+
+```xml
+<PropertyGroup>
+  <ServerGarbageCollection>true</ServerGarbageCollection>
+  <GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>
+</PropertyGroup>
+```
+
+Und für eine Konsolenanwendung, die testweise mit Server GC laufen soll, ohne neu zu bauen:
+
+```bash
+DOTNET_gcServer=1 dotnet MyApp.dll
+```
+
+{/* TODO(verify): DATAS has no effect when workstation GC is selected, and setting GCHeapCount explicitly disables DATAS (dynamic heap count) in .NET 9. */}
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die Modi unterscheiden sich nicht nur in der Konfiguration, sondern im Code: Der GC wird in einer Workstation- und einer Server-Variante gebaut, und beim Start wählt die Runtime eine davon. Im Quellcode von dotnet/runtime heißen sie `WKS` und `SVR`, das Book of the Runtime beschreibt den Ablauf für alle vier Kombinationen aus Workstation oder Server und Concurrent an oder aus.
+
+{/* TODO(verify): gc.cpp compiled twice (WKS and SVR namespaces, MULTIPLE_HEAPS define) and selected at startup in gcload/gcconfig. */}
+
+Für den JIT ändert sich wenig. Die Allokationshelfer und Write Barriers funktionieren in beiden Modi gleich. Der Allocation Context eines Threads bestimmt, in welchem Heap seine Objekte landen. Seit .NET 7 arbeitet der GC mit Regions statt Segmenten (siehe „Segments und Regions“), was DATAS erst praktikabel gemacht hat: Speicher lässt sich in kleineren Einheiten zwischen Heaps verschieben oder zurückgeben.
+
+{/* TODO(verify): DATAS depends on regions (not available with segments / clrgc.dll). */}
+
+<Callout kind="version">
+  DATAS gibt es seit .NET 8 als Opt-in und ist seit .NET 9 standardmäßig aktiv, wenn Server GC
+  verwendet wird. Das Ziel für die Throughput Cost Percentage ist ab .NET 9 einstellbar, die
+  Einstellungen für die Gen0-Obergrenze von DATAS ab .NET 10. Die Umgebungsvariablen mit Präfix
+  `DOTNET_` gibt es seit .NET 6, davor hießen sie `COMPlus_`.
+</Callout>
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das Programm gibt aus, welcher Modus aktiv ist und welche GC-Konfiguration die Runtime tatsächlich verwendet, hält rund 100 MB langlebige Daten und erzeugt dann auf allen Kernen viel Müll. Starte es dreimal: normal (Workstation), mit `DOTNET_gcServer=1` (Server mit DATAS ab .NET 9) und mit `DOTNET_gcServer=1` plus `DOTNET_GCDynamicAdaptationMode=0` (klassischer Server GC).
+
+{/* TODO(verify): Expected tendency on a machine with 8+ cores: Workstation most gen0 GCs and lowest committed memory, classic Server GC fewest gen0 GCs and highest committed memory, DATAS in between. Not measured. */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus mit .NET 9 oder neuer ausführen (dotnet run -c Release), dreimal mit den genannten Umgebungsvariablen. Erwartet: Mit klassischem Server GC deutlich weniger Gen0-Collections und deutlich mehr Committed Memory als mit Workstation GC. DATAS sollte dazwischen liegen. Die konkreten Werte hängen von Kernzahl und Hardware ab."
+  code={verifyCode}
+/>
+
+Wie viele Heaps gerade im Einsatz sind, zeigen bei DATAS die GC-Ereignisse. Zeichne einen Trace mit `dotnet-trace` auf und öffne ihn in PerfView: In der Ansicht GCStats steht für jede Collection auch die Zahl der Heaps. `dotnet-counters monitor` zeigt laufend die Zahl der Collections und die Heapgröße, damit lässt sich der Unterschied zwischen den Modi auch ohne Trace beobachten.
+
+{/* TODO(verify): Where the current heap count under DATAS is visible (GCStats column, GCDynamicEvent / GCHeapCountTuning events in .NET 8+, GCMemoryInfo). */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="gc-modi"
+  questions={[
+    {
+      q: 'Auf welchem Thread läuft eine Gen0-Collection bei Workstation GC?',
+      options: [
+        'Auf einem dedizierten GC-Thread mit hoher Priorität',
+        'Auf dem Anwendungs-Thread, der die Collection ausgelöst hat',
+        'Auf einem Thread des ThreadPools',
+      ],
+      correct: 1,
+      explanation:
+        'Bei Workstation GC führt der auslösende Thread die Collection selbst aus, mit seiner normalen Priorität. Dedizierte GC-Threads mit hoher Priorität gibt es bei Server GC.',
+    },
+    {
+      q: 'Ein Objekt liegt in Heap 0, ein anderes in Heap 3 eines Server-GC-Prozesses. Darf das zweite auf das erste verweisen?',
+      options: [
+        'Nein, jeder Heap gehört einem Thread',
+        'Nur über einen GC-Handle',
+        'Ja, alle Heaps bilden einen verwalteten Heap, Verweise über Heapgrenzen sind normal',
+      ],
+      correct: 2,
+      explanation:
+        'Die Heaps dienen der parallelen Allokation und Collection. Für den Code ist unsichtbar, in welchem Heap ein Objekt liegt, und Verweise dürfen beliebig zwischen ihnen verlaufen.',
+    },
+    {
+      q: 'Warum braucht ein Dienst mit Server GC oft viel mehr Speicher als mit Workstation GC?',
+      options: [
+        'Weil Server GC keine Gen0-Collections macht',
+        'Weil es pro Kern einen Heap mit großem Gen0-Budget gibt, in dem zwischen zwei Collections viel Müll liegen darf',
+        'Weil Server GC Objekte doppelt speichert',
+      ],
+      correct: 1,
+      explanation:
+        'Mehr Heaps mit großzügigen Budgets heißt seltenere Collections und mehr Speicher dazwischen. Das ist der Tausch, den Server GC für den Durchsatz eingeht.',
+    },
+    {
+      q: 'Mit wie vielen Heaps startet DATAS?',
+      options: ['Mit einem', 'Mit einem pro Kern', 'Mit der Hälfte der Kerne'],
+      correct: 0,
+      explanation:
+        'DATAS beginnt immer mit einem Heap und erhöht die Zahl, wenn die Throughput Cost Percentage über dem Ziel liegt. Deshalb können Threads beim Start und zu Beginn von Lastspitzen kurz beim Allozieren warten.',
+    },
+    {
+      q: 'Was ist seit .NET 9 der Standard für eine ASP.NET Core Anwendung ohne eigene GC-Einstellungen?',
+      options: [
+        'Workstation GC mit Background GC',
+        'Server GC mit Background GC und DATAS',
+        'Server GC ohne Background GC',
+      ],
+      correct: 1,
+      explanation:
+        'ASP.NET Core Anwendungen verwenden standardmäßig Server GC, Background GC ist in beiden Modi standardmäßig an, und DATAS ist seit .NET 9 bei Server GC standardmäßig aktiv.',
+    },
+    {
+      q: 'Auf einer Maschine mit vier Kernen laufen zwölf Dienste mit klassischem Server GC. Was ist das wahrscheinlichste Problem?',
+      options: [
+        'Gleichzeitige Collections lassen viele hoch priorisierte GC-Threads um dieselben Kerne konkurrieren',
+        'Server GC schaltet sich bei mehr als vier Prozessen automatisch ab',
+        'Die Prozesse teilen sich einen gemeinsamen Heap',
+      ],
+      correct: 0,
+      explanation:
+        'Jeder Prozess hat einen GC-Thread pro Kern. Sammeln mehrere Prozesse gleichzeitig ein, verdrängen sich ihre GC-Threads gegenseitig. Abhilfe sind Workstation GC, DATAS oder eine begrenzte Heapzahl.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- **Workstation GC** hat einen Heap und sammelt auf dem auslösenden Thread ein. Standard für eigenständige Anwendungen und auf Maschinen mit nur einem Kern immer aktiv.
+- **Server GC** hat einen Heap und einen dedizierten GC-Thread pro logischem Kern, sammelt parallel ein und arbeitet mit großen Budgets. Standard für ASP.NET Core.
+- Alle Heaps bilden **einen** verwalteten Heap. Sie dienen der parallelen Allokation und Collection, Verweise zwischen ihnen sind normal.
+- **Background GC** ist eine eigene Einstellung und in beiden Modi standardmäßig aktiv.
+- **DATAS** startet mit einem Heap, passt die Zahl der Heaps über die Throughput Cost Percentage an die Last an und bindet die Budgets an die Größe der langlebigen Daten. Opt-in seit .NET 8, Standard bei Server GC seit .NET 9.
+- Server GC tauscht **Speicher und Threads gegen Durchsatz**. Viele Prozesse auf einer Maschine oder knappe Container-Limits sprechen für DATAS oder Workstation GC.
+- Umschalten über `ServerGarbageCollection`, `ConcurrentGarbageCollection` und `GarbageCollectionAdaptationMode` oder die passenden `runtimeconfig.json`-Einträge und `DOTNET_`-Variablen. Benchmarks immer im Modus der Produktion messen.
+
+</Block>

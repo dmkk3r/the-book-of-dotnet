@@ -1,0 +1,140 @@
+---
+import Icon from '@/components/Icon.astro';
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import ProgressBar from '@/components/layout/ProgressBar.astro';
+import { curriculum, lessonsOf, chapterPath, lessonPath, TIER_LABELS } from '@/lib/curriculum';
+import { getReadyIds } from '@/lib/lessons';
+import { withBase } from '@/lib/paths';
+
+const ready = await getReadyIds();
+const first = curriculum.lessons.find((l) => ready.has(l.id)) ?? curriculum.lessons[0]!;
+---
+
+<BaseLayout description="Interaktive Lektionen zu den Interna der .NET-Runtime." wide>
+  <section class="hero">
+    <h1>Die .NET-Runtime von innen</h1>
+    <p class="lead">
+      Jede Lektion zeigt dir, was im Speicher, im JIT oder im ThreadPool passiert, während dein Code
+      läuft, Schritt für Schritt und mit dem Weg, es selbst nachzuweisen.
+    </p>
+    <a class="btn primary" data-continue href={withBase(lessonPath(first.chapter.id, first.id))}>
+      Weiterlernen: <span data-continue-title>{first.title}</span>
+    </a>
+  </section>
+
+  <h2 class="section-title">Kapitel</h2>
+  <ol class="cards">
+    {curriculum.chapters.map((chapter) => {
+      const lessons = lessonsOf(chapter);
+      return (
+        <li class="card" data-progress-chapter={chapter.id}>
+          <div class="card-head">
+            <p class="eyebrow">Kapitel {chapter.number}</p>
+            <span class="tier">{TIER_LABELS[chapter.tier]}</span>
+          </div>
+          <h3>
+            <a href={withBase(chapterPath(chapter.id))}>{chapter.title}</a>
+          </h3>
+          <p class="summary">{chapter.summary}</p>
+          <ul class="card-links" aria-label={`Lektionen in ${chapter.title}`}>
+            {lessons.map((lesson) => (
+              <li>
+                <a
+                  href={withBase(lessonPath(chapter.id, lesson.id))}
+                  data-lesson={lesson.id}
+                  data-state={ready.has(lesson.id) ? 'ready' : 'todo'}
+                >
+                  {lesson.title}
+                </a>
+                <span class="done" aria-hidden="true">
+                  <Icon name="check" />
+                </span>
+                <span class="sr-only" data-done-label />
+              </li>
+            ))}
+          </ul>
+          <div class="card-foot">
+            <ProgressBar total={lessons.length} />
+          </div>
+        </li>
+      );
+    })}
+  </ol>
+</BaseLayout>
+
+<style>
+  .hero {
+    padding: 24px 0 32px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 32px;
+  }
+  .section-title {
+    font-size: 1.5rem;
+    margin-bottom: 16px;
+  }
+  .cards {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
+    gap: 16px;
+  }
+  .card {
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    padding: 16px 20px;
+  }
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 4px;
+  }
+  .card .eyebrow {
+    margin: 0;
+  }
+  .card h3 {
+    font-size: 1.125rem;
+    margin: 0 0 6px;
+  }
+  .summary {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .card-links {
+    list-style: none;
+    margin: 0 0 16px;
+    padding: 0;
+    font-size: 14px;
+    display: grid;
+    gap: 4px;
+  }
+  .card-links li {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+  }
+  .card-links a[data-state='todo'] {
+    color: var(--muted);
+  }
+  .card-links .done {
+    display: none;
+    color: var(--ok);
+    font-weight: 600;
+  }
+  .card-links a[data-done='true'] + .done {
+    display: inline;
+  }
+  .card-foot {
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+</style>

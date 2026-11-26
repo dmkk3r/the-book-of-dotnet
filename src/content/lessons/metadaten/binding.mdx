@@ -1,0 +1,336 @@
+---
+id: binding
+title: Versionierung und Binding
+summary: Woraus die Identität einer Assembly besteht, wie der Default-Kontext eine AssemblyRef über die TPA-Liste an genau eine Datei bindet, warum eine höhere Version reicht und eine niedrigere scheitert, wo Versionskonflikte wirklich entschieden werden und was Assembly-, Datei-, Paket- und Informationsversion jeweils bedeuten.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Algorithmus zum Laden verwalteter Assemblys (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/dependency-loading/loading-managed
+  - title: 'Standardsuche des Default-Kontexts (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/dependency-loading/default-probing
+  - title: 'Assemblys mit starkem Namen (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/assembly/strong-named
+  - title: 'Assemblyversionsverwaltung (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/assembly/versioning
+  - title: 'Versionierung von .NET-Bibliotheken (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/library-guidance/versioning
+  - title: 'NuGet: Auflösung von Paketabhängigkeiten (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/nuget/concepts/dependency-resolution
+  - title: 'dotnet/runtime: Assembly Conflict Resolution'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/assembly-conflict-resolution.md
+  - title: 'dotnet/runtime: assemblybindercommon.cpp (release/9.0)'
+    url: https://github.com/dotnet/runtime/blob/release/9.0/src/coreclr/binder/assemblybindercommon.cpp
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './binding.steps';
+import lowerScript from './binding-lower.steps';
+import conflictScript from './binding-conflict.steps';
+import { versionsCode, lowerCode } from './binding-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine Assembly nennt ihre Abhängigkeiten nur beim Namen. In der Tabelle AssemblyRef steht etwa „Contoso.Json, Version 2.1.0.0“, aber kein Pfad und keine Garantie, dass auf der Zielmaschine genau diese Datei liegt. Irgendwer muss zur Laufzeit entscheiden, welche Datei diesen Verweis erfüllt. Diese Entscheidung heißt **Binding**.
+
+Dahinter steckt ein echter Zielkonflikt. Ist die Regel streng und verlangt exakt die Version, gegen die kompiliert wurde, bricht jede App, sobald eine Abhängigkeit einen Patch bekommt. Ist die Regel locker und nimmt irgendeine Version, laufen Bibliotheken gegen Code, den ihr Autor nie gesehen hat, und scheitern an fehlenden Methoden. Dazu kommt: Eine App besteht aus Dutzenden Paketen, die selbst wieder unterschiedliche Versionen derselben Abhängigkeit verlangen, und das Framework bringt noch einmal eigene Assemblies mit.
+
+.NET Framework hat sich für die strenge Seite entschieden und Entwicklern Binding Redirects in `app.config` gegeben, um sie zu lockern. Wer damit gearbeitet hat, kennt die Folge: lange Listen von Umleitungen, die Werkzeuge generieren und niemand versteht. .NET (Core) hat das Problem neu aufgeteilt. Die Laufzeitregel ist einfach und locker, und die eigentliche Konfliktlösung findet vorher statt, beim Restore, beim Build und beim Start im Host.
+
+Diese Lektion folgt dieser Aufteilung. Sie zeigt, was die Identität einer Assembly ausmacht, wie der Binder einen Verweis auflöst, wann er scheitert und wo du eingreifen musst, wenn es kracht.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen das Modell:
+
+1. **Identität hat vier Teile.** Einfacher Name, Version, Kultur und Public Key Token. Die AssemblyRef in der verweisenden Assembly und das Manifest in der Zieldatei tragen beide diese vier Angaben.
+2. **Pro Name gibt es im Default-Kontext genau eine Datei.** Der Host schreibt beim Start einen Pfad je einfachem Namen in die TPA-Liste. Der Binder sucht dort nur nach dem Namen.
+3. **Neu genug reicht.** Die gefundene Version muss gleich oder höher sein als die verlangte. Eine niedrigere Version führt zu einer `FileLoadException`, eine höhere wird ohne Konfiguration akzeptiert.
+4. **Konflikte sind vor dem Laden entschieden.** NuGet wählt eine Version pro Paket, das SDK eine Datei pro Name, `hostpolicy` zwischen App und Framework. Der Binder prüft nur noch.
+5. **Nur die Assembly-Version zählt.** Paket-, Datei- und Informationsversion beeinflussen das Binding der Runtime nicht. Das Framework hält seine Assembly-Version über alle Patches einer Version konstant.
+
+<Callout kind="fehlannahme">
+  „Wenn zwei Pakete unterschiedliche Versionen verlangen, brauche ich auch in .NET 8 einen Binding
+  Redirect.“ Nein: .NET (Core) liest keine Binding Redirects. Die Runtime lädt automatisch eine
+  höhere Version, wenn sie auf der TPA-Liste steht. Und eine niedrigere Version kann auch kein
+  Redirect erzwingen. Gelöst wird so ein Konflikt mit den Paketversionen im Projekt.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Eine App ist gegen Contoso.Json 2.1 gebaut, ausgeliefert wird 2.3. Achte in Schritt 3 darauf, wonach in der TPA-Liste gesucht wird, und in Schritt 5, wann die Version überhaupt ins Spiel kommt.
+
+<StepPlayer script={script} />
+
+Der Code-Tab zeigt die drei Zutaten: den Aufruf, der das Binding auslöst, die AssemblyRef, die der Compiler in `App.dll` geschrieben hat, und den Eintrag der TPA-Liste. Die Reihenfolge der Prüfungen entspricht dem Binder im CoreCLR-Quellcode: erst der Cache des Kontexts, dann die TPA-Liste nach Namen, dann Name und Kultur, zuletzt die Version. Wie die Kette vom Methodenaufruf über TypeRef zur AssemblyRef aussieht, zeigt die Lektion „Metadatentabellen und Tokens“.
+
+{/* TODO(verify): Order in src/coreclr/binder/assemblybindercommon.cpp (release/9.0): BindLocked -> FindInExecutionContext -> BindByTpaList -> TestCandidateRefMatchesDef -> IsCompatibleAssemblyVersion; checked 2026-11, pin to a commit. */}
+
+</Block>
+
+<Block n={4} title="Identität und Versionsregel">
+
+### Die vier Teile einer Identität
+
+Die Identität einer Assembly steht im Manifest, also in der Tabelle Assembly, und jeder Verweis darauf in einer Zeile der Tabelle AssemblyRef. Wie diese Tabellen aufgebaut sind, beschreibt die Lektion „Aufbau einer Assembly“. Geschrieben wird die Identität als **Anzeigename**:
+
+```text
+Contoso.Json, Version=2.1.0.0, Culture=neutral, PublicKeyToken=0a1b2c3d4e5f6071
+```
+
+- **Einfacher Name**: in der Regel der Dateiname ohne `.dll`. Der Vergleich ignoriert Groß- und Kleinschreibung.
+- **Version**: vier Zahlen, Haupt-, Neben-, Build- und Revisionsnummer. Im Projekt setzt du sie mit `<AssemblyVersion>`.
+- **Kultur**: `neutral` für Code. Eine andere Kultur haben nur Satellitenassemblies mit übersetzten Ressourcen.
+- **Public Key Token**: ein kurzer Hash des öffentlichen Schlüssels, falls die Assembly einen starken Namen hat, sonst `null`.
+
+{/* TODO(verify): Version components are UInt16 with a maximum of 65534 (AssemblyVersionAttribute docs); public key token is the last 8 bytes of the SHA-1 hash of the public key (ECMA-335 II.6.2.1.3). */}
+
+### Starke Namen in .NET (Core)
+
+Ein starker Name entsteht, wenn eine Assembly mit einem privaten Schlüssel signiert wird. In .NET Framework hatte das echte Folgen: Nur signierte Assemblies kamen in den globalen Assembly-Cache, und nur bei ihnen prüfte die Runtime die Version überhaupt. Microsoft schreibt dazu klar: Für .NET Core und .NET 5+ bringen starke Namen keinen nennenswerten Nutzen. Die Runtime prüft die Signatur nie und verwendet den starken Namen nicht für das Binding.
+
+Im Quellcode des Binders sieht man das direkt. Findet er eine Datei über die TPA-Liste, vergleicht er Name und Kultur, aber nicht das Public Key Token. Eine Datei mit anderem Schlüssel und gleichem Namen erfüllt den Verweis also genauso. Bibliotheken, die auch unter .NET Framework laufen sollen, signieren trotzdem weiter, weil ein Verweis aus einer signierten Assembly dort nur auf eine signierte zeigen darf.
+
+{/* TODO(verify): TestCandidateRefMatchesDef with tpaListAssembly=true uses INCLUDE_DEFAULT (simple name, content type, culture) in release/9.0; the source comment mentions PKT but the flags do not include INCLUDE_PUBLIC_KEY_TOKEN. Confirm with an experiment (assembly re-signed with a different key on the TPA list). */}
+
+### Die Versionsregel im Detail
+
+Hat der Binder eine Datei mit passendem Namen und passender Kultur, vergleicht er die Versionen Komponente für Komponente: erst die Hauptversion, bei Gleichstand die Nebenversion, dann Build, dann Revision. Ist die gefundene Version an der ersten unterschiedlichen Stelle höher, passt sie, ist sie niedriger, nicht. Fehlt im Verweis eine Komponente, etwa bei `Assembly.Load("Contoso.Json")` ganz ohne Version, gilt sie als erfüllt.
+
+| Verlangt | Gefunden | Ergebnis |
+| --- | --- | --- |
+| 2.1.0.0 | 2.1.0.0 | passt |
+| 2.1.0.0 | 2.3.0.0 | passt |
+| 2.1.0.0 | 3.0.0.0 | passt, auch über eine Hauptversion hinweg |
+| 2.1.0.0 | 2.0.9.9 | scheitert, Nebenversion 0 ist kleiner als 1 |
+| ohne Version | 1.0.0.0 | passt |
+
+Dieselbe Regel gilt, wenn die Assembly im Kontext schon geladen ist. Dann wird gegen die **geladene** Version geprüft, denn eine zweite Version desselben Namens kann der Kontext nicht aufnehmen. Wer wirklich zwei Versionen nebeneinander braucht, braucht zwei Kontexte, wie in der Lektion „AssemblyLoadContext und Isolierung“ beschrieben.
+
+Bemerkenswert ist, was **nicht** in der Regel steckt. Eine Obergrenze gibt es nicht, auch ein Sprung von 2 auf 3 wird akzeptiert. Und die Regel gilt unabhängig davon, ob die Assembly einen starken Namen hat. In .NET Framework war es genau umgekehrt: Versionen wurden nur bei signierten Assemblies geprüft, dafür exakt.
+
+{/* TODO(verify): IsCompatibleAssemblyVersion in release/9.0 has no strong-name condition (checked in source); confirm the "found 3.0 for requested 2.1" case at run time. */}
+
+</Block>
+
+<Block n={5} title="Wo Konflikte entschieden werden">
+
+### Vier Stellen, eine Regel pro Stelle
+
+Die Laufzeitregel ist so einfach, weil die schwierigen Fragen vorher beantwortet werden. Zwischen deiner Projektdatei und dem Binder liegen vier Stationen, und an jeder fällt eine Entscheidung:
+
+<StepPlayer script={conflictScript} />
+
+### NuGet: eine Version pro Paket
+
+Beim Restore baut NuGet den Abhängigkeitsgraphen und wählt für jedes Paket genau eine Version. Die Regeln dafür sind dokumentiert: Gibt es nur Untergrenzen, nimmt NuGet die **niedrigste** Version, die alle erfüllt, nicht die neueste. Hängt das Projekt selbst direkt von einem Paket ab, gewinnt diese direkte Angabe, auch wenn sie niedriger ist als das, was ein anderes Paket verlangt. Dann meldet NuGet eine Herabstufung mit NU1605. Das Ergebnis steht in `obj/project.assets.json`.
+
+### SDK: eine Datei pro Name
+
+Auch nach dem Restore können zwei Dateien mit gleichem Namen im Build landen, etwa eine Assembly aus einem Paket und dieselbe aus dem Framework, gegen das du baust. Die SDK-Aufgabe `ResolvePackageFileConflicts` wählt dann eine aus. Laut Quellcode zählt zuerst eine ausdrückliche Überschreibungsliste, dann die höhere Assembly-Version, dann die höhere Dateiversion, dann ein bevorzugtes Paket, und bei Gleichstand gewinnt die Datei der Plattform. Was übrig bleibt, landet in der `deps.json`, zusammen mit Assembly- und Dateiversion.
+
+{/* TODO(verify): Order in dotnet/sdk src/Tasks/Common/ConflictResolution/ConflictResolver.cs (main 2026-11): PackageOverrides, AssemblyVersion, FileVersion, PreferredPackages, Platform item; that assemblyVersion and fileVersion are written to deps.json runtime entries. */}
+
+### hostpolicy: App gegen Framework
+
+Erst beim Start trifft die App auf das Framework, das auf der Maschine installiert ist, und das kann ein neuerer Patch sein als beim Build. `hostpolicy` liest zuerst die `deps.json` der App, dann die der Frameworks. Kommt ein Name doppelt vor, gewinnt laut Design-Dokument die höhere Assembly-Version, bei Gleichstand die höhere Dateiversion. So überholt ein Sicherheitspatch des Frameworks eine ältere Kopie derselben Assembly, die eine App aus einem Paket mitgebracht hat. Wie `hostpolicy` die Liste baut, zeigen „Der Host: dotnet, hostfxr, hostpolicy“ und „runtimeconfig.json und deps.json“.
+
+{/* TODO(verify): Tie-breaking when assembly and file version are equal (assembly-conflict-resolution.md: "If the new entry is equal or lower, skip it", app processed first, so the app entry stays). */}
+
+### Der Binder: nur noch prüfen
+
+Wenn die Runtime startet, steht pro Name genau ein Pfad fest. Der Binder wählt zwischen keinen Alternativen mehr, er beantwortet nur die Frage „neu genug?“. Darin liegt die eigentliche Idee von .NET (Core): Konflikte werden dort gelöst, wo alle Informationen vorliegen, nicht in einer Konfigurationsdatei, die zur Laufzeit Anfragen umbiegt.
+
+</Block>
+
+<Block n={6} title="Vier Versionsnummern">
+
+### Welche Zahl wofür
+
+Eine Bibliothek trägt bis zu vier verschiedene Versionen, und nur eine davon interessiert den Binder:
+
+| Version | Gesetzt mit | Wo sichtbar | Wirkung |
+| --- | --- | --- | --- |
+| Paketversion | `<PackageVersion>` bzw. `<Version>` | NuGet, `project.assets.json` | Auswahl beim Restore, keine Wirkung zur Laufzeit |
+| Assembly-Version | `<AssemblyVersion>` | Manifest, jede AssemblyRef | Teil der Identität, vom Binder geprüft |
+| Dateiversion | `<FileVersion>` | Dateieigenschaften unter Windows, `deps.json` | Gleichstandsregel in SDK und `hostpolicy` |
+| Informationsversion | `<InformationalVersion>` | Attribut, oft mit Commit-Hash | rein informativ |
+
+Microsoft schreibt über Datei- und Informationsversion, sie hätten keine Wirkung auf das Laufzeitverhalten. Für die Runtime selbst stimmt das. Die Tabelle zeigt aber, dass die Dateiversion vorher sehr wohl zählt: SDK und `hostpolicy` nutzen sie, um bei gleicher Assembly-Version die neuere Datei zu wählen.
+
+### Die Politik des Frameworks
+
+Die Assemblies des Shared Frameworks halten ihre Assembly-Version über alle Patches konstant: In der Build-Konfiguration von dotnet/runtime ist sie auf Haupt- und Nebenversion mit zwei Nullen festgelegt, also `9.0.0.0` für jede Version von .NET 9. Was sich mit jedem Patch ändert, sind Datei- und Informationsversion. Für dich hat das eine angenehme Folge: Eine App, die gegen `System.Runtime, Version=9.0.0.0` gebaut ist, bindet an jedem Patch von .NET 9 ohne jede Versionsfrage.
+
+{/* TODO(verify): eng/Versions.props in release/9.0 sets AssemblyVersion to $(MajorVersion).$(MinorVersion).0.0 with the comment that serviced assemblies are updated manually per assembly (applies to OOB packages?). Confirm shared framework assemblies stay at 9.0.0.0 across 9.0.x. */}
+
+Microsoft empfiehlt Bibliotheksautoren Ähnliches: in der Assembly-Version nur die Hauptversion zu führen, also `1.0.0.0` für alle 1.x-Pakete, und diese Hauptversion mit der Paketversion abzugleichen. Eine Assembly-Version, die sich nie ändert, raten sie dagegen ab, weil sie unter .NET Framework im globalen Assembly-Cache zu Problemen führt.
+
+</Block>
+
+<Block n={7} title="Stolperfalle: zu alt, und zu neu">
+
+Die lockere Regel hat zwei Fehlerbilder, die man auseinanderhalten muss. Das eine kracht beim Binding, das andere erst später:
+
+<StepPlayer script={lowerScript} />
+
+Die beiden Fälle unterscheiden sich an der Ausnahme. Eine `FileLoadException` mit dem Hinweis, das Manifest passe nicht zum Verweis, heißt: Die Datei ist da, aber zu alt. Eine `FileNotFoundException` heißt: Der Name steht gar nicht auf der TPA-Liste. Und eine `MissingMethodException` oder `TypeLoadException` nach erfolgreichem Laden heißt: Die Version war neu genug, aber nicht kompatibel. In welchem Moment solche Fehler auftauchen, beschreibt die Lektion „Wie ein Typ geladen wird“.
+
+{/* TODO(verify): Exact FileLoadException message for FUSION_E_REF_DEF_MISMATCH (0x80131040) on .NET 8 and 9. */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Situation | Was passiert | Was du tust |
+| --- | --- | --- |
+| Zwei Pakete verlangen verschiedene Mindestversionen | NuGet nimmt die niedrigste, die alle erfüllt | nichts, oder direkt eine höhere Version referenzieren |
+| Warnung NU1605 beim Restore | direkte Referenz stuft ein Paket herab | direkte Referenz anheben, Warnung nicht unterdrücken |
+| `FileLoadException` mit Version im Text | Datei auf der TPA-Liste ist älter als verlangt | `deps.json` und Paketversionen prüfen |
+| `MissingMethodException` nach Update | höhere Hauptversion mit entferntem Member | Bibliotheken auf eine gemeinsame Hauptversion bringen |
+| Alte `app.config` mit `bindingRedirect` migriert | wird ignoriert | löschen, Konflikt über Pakete lösen |
+| App bringt ältere Kopie einer Framework-Assembly mit | `hostpolicy` nimmt die neuere aus dem Framework | Paketreferenz entfernen, wenn das Framework die Assembly enthält |
+
+{/* TODO(verify): That .NET (Core) ignores app.config bindingRedirect entries entirely (System.Configuration.ConfigurationManager reads app.config only for appSettings etc.). */}
+
+### Typweiterleitung als Versionswerkzeug
+
+Ein Mittel, mit dem Bibliotheken ihre Identität stabil halten, kennst du schon aus „Die Bausteine von .NET“: die **Typweiterleitung**. Verschiebt ein Autor einen Typ in eine andere Assembly, lässt er in der alten eine Zeile in der Tabelle ExportedType zurück. Alte Verweise binden weiter an die alte Assembly, und die Runtime folgt der Weiterleitung zum neuen Ort. So bleibt `System.Runtime` der stabile Vertrag, während die Implementierung in `System.Private.CoreLib` liegt, und so leitet die Fassade `netstandard.dll` Verweise aus .NET-Standard-Bibliotheken auf die echten Assemblies weiter. Das Binding prüft dabei nur die Version der Assembly, auf die der Verweis zeigt.
+
+{/* TODO(verify): That netstandard.dll in shared/Microsoft.NETCore.App is a facade consisting of type forwards. */}
+
+### Bibliotheken richtig versionieren
+
+Wenn du selbst Bibliotheken veröffentlichst, folgt aus der Regel „neu genug reicht“ eine Verantwortung: Innerhalb einer Hauptversion darfst du keine öffentlichen Member entfernen oder ändern, denn jeder Aufrufer, der gegen eine ältere Version gebaut wurde, bindet an deine neue. Bei Breaking Changes erhöhst du die Hauptversion, in Paket- und Assembly-Version. Ein Wechsel der Hauptversion verhindert das Binding zwar nicht, er macht aber für alle sichtbar, dass Vorsicht geboten ist.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Versionsregel ist eine Hälfte der Versionierung, die **Framework-Auflösung** im Host ist die andere. Bevor überhaupt eine Assembly gebunden wird, wählt `hostfxr` nach den Roll-Forward-Regeln, welches Shared Framework die App bekommt, typischerweise den neuesten Patch der Version, gegen die gebaut wurde. Weil die Assembly-Versionen innerhalb einer Hauptversion gleich bleiben, ist dieser Patchwechsel für den Binder unsichtbar. Erlaubt eine App mit `rollForward` den Sprung auf eine neue Hauptversion, stehen danach Framework-Assemblies mit höherer Version auf der TPA-Liste, etwa `9.0.0.0` für einen Verweis auf `8.0.0.0`. Auch das erfüllt die Regel. Die Details stehen in der Lektion „Der Host: dotnet, hostfxr, hostpolicy“.
+
+Eigene Kontexte folgen teilweise anderen Regeln. Ein abgeleiteter `AssemblyLoadContext` entscheidet in seiner Methode `Load` selbst, welche Datei er für einen Namen lädt, und kann so Versionen nebeneinander halten, die im Default-Kontext unmöglich wären. Welche Versionsprüfung danach noch greift, ist ein Detail, das du für deine Version im Binder nachlesen solltest.
+
+{/* TODO(verify): Whether the runtime validates the version of an assembly returned from a custom AssemblyLoadContext.Load override (BindUsingHostAssemblyResolver in src/coreclr/binder) and from the Resolving event. */}
+
+<Callout kind="version">
+  Diese Lektion beschreibt .NET (Core) ab Version 3.0 mit Beispielen für .NET 8 und 9. In .NET
+  Framework gelten andere Regeln: exakte Versionsprüfung nur für signierte Assemblies, globaler
+  Assembly-Cache, Binding Redirects und Publisher Policy. Die Versionsregel im Binder von CoreCLR
+  wurde im Zweig `release/9.0` nachgelesen.
+</Callout>
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+### Verlangte und geladene Versionen
+
+Das erste Programm zeigt, was deine App verlangt und was die Runtime tatsächlich geladen hat, mit allen vier Versionsangaben. Führe es lokal aus.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht: dotnet new console, Program.cs ersetzen, dotnet run. SharpLab hat eine eigene Startkette."
+  code={versionsCode}
+/>
+
+Erwartetes Ergebnis bei einer App für `net8.0`: Die Verweise nennen `System.Runtime, Version=8.0.0.0` und `System.Console, Version=8.0.0.0`, jeweils mit Public Key Token. Bei den geladenen Assemblies hat `System.Private.CoreLib` die Assembly-Version `8.0.0.0`, die Dateiversion und die Informationsversion zeigen dagegen den installierten Patch. Installierst du einen neueren Patch und startest erneut, ändern sich nur die beiden letzten.
+
+{/* TODO(verify): Output on .NET 8 (8.0.x) and 9: CoreLib assembly version 8.0.0.0, file version 8.0.x.y, informational version 8.0.x+hash. */}
+
+### Eine zu alte Version provozieren
+
+Das zweite Experiment baut eine Bibliothek in zwei Assembly-Versionen und tauscht nach dem Build die neue gegen die alte aus:
+
+<VerifyCard
+  sharplab="Führe die Schritte lokal in einem leeren Ordner aus."
+  code={lowerCode}
+/>
+
+Erwartetes Ergebnis: Die App startet, und sobald der JIT die Methode übersetzt, die einen Typ aus `Shop` verwendet, kommt eine `FileLoadException` für `Shop, Version=2.0.0.0`. Tausch dann umgekehrt: App gegen 1.0 bauen, 2.0 hineinkopieren. Jetzt läuft sie ohne Fehler. Setz zum Schluss `DOTNET_HOST_TRACE=1` und such im Protokoll die TPA-Liste mit dem Pfad der getauschten Datei.
+
+{/* TODO(verify): Run the experiment on .NET 8: the deps.json still lists Shop with assemblyVersion 2.0.0.0, hostpolicy does not check the file, the runtime throws FileLoadException at the first use. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="binding"
+  questions={[
+    {
+      q: 'App.dll verlangt Contoso.Json 2.1.0.0, auf der TPA-Liste steht 3.0.0.0. Was passiert beim Binding?',
+      options: [
+        'FileLoadException, weil die Hauptversion abweicht',
+        'Das Binding gelingt, eine höhere Version reicht',
+        'Es braucht einen Binding Redirect',
+      ],
+      correct: 1,
+      explanation:
+        'Der Binder verlangt nur gefunden ≥ verlangt, ohne Obergrenze. Ob die Bibliothek wirklich kompatibel ist, zeigt sich erst, wenn Member aufgelöst werden.',
+    },
+    {
+      q: 'Verlangt ist 2.1.0.0, gefunden wird 2.0.9.9. Was passiert?',
+      options: ['Passt, weil die Hauptversion gleich ist', 'FileLoadException', 'FileNotFoundException'],
+      correct: 1,
+      explanation:
+        'Verglichen wird komponentenweise: Hauptversion gleich, Nebenversion 0 kleiner als 1, also zu alt. Die Datei wurde gefunden, deshalb FileLoadException und nicht FileNotFoundException.',
+    },
+    {
+      q: 'Prüft .NET 8 die Strong-Name-Signatur einer Assembly beim Laden?',
+      options: ['Ja, immer', 'Nur bei Assemblies auf der TPA-Liste', 'Nein, nie'],
+      correct: 2,
+      explanation:
+        'Laut Microsoft prüft die Runtime von .NET Core und .NET 5+ die Signatur nie und verwendet den starken Namen nicht für das Binding.',
+    },
+    {
+      q: 'Contoso.Pdf verlangt Contoso.Json ≥ 2.0.0, Contoso.Mail ≥ 2.1.0. Auf dem Feed gibt es 2.0.0, 2.1.0 und 2.3.0. Was wählt NuGet?',
+      options: ['2.0.0', '2.1.0', '2.3.0'],
+      correct: 1,
+      explanation:
+        'NuGet nimmt die niedrigste Version, die alle Bedingungen erfüllt. Die neueste Version auf dem Feed spielt keine Rolle.',
+    },
+    {
+      q: 'Welche Version ändert sich bei den Assemblies von .NET 9 zwischen den Patches 9.0.1 und 9.0.2?',
+      options: [
+        'Die Assembly-Version',
+        'Datei- und Informationsversion, die Assembly-Version bleibt 9.0.0.0',
+        'Keine',
+      ],
+      correct: 1,
+      explanation:
+        'Das Framework hält die Assembly-Version auf Haupt- und Nebenversion mit zwei Nullen. Deshalb binden Apps an jeden Patch, ohne dass sich ihre Verweise ändern.',
+    },
+    {
+      q: 'Eine migrierte App enthält in app.config Binding Redirects. Was bewirken sie unter .NET 8?',
+      options: [
+        'Sie biegen Verweise wie in .NET Framework um',
+        'Nichts, .NET (Core) liest keine Binding Redirects',
+        'Sie erlauben eine niedrigere Version',
+      ],
+      correct: 1,
+      explanation:
+        'Der Binder kennt keine Umleitungen. Höhere Versionen akzeptiert er ohnehin, niedrigere lassen sich nicht erzwingen. Konflikte löst man über die Paketversionen.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Die Identität einer Assembly besteht aus **einfachem Namen, Version, Kultur und Public Key Token**. Jede AssemblyRef nennt sie, jedes Manifest trägt sie.
+- Der Default-Kontext sucht in der **TPA-Liste nur nach dem einfachen Namen** und prüft danach Name, Kultur und Version. Pro Name gibt es genau eine Datei.
+- Die Regel heißt **gefunden ≥ verlangt**, komponentenweise und ohne Obergrenze. Eine zu alte Datei ergibt eine `FileLoadException`, eine fehlende eine `FileNotFoundException`.
+- Starke Namen werden in .NET (Core) **weder geprüft noch für das Binding verwendet**. Binding Redirects gibt es nicht.
+- Konflikte werden **vor dem Laden** entschieden: NuGet wählt eine Version pro Paket, das SDK eine Datei pro Name, `hostpolicy` zwischen App und Framework nach Assembly- und Dateiversion.
+- Nur die **Assembly-Version** zählt für den Binder. Das Framework hält sie über alle Patches konstant, Datei- und Informationsversion zeigen den Patch.
+- „Neu genug“ heißt nicht „kompatibel“: Fehlende Member einer höheren Version zeigen sich erst als `MissingMethodException`.
+
+</Block>

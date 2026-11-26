@@ -1,0 +1,48 @@
+---
+// Color legend using the binding color semantics (tokens.css).
+type Item = 'stack' | 'heap' | 'ref';
+interface Props {
+  items?: Item[];
+}
+const TEXT: Record<Item, string> = {
+  stack: 'Stack: lokale Werte, verschwinden mit dem Frame',
+  heap: 'Heap: Objekte, vom GC verwaltet',
+  ref: 'Verweis',
+};
+const COLOR: Record<Item, string> = {
+  stack: 'var(--stack)',
+  heap: 'var(--heap)',
+  ref: 'var(--ref)',
+};
+const { items = ['stack', 'heap', 'ref'] } = Astro.props;
+---
+
+<ul class="legend">
+  {items.map((item) => (
+    <li>
+      <i style={`background:${COLOR[item]}`} aria-hidden="true" />
+      {TEXT[item]}
+    </li>
+  ))}
+</ul>
+
+<style>
+  .legend {
+    list-style: none;
+    padding: 0;
+    display: flex;
+    gap: 8px 18px;
+    flex-wrap: wrap;
+    font-size: 14px;
+    color: var(--muted);
+    margin: 14px 0 0;
+  }
+  i {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    margin-right: 6px;
+    vertical-align: -1px;
+  }
+</style>

@@ -1,0 +1,98 @@
+/* Knowledge check in the style of documentation sites (see Quiz.tsx). */
+.quiz {
+  max-width: 80ch;
+}
+
+.q {
+  margin: 0 0 24px;
+}
+
+.q-text {
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+
+.q-n {
+  margin-right: 4px;
+}
+
+.opts {
+  display: grid;
+  gap: 6px;
+}
+
+.opt {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-align: left;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-size: 15px;
+}
+
+.opt::before {
+  content: '';
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1.5px solid var(--muted);
+}
+
+.opt:hover {
+  border-color: var(--accent);
+}
+
+.opt[aria-pressed='true']::before {
+  border-width: 5px;
+  border-color: var(--accent);
+}
+
+.opt[data-state='right'] {
+  border-color: var(--ok);
+}
+
+.opt[data-state='right']::before {
+  border-color: var(--ok);
+}
+
+.opt[data-state='wrong'] {
+  border-color: var(--bad);
+}
+
+.opt[data-state='wrong']::before {
+  border-color: var(--bad);
+}
+
+.fb {
+  margin: 8px 0 0;
+  font-size: 15px;
+}
+
+.fb:empty {
+  display: none;
+}
+
+.fb[data-state='right'] strong {
+  color: var(--ok);
+}
+
+.fb[data-state='wrong'] strong {
+  color: var(--bad);
+}
+
+.quiz-status {
+  margin: 4px 0 0;
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.quiz-status:empty {
+  display: none;
+}

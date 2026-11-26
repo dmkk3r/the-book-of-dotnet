@@ -1,0 +1,336 @@
+---
+id: card-tables
+title: 'Write Barriers und Card Tables'
+summary: Wie die Runtime bei jedem Verweis-Schreibzugriff festhält, wo alte Objekte auf junge zeigen, wie die Card Table aufgebaut ist und warum ständige Schreibzugriffe in alte Datenstrukturen ephemere Collections teurer machen.
+status: draft
+dotnetVersion: '7+'
+sources:
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'Quellcode: Write-Barrier-Varianten für x64 (JitHelpers_FastWriteBarriers.asm)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/amd64/JitHelpers_FastWriteBarriers.asm
+  - title: 'Quellcode: Auswahl der Write Barrier (writebarriermanager.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/writebarriermanager.cpp
+  - title: 'Quellcode: Card Table und Card Marking (card_table.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/card_table.cpp
+  - title: 'Quellcode: Kartengröße und Brick-Konstanten (gcpriv.h)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gcpriv.h
+  - title: 'Quellcode: Wann der JIT eine Barrier braucht (gcinfo.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/jit/gcinfo.cpp
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './card-tables.steps';
+import scanScript from './card-tables-scan.steps';
+import arrayScript from './card-tables-array.steps';
+
+<Block n={1} title="Das Problem">
+
+Generationen funktionieren nur, wenn eine Gen0-Collection Gen2 nicht durchsuchen muss. Das ist ihr ganzer Sinn: Ein Heap mit mehreren Gigabyte alter Objekte soll nicht bei jeder der vielen kleinen Collections durchlaufen werden. Gleichzeitig darf die Gen0-Collection kein lebendes Objekt übersehen.
+
+Genau hier entsteht ein Widerspruch. Ein neues Objekt kann ausschließlich über ein altes erreichbar sein, etwa wenn ein langlebiger Cache einen frischen Eintrag bekommt:
+
+```csharp
+s_cache.Last = new Order(42);   // Gen2-Objekt zeigt auf ein Gen0-Objekt
+```
+
+Die Roots zeigen auf `s_cache`, und `s_cache` liegt in Gen2. Folgt der GC nur den Roots in die jungen Generationen, sieht er `Order 42` nie. Durchsucht er zur Sicherheit ganz Gen2, ist der Vorteil der Generationen dahin.
+
+Die Lösung muss also Buch führen: Wo im alten Teil des Heaps stehen Verweise auf junge Objekte? Und sie muss das billig tun, denn Verweise werden ständig geschrieben. Die Lektion „Generationen“ hat das Prinzip schon gezeigt. Hier geht es darum, wie die **Write Barrier** dieses Buch führt, wie die **Card Table** aufgebaut ist und was das für deinen Code kostet.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen den Rest:
+
+1. **Jedes Speichern eines Verweises in ein Heap-Objekt läuft durch die Write Barrier.** Der JIT erzeugt dafür statt eines einfachen Speicherbefehls einen Aufruf einer kleinen Hilfsroutine.
+2. **Die Barrier speichert zuerst ganz normal und prüft dann den gespeicherten Wert.** Zeigt er auf ein junges Objekt, markiert sie die **Karte**, die die Zieladresse abdeckt.
+3. **Eine Karte ist ein Eintrag in der Card Table und steht für einen kleinen, festen Adressbereich.** Sie sagt nur: „Hier steht vielleicht ein Verweis auf Junges.“ Welches Feld es war, weiß sie nicht.
+4. **Eine ephemere Collection durchsucht nur die Objekte in markierten Karten** und behandelt deren Verweise in die verurteilten Generationen wie Roots.
+5. **Die Barrier markiert nur, der GC löscht.** Findet er in einer Karte keinen Verweis auf eine jüngere Generation mehr, setzt er sie zurück.
+
+Damit verteilen sich die Kosten auf zwei Stellen: einen kleinen Aufschlag bei jedem Verweis-Schreibzugriff und das Durchsuchen markierter Karten bei jeder ephemeren Collection. Lesen kostet nichts extra, der .NET-GC braucht keine Read Barrier.
+
+<Callout kind="fehlannahme">
+  „Die Write Barrier markiert das junge Objekt.“ Nein, sie markiert die Stelle, an der der Verweis
+  **steht**, also das alte Objekt, genauer den Speicherbereich um das Feld herum. Geprüft wird der
+  gespeicherte Wert (ist er jung?), markiert wird das Ziel des Schreibzugriffs (wo liegt das Feld?).
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel schreibt viermal in Felder eines alten Objekts. Achte darauf, an welchem Punkt die Barrier jeweils aufhört, und darauf, dass das Speichern selbst immer zuerst passiert.
+
+<StepPlayer script={script} />
+
+Der Assembler-Tab zeigt die klassische Form der Barrier für x64 mit Segmenten und Workstation GC, vereinfacht aus `JIT_WriteBarrier_PreGrow64` im Quellcode der Runtime. Bemerkenswert ist die Zeile `shr rcx, 0Bh`: Die Barrier rechnet aus der Feldadresse direkt den Index eines Bytes in der Card Table aus, ohne Tabelle, ohne Verzweigung. Und sie liest das Byte, bevor sie es schreibt, damit eine oft getroffene Karte nicht bei jedem Zugriff dieselbe Cache-Zeile neu beschreibt. Die Adressen im Beispiel sind erfunden.
+
+{/* TODO(verify): Caller side shown in the asm tab (lea/mov/call) is illustrative; on Windows x64 the helper takes dst in rcx and ref in rdx, on Unix x64 different registers. */}
+
+</Block>
+
+<Block n={4} title="Wie die Card Table aufgebaut ist">
+
+### Karten, Bytes und Wörter
+
+Im GC ist eine Karte ein einzelnes **Bit**. Die Card Table ist ein Array aus 32-Bit-Wörtern, jedes Wort enthält 32 Karten. Laut `gcpriv.h` deckt eine Karte auf 64-Bit 256 Byte Heap ab, ein Wort also 8 KB. Die Barrier aus dem Durchspielen arbeitet dagegen auf **Bytes**: Sie setzt das ganze Byte auf `0xFF` und markiert damit acht Karten oder 2048 Byte auf einmal. Das ist bewusst grob, denn ein Byte zu schreiben ist billiger als ein einzelnes Bit atomar zu setzen.
+
+{/* TODO(verify): card_size = 2*GC_PAGE_SIZE/card_word_width = 256 bytes on 64-bit (128 on 32-bit), card_word_width 32, byte-wise barriers covering 2048 bytes (shr 0Bh). */}
+
+Die Card Table deckt den gesamten Adressbereich des GC-Heaps ab, nicht nur Gen2. Darum funktioniert dieselbe Tabelle auch für Verweise von Gen1 nach Gen0 und für den Large Object Heap, der logisch zu Gen2 gehört.
+
+### Card Bundles
+
+Bei einem Heap von vielen Gigabyte ist auch die Card Table groß, und eine Gen0-Collection müsste sie komplett lesen, um die wenigen markierten Karten zu finden. Deshalb gibt es eine zweite Ebene, die **Card Bundles**: Ein Bit im Bundle steht für eine Gruppe von Kartenwörtern und sagt, ob darin überhaupt etwas markiert ist. Der GC überspringt so ganze Abschnitte der Card Table. Auf Plattformen mit `FEATURE_MANUALLY_MANAGED_CARD_BUNDLES` setzt die Barrier das Bundle-Byte gleich mit, in derselben Art wie die Karte.
+
+{/* TODO(verify): card_bundle_size = 32 card words per bundle bit (256 KB of heap on 64-bit); FEATURE_MANUALLY_MANAGED_CARD_BUNDLES enabled on which platforms; on Windows historically maintained via OS write watch. */}
+
+### Was die Collection mit den Karten macht
+
+Bei einer ephemeren Collection sucht der GC markierte Karten, durchsucht die Objekte, die in diesen Bereichen liegen, und markiert deren Ziele in den verurteilten Generationen. Er zählt dabei mit, wie viele Verweise er überhaupt in jüngere Generationen findet. Findet er in einem Kartenbereich keinen, löscht er die Karten. Bleiben Verweise auf jüngere Objekte bestehen, auch nach deren Promotion, bleiben die Karten markiert.
+
+<StepPlayer script={scanScript} />
+
+Das Verhältnis aus besuchten Verweisen und nützlichen Funden nutzt der GC auch als Maß für die Effizienz des Card Marking. Ist sie schlecht, kann er beschließen, gleich eine ältere Generation mit einzusammeln, statt immer wieder dieselben nutzlosen Karten zu durchsuchen.
+
+{/* TODO(verify): generation_skip_ratio computed from n_gen/n_eph in mark_phase.cpp and its influence on condemning gen1 (GCLowSkipRatio). Card clearing in card_transition when cg_pointers_found == 0. */}
+
+</Block>
+
+<Block n={5} title="Varianten der Barrier">
+
+### Eine Barrier, viele Fassungen
+
+Es gibt nicht die eine Write Barrier. Die Runtime hält mehrere Fassungen bereit und kopiert beim Start die passende an die Stelle, die der JIT-Code aufruft. Ändern sich Grenzen oder Tabellen, wird der Code zur Laufzeit gepatcht oder gegen eine andere Fassung ausgetauscht. Welche Fassung läuft, hängt von der Heap-Organisation, dem GC-Modus und davon ab, ob gerade ein Background GC läuft. Für x64 zeigt der Quellcode unter anderem:
+
+| Fassung | Prüft | Markiert |
+| --- | --- | --- |
+| Segmente, Workstation (`PreGrow64`, `PostGrow64`) | Wert im ephemeren Bereich? | Ein Byte, also 2048 Byte Heap |
+| Segmente, Server GC (`SVR64`) | Nichts, mehrere Heaps haben keinen gemeinsamen ephemeren Bereich | Ein Byte, bei jedem Verweis |
+| Regions, byteweise (`Byte_Region64`) | Ziel in Gen0? Wert im Heap? Ist der Wert jünger als das Ziel? | Ein Byte |
+| Regions, bitweise (`Bit_Region64`) | Wie byteweise | Nur das eine Bit der Karte |
+
+{/* TODO(verify): Table of barrier variants from JitHelpers_FastWriteBarriers.asm and writebarriermanager.cpp (x64); arm64 equivalents may differ. */}
+
+### Präzise und unpräzise Barriers
+
+Die Segment-Barriers sind **unpräzise**: Sie fragen nur, ob der Wert irgendwo im ephemeren Bereich liegt, und markieren auch, wenn ein Gen1-Objekt auf ein anderes Gen1-Objekt zeigt. Die Server-Barrier für Segmente markiert sogar bei jedem Schreibzugriff. Das kostet später beim Durchsuchen, macht die Barrier selbst aber kurz.
+
+Mit Regions kennt jede Region ihre Generation, und die Runtime hat eine Tabelle von Region zu Generation. Die Region-Barriers sind dadurch **präzise**: Schreibst du in ein Gen0-Objekt, ist nach einem Vergleich Schluss, denn Gen0 wird ohnehin immer komplett eingesammelt. Sonst wird nur markiert, wenn der Wert in einer jüngeren Generation liegt als das Ziel. Die bitweise Fassung setzt zudem nur die eine Karte statt acht, mit einem atomaren `lock or`, weil mehrere Threads Bits im selben Byte setzen könnten. Laut Quellcode ist sie mit Regions heute die Voreinstellung, über die Einstellung `GCWriteBarrier` lässt sie sich ändern.
+
+{/* TODO(verify): Bitwise region barrier is the default with regions ("bitwise region write barrier is the default now" in gc.cpp region_write_barrier_settings) and since which .NET version; GCWriteBarrier config name and values. */}
+
+### Software Write Watch für Background GC
+
+Ein Background GC markiert Gen2, während dein Programm weiterläuft und Verweise ändert. Am Ende muss er wissen, welche Speicherseiten in der Zwischenzeit beschrieben wurden, um sie erneut zu prüfen. Dafür gibt es die WriteWatch-Fassungen der Barrier: Sie setzen zusätzlich vor der Kartenprüfung ein Byte in einer Write-Watch-Tabelle, ein Byte pro 4-KB-Seite. Diese Fassung ist nur nötig, solange ein Background GC läuft. Mehr dazu in „Background GC“.
+
+{/* TODO(verify): Software write watch granularity (shr 0Ch, 4 KB pages), that the WriteWatch barrier is only installed while a background GC is in progress, and on which platforms the OS write watch is used instead. */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Neue Objekte in alte Strukturen schreiben
+
+Jede ephemere Collection kostet so viel, wie markierte Karten zu durchsuchen sind. Ein Programm, das ständig frisch erzeugte Objekte in langlebige Datenstrukturen schreibt, hält viele Karten dauerhaft markiert: Caches, deren Werte laufend ersetzt werden, Ringpuffer mit den letzten N Ereignissen, Dictionaries mit Sitzungsobjekten, Listen von Abonnenten. Doppelt unglücklich ist, dass die neuen Objekte dadurch auch überleben und promotet werden.
+
+<StepPlayer script={arrayScript} />
+
+Große Verweis-Arrays verschärfen das. Ein `object[]` mit hunderttausend Elementen liegt im Large Object Heap und ist **ein** Objekt, aber seine Karten werden einzeln markiert. Wird an vielen Stellen geschrieben, durchsucht der GC bei jeder Gen0-Collection große Teile davon, Element für Element.
+
+{/* TODO(verify): For objects spanning many cards, only the marked cards' portion of the array is scanned, not the whole array. */}
+
+### Structs mit Verweisen sind keine Ausnahme
+
+Ein Struct ohne Verweisfelder ist für die Card Table unsichtbar, ein Array solcher Structs braucht nie eine Barrier. Sobald das Struct aber einen `string` oder ein anderes Objekt enthält, gilt das nicht mehr: Beim Speichern in ein Array oder ein Feld auf dem Heap braucht jedes enthaltene Verweisfeld die Barrier. Ein `KeyValuePair<int, string>` im Array verursacht also genauso Kartenmarkierungen wie ein `string` im Array, bei jedem Schreiben eines neuen Strings.
+
+{/* TODO(verify): Copying a struct with GC refs into the heap uses a per-field barrier or a byref/bulk barrier helper (CORINFO_HELP_ASSIGN_BYREF, CORINFO_HELP_BULK_WRITEBARRIER) depending on size and JIT version. */}
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Die Barrier selbst ist billig, ein paar Befehle und meist eine nicht genommene Verzweigung. Teuer wird das Muster dahinter: viele Verweise von alt nach jung. Das erkennst du an Gen0-Collections, die länger dauern, als die Zahl der Überlebenden erwarten lässt, und an vielen Promotionen aus Gen0 bei einer stabilen Datenmenge. Die GC-Ereignisse zur Markierphase zeigen, wie viel über ältere Generationen (also über Karten) markiert wurde, siehe „Mark, Plan, Relocate, Compact“.
+
+{/* TODO(verify): GCMarkWithType root kind for older generation (card marking) in ETW/EventPipe GC events. */}
+
+| Code | Effekt | Warum | Ausweg |
+| --- | --- | --- | --- |
+| `s_cache[key] = new Value(...)` bei jeder Anfrage | Viele markierte Karten, neue Werte überleben | Alt zeigt auf jung | Werte seltener ersetzen, unveränderliche Snapshots gesammelt austauschen |
+| Ringpuffer `Event[]` mit neuen Objekten | Großes Array wird ständig durchsucht | Schreibstellen wandern über alle Karten | Puffer aus Structs ohne Verweise, oder die Event-Objekte wiederverwenden |
+| `List<T>` von Referenztypen als Langzeitpuffer | Wie oben, plus Promotion | Jedes `Add` schreibt einen Verweis ins alte Array | Kurzlebig halten oder verweisfreie Daten speichern |
+| Feld in einem frisch erzeugten Objekt setzen | Fast keine Kosten | Ziel liegt in Gen0, Region-Barrier endet sofort | Nichts zu tun |
+| Struct ohne Verweise in ein Array schreiben | Keine Barrier | Keine Verweise, nichts zu merken | Gutes Muster für große Datenmengen |
+| Feld auf `null` setzen | Keine Barrier | `null` kann nicht auf Junges zeigen | Karte bleibt trotzdem markiert, bis der GC sie löscht |
+
+Die Abhilfen haben ein gemeinsames Muster: Entweder schreibst du weniger Verweise in alte Objekte (Snapshots einmal bauen und ganz ersetzen, Objekte wiederverwenden statt neu anlegen), oder du schreibst Daten ohne Verweise (Werttypen, Indizes statt Objektverweise). Unveränderliche Snapshots haben einen schönen Nebeneffekt: Der neue Snapshot wird als Ganzes aufgebaut, während er jung ist, und nur ein einziger Verweis zeigt am Ende von alt nach jung.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Der JIT entscheidet für jeden Verweis-Schreibzugriff, welche Barrier er braucht. Im Quellcode (`gcIsWriteBarrierCandidate` in `gcinfo.cpp`) gibt es drei Ergebnisse:
+
+- **Keine Barrier**, wenn `null` gespeichert wird, wenn der Wert ein Objekt außerhalb des GC-Heaps ist (zum Beispiel ein eingefrorenes String-Literal im Non-GC-Heap) oder wenn das Ziel nachweislich nicht auf dem Heap liegt, etwa eine lokale Variable oder ein Struct auf dem Stack.
+- **Ungeprüfte Barrier**, wenn das Ziel sicher im Heap liegt, typisch ein Feld eines Objekts.
+- **Geprüfte Barrier**, wenn das Ziel ein `ref` ist, das auf den Stack oder in den Heap zeigen kann. Sie prüft zuerst, ob die Zieladresse im GC-Heap liegt, und speichert sonst einfach.
+
+Mit Escape Analysis kann der JIT kleine Objekte, die eine Methode nie verlassen, auf dem Stack anlegen. Schreibzugriffe in solche Objekte brauchen dann ebenfalls keine Barrier, siehe „Escape Analysis“.
+
+<Callout kind="version">
+  Regions und damit die präzisen Region-Barriers sind seit .NET 7 auf 64-Bit Standard. Das Weglassen
+  der Barrier für Objekte außerhalb des GC-Heaps hängt am Non-GC-Heap für eingefrorene Objekte, den
+  es seit .NET 8 gibt. Die genauen Regeln des JIT ändern sich von Version zu Version, prüfe sie im
+  Assembler deiner Zielversion.
+</Callout>
+
+{/* TODO(verify): Since which version the JIT omits barriers for frozen (non-GC heap) objects (.NET 8?), which escape analysis cases exist in .NET 9/10, and whether the bitwise region barrier was default from .NET 7 or later. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Im JIT-Assembler siehst du direkt, wo Barriers stehen. Ein Feld, ein `null`, ein Struct und ein `ref`-Parameter ergeben vier verschiedene Fälle.
+
+{/* TODO(verify): BenchmarkDotNet results: allocated 24 B for new object() on x64, StoreNewObject clearly slower than StoreValue; measured times. */}
+
+{/* TODO(verify): SharpLab JIT Asm shows CORINFO_HELP_ASSIGN_REF for SetField, a plain mov for SetNull and SetCount, and CORINFO_HELP_CHECKED_ASSIGN_REF for SetRef. */}
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „JIT Asm“ (Release). Erwartet: SetField ruft CORINFO_HELP_ASSIGN_REF auf, SetRef CORINFO_HELP_CHECKED_ASSIGN_REF. SetNull und SetCount kommen mit einem einfachen mov aus."
+  code={`public class Holder
+{
+    public object? Value;
+    public int Count;
+}
+
+public static class C
+{
+    public static void SetField(Holder h, object o) => h.Value = o;
+    public static void SetNull(Holder h) => h.Value = null;
+    public static void SetCount(Holder h, int n) => h.Count = n;
+    public static void SetRef(ref object? target, object o) => target = o;
+}`}
+  benchmark={`[MemoryDiagnoser]
+public class CardBench
+{
+    private readonly object[] _refs = new object[100_000];
+    private readonly (int Id, long At)[] _values = new (int, long)[100_000];
+    private int _i;
+
+    [GlobalSetup]
+    public void Setup() { GC.Collect(); GC.Collect(); } // Arrays nach Gen2 (LOH)
+
+    [Benchmark(Baseline = true)]
+    public void StoreNewObject() => _refs[_i++ % _refs.Length] = new object();
+
+    [Benchmark]
+    public void StoreValue() => _values[_i++ % _values.Length] = (_i, 42L);
+}`}
+  expected={[
+    { method: 'StoreNewObject', allocated: '24 B' },
+    { method: 'StoreValue', allocated: '0 B' },
+  ]}
+  note="64-Bit, Release. StoreNewObject sollte deutlich langsamer sein als StoreValue, die genauen Zeiten hängen von Hardware und GC-Modus ab."
+/>
+
+Im Benchmark kommen mehrere Kosten zusammen: die Allokation selbst, die Barrier, und bei jeder Gen0-Collection das Durchsuchen der markierten Karten des großen Arrays samt Promotion der darin gehaltenen Objekte. Um nur den Effekt der Karten zu sehen, vergleiche die Gen0-Pausen beider Varianten über `GC.GetGCMemoryInfo()` oder einen Trace.
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="card-tables"
+  questions={[
+    {
+      q: 'Was markiert die Write Barrier bei s_cache.Last = order, wenn s_cache in Gen2 und order in Gen0 liegt?',
+      options: [
+        'Das Objekt order als lebend',
+        'Die Karte, die die Adresse des Felds s_cache.Last abdeckt',
+        'Die gesamte Generation 2 als zu durchsuchen',
+      ],
+      correct: 1,
+      explanation:
+        'Geprüft wird der gespeicherte Wert, markiert wird die Stelle, an der er steht. Bei der nächsten ephemeren Collection durchsucht der GC die Objekte in diesem Kartenbereich.',
+    },
+    {
+      q: 'Wann wird eine markierte Karte wieder gelöscht?',
+      options: [
+        'Wenn der Code das Feld auf null setzt',
+        'Wenn der GC beim Durchsuchen im Kartenbereich keinen Verweis auf eine jüngere Generation mehr findet',
+        'Nach jeder ephemeren Collection automatisch',
+      ],
+      correct: 1,
+      explanation:
+        'Die Barrier markiert nur. Für null wird sie nicht einmal aufgerufen. Löschen kann nur der GC, nachdem er nachgesehen hat.',
+    },
+    {
+      q: 'Welcher Schreibzugriff braucht keine Write Barrier?',
+      options: [
+        'obj.Field = new Order() mit obj in Gen2',
+        'obj.Field = null',
+        'array[i] = someString bei einem string[] in Gen2',
+      ],
+      correct: 1,
+      explanation:
+        'null kann nicht auf ein junges Objekt zeigen, der JIT speichert einfach. Die anderen beiden speichern einen echten Verweis in ein Heap-Objekt.',
+    },
+    {
+      q: 'Warum ist die Server-GC-Barrier für Segmente besonders unpräzise?',
+      options: [
+        'Weil Server GC keine Card Table hat',
+        'Weil es mit mehreren Heaps keinen gemeinsamen ephemeren Bereich gibt, also markiert sie bei jedem Verweis',
+        'Weil sie nur jeden zweiten Schreibzugriff prüft',
+      ],
+      correct: 1,
+      explanation:
+        'Jeder Heap hat seine eigenen ephemeren Generationen. Statt mehrerer Bereichsprüfungen markiert die Barrier einfach immer, das Aussortieren übernimmt der GC beim Durchsuchen.',
+    },
+    {
+      q: 'Ein Ringpuffer object[] im LOH bekommt laufend neue Objekte. Was macht das teuer?',
+      options: [
+        'Nur die Allokation der neuen Objekte',
+        'Viele markierte Karten im großen Array, die jede Gen0-Collection durchsuchen muss, und die Promotion der festgehaltenen Objekte',
+        'Der LOH wird bei jeder Gen0-Collection kompaktiert',
+      ],
+      correct: 1,
+      explanation:
+        'Die Schreibstellen wandern über das ganze Array und markieren seine Karten. Die Objekte bleiben durch das Array erreichbar und werden promotet.',
+    },
+    {
+      q: 'Was ändert sich mit Regions an der Barrier?',
+      options: [
+        'Nichts, nur die Heap-Organisation ändert sich',
+        'Sie kann Generationen von Ziel und Wert vergleichen und markiert nur bei Verweisen von alt nach jung, auf Wunsch sogar nur ein einzelnes Kartenbit',
+        'Sie entfällt, weil Regions keine Karten brauchen',
+      ],
+      correct: 1,
+      explanation:
+        'Jede Region kennt ihre Generation. Die Region-Barriers sind dadurch präzise, und die bitweise Fassung markiert nur eine Karte statt acht.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Jeder Verweis, der in ein Heap-Objekt gespeichert wird, läuft durch die **Write Barrier**: speichern, prüfen, ob der Wert jung ist, und dann die **Karte** des Ziels markieren.
+- Eine Karte deckt einen kleinen Adressbereich ab (auf 64-Bit 256 Byte), byteweise Barriers markieren acht Karten auf einmal. **Card Bundles** fassen Karten zu einer zweiten Ebene zusammen.
+- Ephemere Collections durchsuchen **nur markierte Karten** und behandeln die gefundenen Verweise wie Roots. Der GC löscht Karten, in denen nichts Junges mehr steht.
+- Es gibt **mehrere Fassungen** der Barrier: unpräzise für Segmente, präzise für Regions, mit Write Watch während eines Background GC.
+- Der JIT lässt die Barrier weg für `null`, für Objekte außerhalb des GC-Heaps und für Ziele, die sicher nicht im Heap liegen. Für unklare `ref`-Ziele nimmt er die geprüfte Fassung.
+- Teuer sind **ständige Schreibzugriffe mit neuen Objekten in alte Strukturen**, vor allem in große Verweis-Arrays. Abhilfe: Snapshots, Wiederverwendung, Werttypen ohne Verweise.
+
+</Block>

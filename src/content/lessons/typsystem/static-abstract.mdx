@@ -1,0 +1,251 @@
+---
+id: static-abstract
+title: Statische abstrakte Interface-Member
+summary: Wie Interfaces statische Member vorschreiben können, wie Generic Math darauf aufbaut und warum der JIT daraus für Werttypen Code erzeugt, der so schnell ist wie handgeschriebener.
+status: draft
+dotnetVersion: '7+'
+sources:
+  - title: 'Statische virtuelle Interfacemember (Tutorial, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/whats-new/tutorials/static-virtual-interface-members
+  - title: 'Generische Mathematik (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/generics/math
+  - title: 'Book of the Runtime: Shared Generics Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/shared-generics.md
+  - title: 'IParsable<TSelf> (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.iparsable-1
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './static-abstract.steps';
+
+<Block n={1} title="Das Problem">
+
+Versuch einmal, vor .NET 7 eine generische Summe zu schreiben: `T Sum<T>(T[] values)`. Es scheitert schon an der ersten Zeile. Woher kommt die Null, mit der du beginnst? Und wie addierst du zwei `T`? Interfaces konnten nur Instanzmethoden vorschreiben. Operatoren und Konstanten wie `Zero` sind aber statisch, sie gehören zum Typ, nicht zu einem Objekt.
+
+Die Umwege waren alle unbefriedigend. Man schrieb dieselbe Methode für `int`, `long`, `double` und `decimal` mehrfach. Man übergab Delegates für Addition und Null, mit Aufrufkosten bei jedem Schritt. Oder man nahm `dynamic` und bezahlte mit Laufzeitbindung und Boxing. Für eine Plattform, die viel numerischen Code hat, war das eine echte Lücke.
+
+Seit C# 11 und .NET 7 können Interfaces auch **statische abstrakte Member** vorschreiben. Darauf baut **Generic Math** auf. Und weil der JIT für Werttypen ohnehin eigenen Code erzeugt, ist das Ergebnis nicht nur bequem, sondern genauso schnell wie handgeschriebener Code.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+1. **Ein Interface kann statische Member verlangen,** etwa einen Operator, eine Eigenschaft wie `Zero` oder eine Methode wie `Parse`.
+2. **Ein Typ implementiert sie als statische Member.** `int` implementiert `INumber<int>` und stellt damit unter anderem `int.Zero` und den Operator `+` bereit.
+3. **Aufrufen kann man sie nur über einen Typparameter:** `T.Zero` oder `a + b` innerhalb einer generischen Methode mit passendem Constraint.
+4. **Aufgelöst wird beim Übersetzen pro Instanziierung.** Im spezialisierten Code für einen Werttyp steht fest, welcher Member gemeint ist. Nur geteilter Code für Referenztypen muss zur Laufzeit nachschlagen.
+
+<Callout kind="fehlannahme">
+  „Generischer Mathe-Code ist langsamer als handgeschriebener, weil er über Interfaces läuft.“ Für
+  Werttypen gibt es zur Laufzeit gar keinen Interface-Aufruf. Der JIT setzt den konkreten Operator
+  direkt ein.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Eine generische Summe für alle Zahlentypen. Verfolge, wann `T.Zero` und `+` aufgelöst werden: beim Übersetzen oder bei der Ausführung.
+
+<StepPlayer script={script} />
+
+Der entscheidende Schritt ist der zweite: Weil `int` ein Werttyp ist, gibt es eigenen Code für `Sum<int>`. Ab da ist alles Weitere eine Frage des Übersetzens, nicht der Laufzeit. Wie diese Spezialisierung funktioniert, erklärt die Lektion „Generics zur Laufzeit“.
+
+</Block>
+
+<Block n={4} title="Wie Generic Math aufgebaut ist">
+
+`INumber<T>` ist kein einzelnes großes Interface, sondern die Spitze einer Hierarchie aus kleinen Bausteinen. Jeder beschreibt eine Fähigkeit:
+
+| Interface | Fähigkeit |
+| --- | --- |
+| `IAdditionOperators<TSelf, TOther, TResult>` | Operator `+` |
+| `IMultiplyOperators<TSelf, TOther, TResult>` | Operator `*` |
+| `IAdditiveIdentity<TSelf, TResult>` | `AdditiveIdentity`, das neutrale Element der Addition |
+| `INumberBase<TSelf>` | `Zero`, `One`, Umwandlungen, Prüfungen wie `IsZero` |
+| `IComparisonOperators<TSelf, TOther, TResult>` | `<`, `>`, `<=`, `>=` |
+| `INumber<TSelf>` | Zusammenfassung für „gewöhnliche Zahlen“ |
+
+Daraus folgt eine gute Praxis: Verlange im Constraint nur, was du brauchst. Eine Summe braucht `IAdditionOperators` und `IAdditiveIdentity`, nicht gleich `INumber`. Dann funktioniert sie auch für eigene Typen wie Vektoren oder Geldbeträge, die keine vollständigen Zahlen sind.
+
+### Das Muster TSelf
+
+Die Interfaces haben einen auffälligen Typparameter: `INumber<TSelf> where TSelf : INumber<TSelf>`. Ein Typ nennt sich darin selbst: `int : INumber<int>`. Nur so kann das Interface Signaturen wie „ein Operator, der zwei Werte **dieses** Typs nimmt und einen Wert **dieses** Typs liefert“ ausdrücken.
+
+```csharp
+public interface IAdditionOperators<TSelf, TOther, TResult>
+    where TSelf : IAdditionOperators<TSelf, TOther, TResult>
+{
+    static abstract TResult operator +(TSelf left, TOther right);
+}
+```
+
+{/* TODO(verify): Exact declaration of IAdditionOperators in System.Runtime (also checked operator op_CheckedAddition). */}
+
+</Block>
+
+<Block n={5} title="Im IL: der constrained-Aufruf">
+
+Wie sieht `T.Zero` im IL aus? Der Compiler erzeugt einen Aufruf mit dem Präfix `constrained.`. Er sagt der Runtime: „Rufe diesen statischen Interface-Member auf, und zwar für den Typ, der hier für `T` eingesetzt ist.“
+
+```text
+constrained. !!T
+call       !0 class System.Numerics.IAdditiveIdentity`2<!!T, !!T>::get_AdditiveIdentity()
+```
+
+Für den JIT ist das eine klare Anweisung. In spezialisiertem Code für `int` ersetzt er den Aufruf durch `int`s Implementierung, und weil die winzig ist, setzt er sie direkt ein. Übrig bleibt eine Konstante oder eine einzelne Additionsinstruktion. In geteiltem Code für Referenztypen schlägt er die Implementierung im generischen Wörterbuch nach.
+
+{/* TODO(verify): IL for T.Zero and a + b in SharpLab (constrained. call to get_Zero / op_Addition). */}
+
+</Block>
+
+<Block n={6} title="Eigene Typen und statische Fabrikmethoden">
+
+Statische abstrakte Member sind nicht nur für Mathe da. Ein besonders nützliches Beispiel ist `IParsable<TSelf>`: Es verlangt eine statische Methode `Parse`. Damit kannst du endlich generisch „erzeuge ein `T` aus diesem Text“ schreiben:
+
+```csharp
+static T[] ParseAll<T>(string[] parts) where T : IParsable<T>
+    => parts.Select(p => T.Parse(p, null)).ToArray();
+
+int[] ints = ParseAll<int>(["1", "2", "3"]);
+Guid[] ids = ParseAll<Guid>([Guid.NewGuid().ToString()]);
+```
+
+Auch eigene Typen können die Interfaces implementieren. Ein Struct `Money` mit `IAdditionOperators<Money, Money, Money>` und `IAdditiveIdentity<Money, Money>` funktioniert sofort mit jeder generischen Summe, die nur diese Fähigkeiten verlangt.
+
+### static virtual: mit Standardimplementierung
+
+Neben `static abstract` gibt es `static virtual`: Das Interface liefert eine Standardimplementierung, die ein Typ überschreiben kann, aber nicht muss. Das ist nützlich, um bestehende Interfaces zu erweitern, ohne alle Implementierungen anpassen zu müssen.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Kein Aufruf über das Interface selbst
+
+`INumber<int>.Zero` funktioniert nicht. Ein statischer abstrakter Member hat im Interface keine Implementierung, die man aufrufen könnte. Er ist nur über einen Typparameter erreichbar, der für einen konkreten Typ steht.
+
+### Solche Interfaces sind keine normalen Typen
+
+Ein Interface mit statischen abstrakten Membern kannst du nicht einfach als Variablentyp oder als Typargument verwenden. `List<INumber<int>>` lehnt der Compiler ab, weil für das Interface selbst offen wäre, welche statische Implementierung gemeint ist. Diese Interfaces sind als **Constraints** gedacht, nicht als Ersatz für Basisklassen.
+
+{/* TODO(verify): Compiler error for using interfaces with static abstract members as type arguments (CS8920) and as variable types. */}
+
+### Überlauf
+
+Generischer Code verhält sich bei Überlauf wie gewöhnlicher Code: standardmäßig ohne Prüfung. Eine Summe über viele `byte`-Werte läuft also still über. Wer prüfen will, verwendet einen `checked`-Kontext, für den Generic Math eigene geprüfte Operatoren vorsieht, oder rechnet mit einem größeren Ergebnistyp.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Aufgabe | Lösung mit statischen abstrakten Membern |
+| --- | --- |
+| Algorithmus für alle Zahlentypen | `where T : INumber<T>` oder nur die nötigen Operator-Interfaces |
+| generisch aus Text erzeugen | `where T : IParsable<T>` und `T.Parse(...)` |
+| generisch formatieren in Puffer | `where T : ISpanFormattable` und `TryFormat` |
+| eigener Wertetyp mit Operatoren | passende Operator-Interfaces implementieren, schon funktioniert jeder generische Code |
+| Fabrik ohne Reflection | eigenes Interface mit `static abstract T Create(...)` |
+
+Für die meisten Anwendungsentwickler ist Generic Math vor allem in Bibliotheken spürbar: Die Basisbibliothek nutzt es intern, um numerischen Code einmal statt dutzendfach zu schreiben. Selbst lohnt es sich, sobald du Algorithmen für mehrere Zahlentypen brauchst.
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Vergleiche in SharpLab den Maschinencode von `Sum<int>` mit einer handgeschriebenen Schleife über `int`, und miss beide mit BenchmarkDotNet.
+
+{/* TODO(verify): Benchmark numbers for SumGeneric vs. SumInt (expected roughly equal, 0 B allocated). */}
+
+<VerifyCard
+  sharplab="Stelle in SharpLab die Ausgabe auf „IL“ und suche nach constrained. vor dem Aufruf von get_AdditiveIdentity bzw. op_Addition. Wechsle dann zu „JIT Asm“: Im Code für Sum<int> findest du keinen Interface-Aufruf, sondern eine Addition."
+  benchmark={`[MemoryDiagnoser]
+public class GenericMathBench
+{
+    readonly int[] _data = Enumerable.Range(0, 1000).ToArray();
+
+    [Benchmark(Baseline = true)]
+    public int SumInt()
+    {
+        int total = 0;
+        foreach (var v in _data) total += v;
+        return total;
+    }
+
+    [Benchmark] public int SumGeneric() => Sum(_data);
+
+    static T Sum<T>(T[] values) where T : INumber<T>
+    {
+        T total = T.Zero;
+        foreach (var v in values) total += v;
+        return total;
+    }
+}`}
+  expected={[
+    { method: 'SumInt', allocated: '-' },
+    { method: 'SumGeneric', allocated: '-' },
+  ]}
+  note="Beide Varianten sollten etwa gleich schnell sein und nichts allozieren."
+/>
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="static-abstract"
+  questions={[
+    {
+      q: 'Wird bei Sum<int> der Operator + über ein Interface aufgerufen?',
+      options: ['Ja, über INumber<int>', 'Nein, der JIT setzt int.op_Addition direkt ein'],
+      correct: 1,
+      explanation: 'Im eigenen Code für int steht T fest, der Operator wird beim Übersetzen aufgelöst.',
+    },
+    {
+      q: 'Wann muss ein statischer abstrakter Member zur Laufzeit nachgeschlagen werden?',
+      options: ['Bei Werttypen als T', 'Bei geteiltem Code für Referenztypen als T'],
+      correct: 1,
+      explanation: 'Geteilter Code kennt das konkrete T nicht und liest es aus dem generischen Wörterbuch.',
+    },
+    {
+      q: 'Kann man INumber<int>.Zero direkt aufrufen?',
+      options: ['Ja', 'Nein, nur über einen Typparameter wie T.Zero'],
+      correct: 1,
+      explanation: 'Das Interface selbst hat keine Implementierung. Erst der Typparameter bestimmt sie.',
+    },
+    {
+      q: 'Welcher Constraint ist für eine generische Summe am flexibelsten?',
+      options: ['INumber<T>', 'IAdditionOperators<T, T, T> und IAdditiveIdentity<T, T>'],
+      correct: 1,
+      explanation: 'Wer nur verlangt, was er braucht, lässt auch eigene Typen wie Vektoren oder Geldbeträge zu.',
+    },
+    {
+      q: 'Wofür steht das Muster INumber<TSelf> where TSelf : INumber<TSelf>?',
+      options: ['Für eine Rekursion zur Laufzeit', 'Damit das Interface Signaturen mit dem implementierenden Typ selbst ausdrücken kann'],
+      correct: 1,
+      explanation: 'So kann ein Operator zwei Werte dieses Typs nehmen und einen Wert dieses Typs liefern.',
+    },
+    {
+      q: 'Was zeigt das IL vor einem Aufruf von T.Zero?',
+      options: ['box', 'constrained.'],
+      correct: 1,
+      explanation: 'Das Präfix constrained. sagt der Runtime, für welchen Typ der statische Member aufgerufen wird.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Seit C# 11 und .NET 7 können Interfaces statische abstrakte Member wie Operatoren, `Zero` oder `Parse` vorschreiben.
+- Aufrufbar sind sie nur über einen Typparameter. Im IL steht dafür ein `constrained.`-Aufruf.
+- Für Werttypen löst der JIT die Member beim Übersetzen auf und inlined sie. Generischer Code ist dann so schnell wie handgeschriebener.
+- Geteilter Code für Referenztypen schlägt die Implementierung im generischen Wörterbuch nach.
+- Generic Math besteht aus kleinen Fähigkeits-Interfaces. Verlange nur, was du brauchst.
+- Interfaces mit statischen abstrakten Membern sind Constraints, keine Variablentypen.
+
+</Block>

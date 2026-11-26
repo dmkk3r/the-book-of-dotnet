@@ -1,0 +1,102 @@
+---
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Breadcrumbs from '@/components/layout/Breadcrumbs.astro';
+import { curriculum } from '@/lib/curriculum';
+import { withBase } from '@/lib/paths';
+---
+
+<BaseLayout title="Fortschritt" description="Lernfortschritt sichern, übertragen und zurücksetzen.">
+  <Breadcrumbs items={[{ label: 'Übersicht', href: withBase('') }, { label: 'Fortschritt' }]} />
+  <h1>Dein Fortschritt</h1>
+  <p class="lead">
+    Der Fortschritt liegt nur in diesem Browser. Mit einer Exportdatei kannst du ihn sichern oder
+    auf ein anderes Gerät übertragen.
+  </p>
+
+  <noscript>
+    <p class="nojs">Für diese Seite wird JavaScript benötigt.</p>
+  </noscript>
+
+  <div class="progress-tools" data-progress-page hidden>
+    <p class="summary" data-progress-summary>
+      0 von {curriculum.lessons.length} Lektionen erledigt.
+    </p>
+    <ul class="done-list" data-progress-list></ul>
+
+    <h2>Sichern und übertragen</h2>
+    <div class="actions">
+      <button type="button" class="btn primary" data-export>
+        Fortschritt exportieren
+      </button>
+      <label class="btn">
+        Fortschritt importieren
+        <input type="file" accept="application/json,.json" class="sr-only" data-import />
+      </label>
+    </div>
+    <p class="hint">
+      Beim Import wird zusammengeführt: Eine Lektion bleibt erledigt, wenn sie in diesem Browser
+      oder in der Datei als erledigt markiert ist.
+    </p>
+    <p class="message" role="status" data-progress-message></p>
+
+    <h2>Zurücksetzen</h2>
+    <p>Entfernt den gesamten Fortschritt aus diesem Browser.</p>
+    <button type="button" class="btn danger" data-reset>
+      Fortschritt zurücksetzen
+    </button>
+  </div>
+
+  <script>
+    import '@/scripts/progress-page';
+  </script>
+</BaseLayout>
+
+<style>
+  .summary {
+    font-size: 1.125rem;
+    font-weight: 600;
+  }
+  .done-list {
+    max-width: 80ch;
+    padding-left: 20px;
+  }
+  .done-list:empty {
+    display: none;
+  }
+  h2 {
+    margin-top: 32px;
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .actions label {
+    cursor: pointer;
+  }
+  .actions label:focus-within {
+    outline: 2px solid var(--ink);
+    outline-offset: 2px;
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 14px;
+    max-width: 80ch;
+  }
+  .message {
+    font-weight: 600;
+  }
+  .message[data-kind='error'] {
+    color: var(--bad);
+  }
+  .message[data-kind='ok'] {
+    color: var(--ok);
+  }
+  .danger {
+    color: var(--bad);
+    border-color: var(--bad);
+  }
+  .nojs {
+    color: var(--muted);
+  }
+</style>

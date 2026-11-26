@@ -1,0 +1,53 @@
+---
+// Dev-only overview of all visualization components.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { VIEWS, exampleFor } from '@/lib/viz/demos';
+import { withBase } from '@/lib/paths';
+---
+
+<BaseLayout title="Komponenten">
+  <h1>Visualisierungen</h1>
+  <p class="lead">
+    Nur im Entwicklungsmodus sichtbar. Jede Ansicht mit Beispielskript und Zustandsformat.
+  </p>
+  <ul class="views">
+    {VIEWS.map((v) => {
+      const example = exampleFor(v.view);
+      return (
+        <li>
+          <a href={withBase(`demo/${v.view}/`)}>{v.name}</a>
+          <span>{v.purpose}</span>
+          <span class="ex">
+            {example?.lesson ? `Beispiel: ${example.lesson.title}` : 'kein Beispiel'}
+          </span>
+        </li>
+      );
+    })}
+  </ul>
+</BaseLayout>
+
+<style>
+  .views {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+    gap: 12px;
+  }
+  .views li {
+    display: grid;
+    gap: 4px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 14px 18px;
+  }
+  .views a {
+    font-weight: 600;
+    font-family: var(--font-mono);
+  }
+  .views span {
+    color: var(--muted);
+    font-size: 14px;
+  }
+</style>

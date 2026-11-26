@@ -1,0 +1,376 @@
+---
+id: typladen
+title: Wie ein Typ geladen wird
+summary: Wann die Runtime aus einer TypeDef-Zeile einen lebendigen Typ macht, in welcher Reihenfolge sie Basistypen, Interfaces und generische Instanzen lädt, wann der statische Konstruktor läuft und warum Ladefehler oft eine Methode zu früh auftauchen.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Book of the Runtime: Type Loader Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-loader.md
+  - title: 'Book of the Runtime: Type System Overview'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-system.md
+  - title: 'classloadlevel.h (Ladestufen, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/classloadlevel.h
+  - title: 'ECMA-335 (CLI-Standard), Partition I, 8.9.5: Typinitialisierung und beforefieldinit'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'Managed assembly loading algorithm (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/dependency-loading/loading-managed
+  - title: 'Static Constructors (C#-Programmierhandbuch, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/static-constructors
+  - title: 'TypeInitializationException (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.typeinitializationexception
+  - title: 'TypeLoadException (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.typeloadexception
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './typladen.steps';
+import heapScript from './typladen-heap.steps';
+import cctorScript from './typladen-cctor.steps';
+import { lazyLoadCode, cctorCode } from './typladen-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine Assembly beschreibt ihre Typen als Zeilen in Tabellen: Name, Basistyp, Felder, Methoden, Signaturen. Damit kann eine Runtime aber noch nichts ausführen. Um ein Objekt anzulegen, muss sie wissen, wie groß es ist und an welchem Offset jedes Feld liegt. Um eine virtuelle Methode aufzurufen, braucht sie eine Tabelle mit Methodenzeigern. Um einen Cast zu prüfen, muss sie die Kette der Basistypen und die implementierten Interfaces kennen. All das steht nicht fertig in der Datei, sondern muss aus den Metadaten **berechnet** werden.
+
+Diese Berechnung ist teuer. Ein Feldlayout hängt vom Layout des Basistyps ab, der in einer anderen Assembly liegen kann. Die Methodentabelle übernimmt die Slots der Basisklasse. Generische Typen wie `List<Order>` stehen in keiner Datei, sie entstehen erst aus der Kombination einer Definition mit Typargumenten. Eine durchschnittliche Anwendung zieht über das Framework Zehntausende Typen heran, von denen sie nur einen kleinen Teil wirklich benutzt.
+
+{/* TODO(verify): Order of magnitude of types reachable from a typical app via the shared framework ("Zehntausende"). */}
+
+Würde die Runtime beim Start alles vorbereiten, was erreichbar ist, wäre der Start langsam und der Speicherbedarf hoch, für Typen, die nie gebraucht werden. Die Runtime geht deshalb den umgekehrten Weg: Sie lädt einen Typ **erst, wenn Code ihn wirklich braucht**, und dann genau einmal. Dieser Zielkonflikt zwischen Startzeit und Vorhersehbarkeit prägt alles in dieser Lektion: wann geladen wird, in welcher Reihenfolge, wann der statische Konstruktor läuft und wo Fehler auftauchen.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Wie aus einem Token im IL der Name eines Typs und seiner Assembly wird, beschreibt „Metadatentabellen und Tokens“. Hier geht es darum, was danach passiert. Sechs Sätze tragen das Modell:
+
+1. **Typen werden bei Bedarf geladen.** Eine Assembly zu laden heißt nur, die Datei abzubilden und ihre Metadaten lesbar zu machen. Für einen Typ entsteht erst dann eine Laufzeitstruktur, wenn Code ihn braucht.
+2. **Der häufigste Auslöser ist der JIT.** Wenn er eine Methode übersetzt, braucht er die Typen, die darin vorkommen. Weitere Auslöser sind Reflection und das Laden abhängiger Typen.
+3. **Erst die Eltern, dann das Kind.** Basistyp und Interfaces werden vor dem Typ selbst geladen, weil seine MethodTable auf ihnen aufbaut.
+4. **Das Ergebnis ist eine MethodTable mit EEClass im Loader Heap.** Ein TypeHandle zeigt darauf, und dieselbe Kombination aus Typ und Kontext hat immer dasselbe TypeHandle.
+5. **Generische Instanzen entstehen bei Bedarf.** `List<Order>` wird gebaut, wenn es zum ersten Mal gebraucht wird, und danach in einer Tabelle wiedergefunden.
+6. **Laden ist nicht Initialisieren.** Der statische Konstruktor läuft später, beim ersten auslösenden Zugriff, nach eigenen Regeln.
+
+Aus Satz 2 folgt eine Eigenschaft, die viele überrascht: Weil der JIT eine Methode vollständig übersetzt, bevor ihre erste Zeile läuft, werden die Typen einer Methode **vor** dieser ersten Zeile geladen, nicht an der Stelle, an der sie im Quelltext stehen.
+
+<Callout kind="fehlannahme">
+  „Beim Programmstart werden alle Typen der Anwendung geladen.“ Geladen wird nur, was der Code
+  tatsächlich braucht, und erst, wenn er es braucht. Eine Assembly kann vollständig geladen sein,
+  ohne dass für einen einzigen ihrer Typen schon eine MethodTable existiert.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ruft eine Methode auf, die einen Typ aus einer anderen Assembly benutzt. Achte darauf, **wann** `Shop.dll` geladen wird und wann `Order`, und dass zwischen beidem ein Unterschied besteht.
+
+<StepPlayer script={script} />
+
+Im Tab „IL“ siehst du, was der JIT beim Übersetzen von `Bestellen` vorfindet: `newobj` mit einem Verweis auf den Konstruktor von `Order` und `ldfld` mit einem Verweis auf das Feld `Id` von `Entity`. Beide Instruktionen kann er nur übersetzen, wenn er die Typen kennt: für `newobj` die MethodTable, deren Adresse in den Allokationsaufruf wandert, für `ldfld` den Offset des Felds. Genau diese Fragen lösen das Laden aus. Die konkreten Token-Werte im Beispiel sind erfunden, das Prinzip nicht.
+
+</Block>
+
+<Block n={4} title="Was beim Laden entsteht">
+
+### Die Schritte im Überblick
+
+Der Ablauf aus der Visualisierung lässt sich in vier Teile gliedern:
+
+| Schritt | Was passiert | Was dabei schiefgehen kann |
+| --- | --- | --- |
+| Verweis auflösen | TypeRef bis zur AssemblyRef verfolgen, der aktive `AssemblyLoadContext` lädt die Assembly | Assembly nicht gefunden: `FileNotFoundException` |
+| Typ finden | TypeDef per Namensraum und Name suchen, Weiterleitungen über ExportedType folgen | Typ fehlt: `TypeLoadException` |
+| Abhängigkeiten laden | Basistyp, Interfaces und Werttypen in Feldern laden | jeder Fehler der Abhängigkeit schlägt auf diesen Typ durch |
+| Strukturen bauen | Feldlayout, Methodentabelle, Interface-Map berechnen | ungültiges Layout oder fehlende Interface-Implementierung: `TypeLoadException` |
+
+Der zweite Schritt sucht per Name, nicht per Zeilennummer. Ein TypeRef in deiner Assembly kann gar keine Zeilennummer der fremden Assembly kennen, denn die fremde Assembly kann neu gebaut worden sein. Die Runtime hält dafür pro Modul eine Nachschlagetabelle von Namen auf TypeDef-Zeilen bereit.
+
+{/* TODO(verify): Name lookup per module through the "available class hash" (EEClassHashTable in classhash.h) in CoreCLR. */}
+
+Bei den Abhängigkeiten gibt es einen feinen Unterschied. Ein Feld vom Referenztyp ist für das Layout nur ein Zeiger, seine Größe steht fest, egal welcher Typ dahinter steckt. Ein Feld vom Werttyp dagegen liegt inline im Objekt, und seine Größe muss bekannt sein, bevor das Layout feststeht. Deshalb muss der Loader die Werttypen in Feldern laden, die Referenztypen in Feldern aber nicht vollständig.
+
+{/* TODO(verify): That reference-type field types are not loaded (beyond approximate level) while building the MethodTable, but value-type field types are, per BOTR type-loader.md and methodtablebuilder.cpp. */}
+
+### MethodTable, EEClass und TypeHandle
+
+Das Ergebnis des Ladens kennst du aus „MethodTable und EEClass“: Die **MethodTable** enthält die Daten, die zur Laufzeit ständig gebraucht werden, etwa Basisgröße, Basistyp, Interface-Map und die Slots der virtuellen Methoden. Die **EEClass** enthält die selteneren Daten wie Feldbeschreibungen und den Verweis zurück in die Metadaten. Beide liegen im **Loader Heap**, einem Speicherbereich, den nicht der GC verwaltet, sondern der `AssemblyLoadContext`, in den der Typ geladen wurde.
+
+Zwischen Loader und dem Rest der Runtime vermittelt das **TypeHandle**. Das Book of the Runtime nennt es die universellste Typbezeichnung der CLR: ein Zeiger, der entweder auf eine MethodTable zeigt oder, für Zeiger, ByRefs, Funktionszeiger und generische Typvariablen, auf eine kleinere Struktur namens TypeDesc. Zwei TypeHandles sind genau dann gleich, wenn sie denselben Typ bezeichnen. In verwaltetem Code siehst du es als `RuntimeTypeHandle`, etwa über `typeof(Order).TypeHandle`.
+
+Die Visualisierung zeigt, was nach dem Laden im Speicher liegt, und dass Instanzen nur noch auf das Ergebnis zeigen:
+
+<StepPlayer script={heapScript} />
+
+### Generische Instanzen
+
+`List<Order>` hat keine TypeDef-Zeile. In den Metadaten deiner Assembly steht nur eine TypeSpec-Signatur, die die Definition `List<T>` mit dem Argument `Order` kombiniert. Die Runtime baut daraus eine eigene MethodTable, sobald die Instanz gebraucht wird, und legt sie in einer Hashtabelle des zuständigen Moduls ab. Bevor sie eine neue Instanz baut, sieht sie dort nach. So gibt es nie zwei MethodTables für denselben Typ, und der Vergleich von TypeHandles bleibt ein Zeigervergleich.
+
+Alle Instanzen für Referenztypen teilen sich eine EEClass und den Code der kanonischen Form `List<__Canon>`. Instanzen für Werttypen bekommen eine eigene EEClass. Was das für Code und statische Felder bedeutet, erklärt die Lektion „Generics zur Laufzeit“.
+
+</Block>
+
+<Block n={5} title="Ladestufen und Zyklen">
+
+### Warum ein Typ nicht in einem Schritt fertig wird
+
+Die Regel „erst die Eltern“ hat ein Problem. Schau dir diese Deklaration an:
+
+```csharp
+public class Order : Entity, IComparable<Order> { /* … */ }
+```
+
+Um `Order` zu laden, braucht die Runtime das Interface `IComparable<Order>`. Um diese Instanz zu bauen, braucht sie das Typargument `Order`, das gerade erst geladen wird. Noch deutlicher wird es bei Mustern wie `class Node : Base<Node>` oder bei zwei generischen Typen, die sich gegenseitig als Typargument verwenden. Eine naive Rekursion würde sich hier im Kreis drehen oder, wenn zwei Threads gleichzeitig laden, gegenseitig blockieren.
+
+Der Loader löst das, indem er einen Typ **in Stufen** lädt. In der ersten Stufe dürfen Basistyp und Interfaces nur angenähert sein, die generischen Argumente werden durch etwas ersetzt, das den Zyklus nicht enthält. Später werden die exakten Typen eingesetzt. Ein Typ, der gerade erst die erste Stufe erreicht hat, ist schon sichtbar und kann von anderen Typen als Argument benutzt werden, aber noch nicht verwendet werden, um Code auszuführen.
+
+| Stufe | Bedeutung |
+| --- | --- |
+| `CLASS_LOAD_BEGIN` | Platzhalter: Der Typ existiert noch nicht. |
+| `CLASS_LOAD_APPROXPARENTS` | Die MethodTable existiert, Basistyp und Interfaces haben aber möglicherweise nur angenäherte generische Argumente. |
+| `CLASS_LOAD_EXACTPARENTS` | Basistyp und Interfaces sind exakt, die Hierarchie ist bis zu dieser Stufe geladen. |
+| `CLASS_DEPENDENCIES_LOADED` | Der Typ und alles, wovon er abhängt, ist geladen. Generische Constraints sind noch nicht geprüft. |
+| `CLASS_LOADED` | Abschließende Prüfung, etwa der Constraints. Erst jetzt gilt der Typ als vollständig geladen. |
+
+{/* TODO(verify): Stage names and descriptions taken from src/coreclr/vm/classloadlevel.h (main branch, checked 2026-11); confirm they match .NET 8 and pin the link to a commit. */}
+
+Die letzten beiden Stufen werden für Gruppen voneinander abhängiger Typen gemeinsam erreicht: Ein Typ gilt erst dann als vollständig geladen, wenn auch alle Typen seines Zyklus so weit sind. Für dich als Anwender bleibt das unsichtbar. Es erklärt aber, warum der Loader intern so viel mehr Aufwand treibt, als „lies die Zeile und baue die Struktur“ vermuten lässt, und warum Typladen in der Runtime unter Sperren und mit einer Tabelle laufender Ladevorgänge stattfindet.
+
+{/* TODO(verify): Concurrent loads are coordinated through a pending type load table (PendingTypeLoadTable in clsload.cpp). */}
+
+</Block>
+
+<Block n={6} title="Statische Konstruktoren">
+
+### Laden ist nicht Initialisieren
+
+Ein Typ kann einen **Typinitialisierer** haben, im IL eine Methode namens `.cctor`. In C# entsteht sie aus einem statischen Konstruktor und aus allen Initialisierern statischer Felder, die der Compiler davor einfügt. Die `.cctor` läuft nicht beim Laden der Assembly und auch nicht beim Laden des Typs. Wann sie läuft, regelt ECMA-335 in Partition I, Abschnitt 8.9.5, und zwar auf zwei Arten:
+
+| Semantik | Wann die `.cctor` läuft | Wann C# sie wählt |
+| --- | --- | --- |
+| präzise (ohne `beforefieldinit`) | unmittelbar vor dem ersten Zugriff auf ein statisches Feld, dem ersten Aufruf einer statischen Methode oder dem ersten Aufruf eines Konstruktors | die Klasse hat einen expliziten statischen Konstruktor |
+| `beforefieldinit` | spätestens beim ersten Zugriff auf ein statisches Feld, zu einem beliebigen früheren Zeitpunkt erlaubt | die Klasse hat nur Feldinitialisierer, keinen statischen Konstruktor |
+
+Bei Werttypen kommt in der präzisen Semantik noch der erste Aufruf einer Instanzmethode hinzu. Die Runtime garantiert in beiden Fällen, dass die `.cctor` genau einmal läuft, auch wenn mehrere Threads gleichzeitig zugreifen: Die anderen warten, bis die Initialisierung abgeschlossen ist.
+
+{/* TODO(verify): Exact trigger list in ECMA-335 I.8.9.5 (value types: first instance or virtual method call) and the C# rule that beforefieldinit is emitted only without an explicit static constructor. */}
+
+Warum zwei Varianten? Die präzise Semantik ist vorhersagbar, kostet aber: Jeder Zugriff, der die `.cctor` auslösen könnte, braucht im erzeugten Code eine Prüfung, ob der Typ schon initialisiert ist. Mit `beforefieldinit` darf die Runtime die Initialisierung vorziehen, etwa bevor sie eine Methode übersetzt, und kann dann die Prüfungen weglassen. Das ist der Grund, warum ein leerer statischer Konstruktor `static Config() { }` messbar langsamere Zugriffe auf statische Felder zur Folge haben kann.
+
+{/* TODO(verify): Measurable cost of an empty static constructor on static field access in .NET 8 Tier1 code (BenchmarkDotNet), and that the JIT may run beforefieldinit cctors at compile time. */}
+
+### Wenn der Typinitialisierer scheitert
+
+Wirft die `.cctor` eine Ausnahme, verpackt die Runtime sie in eine `TypeInitializationException`. Die Visualisierung zeigt, was danach passiert:
+
+<StepPlayer script={cctorScript} />
+
+Der wichtigste Punkt ist der letzte Schritt vor der Fehlannahme: Ein gescheiterter Typinitialisierer wird **nicht wiederholt**. Der Typ ist für die Lebensdauer seines Kontexts unbrauchbar, in einer normalen Anwendung also bis zum Prozessende. Wer in einem statischen Konstruktor eine Datei liest, eine Verbindung aufbaut oder eine Konfiguration prüft, verwandelt einen vorübergehenden Fehler in einen dauerhaften. Für solche Fälle ist `Lazy<T>` oder eine explizite Initialisierungsmethode die bessere Wahl, denn dort kannst du selbst entscheiden, ob ein zweiter Versuch stattfindet.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Die Ausnahme kommt eine Methode zu früh
+
+Stell dir vor, `Shop.dll` fehlt beim Kunden. Du hast vorsichtig programmiert:
+
+```csharp
+static void Bestellen()
+{
+    try
+    {
+        var o = new Order(42);
+        Console.WriteLine(o.Id);
+    }
+    catch (FileNotFoundException)
+    {
+        Console.WriteLine("Shop-Modul fehlt");
+    }
+}
+```
+
+Der `catch`-Block wird nie erreicht. Die `FileNotFoundException` entsteht nicht beim Ausführen von `new Order(42)`, sondern beim **Übersetzen** von `Bestellen`, bevor auch nur der `try`-Block betreten wird. Sie fliegt deshalb im Aufrufer heraus, also an der Stelle, an der `Bestellen()` aufgerufen wird. Das Book of the Runtime beschreibt genau diesen Effekt: Eine `TypeLoadException`, die beim Übersetzen entsteht, kann in der übersetzten Methode selbst nicht gefangen werden.
+
+{/* TODO(verify): That a missing assembly surfaces as FileNotFoundException at the call site of the method being JIT compiled (with Tier0 JIT), with message "Could not load file or assembly 'Shop, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null'". */}
+
+Es kommt noch ungemütlicher. Wenn der JIT `Bestellen` in den Aufrufer **inlined**, verschiebt sich der Ladezeitpunkt in die Übersetzung des Aufrufers, und die Ausnahme erscheint eine Ebene weiter oben. Microsoft Learn sagt deshalb ausdrücklich, dass der genaue Zeitpunkt, zu dem statische Assembly-Verweise geladen werden, nicht festgelegt ist und von Optimierungen wie Inlining abhängt. Der robuste Ausweg ist, den Code mit der riskanten Abhängigkeit in eine eigene Methode auszulagern, sie mit `[MethodImpl(MethodImplOptions.NoInlining)]` zu markieren und den `try` um ihren **Aufruf** zu legen.
+
+### Welcher Fehler was bedeutet
+
+Ladefehler haben verschiedene Typen, und jeder sagt etwas anderes:
+
+| Ausnahme | Typische Ursache |
+| --- | --- |
+| `FileNotFoundException` | Die Assembly aus der AssemblyRef wurde nicht gefunden. |
+| `FileLoadException` | Die Assembly wurde gefunden, ließ sich aber nicht laden, etwa wegen einer unpassenden Version im Kontext. |
+| `BadImageFormatException` | Die Datei ist keine gültige Assembly oder passt nicht zur Plattform. |
+| `TypeLoadException` | Der Typ fehlt in der Assembly, oder er lässt sich nicht bauen, etwa weil eine Klasse eine neue Interface-Methode nicht implementiert. |
+| `MissingMethodException`, `MissingFieldException` | Typ gefunden, aber kein Member mit diesem Namen und dieser Signatur. |
+| `TypeInitializationException` | Typ geladen, aber der Typinitialisierer ist gescheitert. Die eigentliche Ursache steht in `InnerException`. |
+
+{/* TODO(verify): FileLoadException for a version lower than requested in the same ALC; TypeLoadException message for a missing interface implementation ("Method 'X' in type 'Y' from assembly 'Z' does not have an implementation"). */}
+
+Die Reihenfolge hilft beim Lesen eines Fehlers. Eine `TypeLoadException` zur Laufzeit bedeutet fast immer, dass die Assembly zur Laufzeit eine andere ist als die, gegen die kompiliert wurde. Den Mechanismus dahinter, die Bindung per Name und Signatur, erklärt „Metadatentabellen und Tokens“.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Situation | Was passiert | Warum | Ausweg |
+| --- | --- | --- | --- |
+| Erster Aufruf einer Methode ist langsam | JIT plus Typladen für alle neuen Typen | Laden ist lazy und passiert beim Übersetzen | ReadyToRun, Aufwärmen beim Start |
+| `try` fängt `FileNotFoundException` nicht | Ausnahme beim Übersetzen der Methode | Typen werden vor der ersten Zeile geladen | riskanten Code in eigene `NoInlining`-Methode auslagern |
+| Ein statischer Wert bleibt für immer kaputt | jeder Zugriff wirft `TypeInitializationException` | gescheiterte `.cctor` wird nicht wiederholt | keine I/O in statischen Konstruktoren, `Lazy<T>` |
+| Leerer statischer Konstruktor kostet | Prüfungen vor Feldzugriffen | präzise Semantik statt `beforefieldinit` | statischen Konstruktor weglassen, wenn die Reihenfolge egal ist |
+| Viele `MakeGenericType`-Aufrufe | Speicher im Loader Heap wächst | jede neue Instanz ist eine eigene MethodTable | Typen cachen, entladbare Kontexte |
+| Zwei Threads benutzen sich gegenseitig in statischen Konstruktoren | Deadlock beim Start | jede `.cctor` läuft unter einer Sperre | Abhängigkeiten zwischen Typinitialisierern vermeiden |
+
+{/* TODO(verify): Deadlock behavior for cross-dependent cctors on two threads (ECMA-335 I.8.9.5 deadlock rules, CoreCLR may return early to break the cycle instead of deadlocking). */}
+
+Für die Diagnose gibt es Laufzeitereignisse: Der Runtime-Provider meldet Typladevorgänge, die du mit `dotnet-trace` aufzeichnen kannst. Damit siehst du, welche Typen in welcher Reihenfolge und mit welcher Dauer geladen werden, was bei der Analyse langsamer Starts hilft.
+
+{/* TODO(verify): Name of the type load events (TypeLoadStart/TypeLoadStop, keyword TypeDiagnostic) in the Microsoft-Windows-DotNETRuntime provider and the .NET version that introduced them. */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+**Tiered Compilation** ändert am Prinzip nichts, verschiebt aber die Arbeit. Auch der schnelle Tier-0-Code muss Typen auflösen, also wird beim ersten Aufruf geladen wie beschrieben. Wenn eine Methode später mit Tier 1 neu übersetzt wird, sind ihre Typen bereits geladen und oft auch initialisiert. Dann kann der JIT zum Beispiel den Wert eines `static readonly`-Felds als Konstante einsetzen, weil der Typinitialisierer schon gelaufen ist. Mehr dazu in „Tiered Compilation und OSR“.
+
+{/* TODO(verify): That Tier1 treats static readonly fields of already initialized classes as JIT-time constants (.NET Core 3.0 and later). */}
+
+**ReadyToRun** liefert vorkompilierten Code mit. Dieser Code enthält keine fertigen MethodTable-Adressen, sondern Verweise, die beim ersten Gebrauch aufgelöst werden. Die Typen werden also auch hier bei Bedarf geladen, nur ohne JIT. Der genaue Zeitpunkt kann sich deshalb vom JIT-Fall unterscheiden.
+
+{/* TODO(verify): ReadyToRun fixups are resolved lazily (per call site or per method entry), and how this shifts the point where load errors surface. */}
+
+**Native AOT** geht den entgegengesetzten Weg: Der Compiler baut alle Typstrukturen schon beim Veröffentlichen, zur Laufzeit gibt es keinen Type Loader im beschriebenen Sinn. Deshalb funktionieren dort nur Typen, die der Compiler vorhersehen konnte, ein `MakeGenericType` mit unbekannten Argumenten kann fehlschlagen. Das vertieft „Native AOT“.
+
+<Callout kind="version">
+  Die Ladestufen und die Trennung von MethodTable und EEClass sind seit Langem stabil. Geändert hat
+  sich in den letzten Versionen vor allem, wann Typinitialisierer laufen: Seit Tiered Compilation
+  kann die Initialisierung bei `beforefieldinit`-Typen später stattfinden als früher, aber nie
+  später als beim ersten Zugriff auf ein statisches Feld.
+</Callout>
+
+{/* TODO(verify): Behavior change of beforefieldinit cctor timing with tiered compilation (.NET Core 3.0) and the exact wording; check against Jon Skeet's / Andrey Akinshin's write-ups or runtime issues. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+### Assemblies werden beim Übersetzen geladen
+
+Das erste Programm meldet jede neu geladene Assembly über das Ereignis `AppDomain.AssemblyLoad`. Die Methode `UseRegex` benutzt `Regex` aus einer eigenen Assembly des Frameworks.
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung ausführen (dotnet run -c Release). Erwartet: Vor dem Aufruf meldet das Programm, dass System.Text.RegularExpressions nicht geladen ist. Die Meldung „[geladen] System.Text.RegularExpressions“ erscheint nach „2. Rufe UseRegex auf“, aber vor „3. UseRegex läuft“: Die Assembly wird beim Übersetzen von UseRegex geladen, vor ihrer ersten Zeile. Weitere Meldungen, etwa für System.Linq, sind normal."
+  code={lazyLoadCode}
+/>
+
+### Wann der Typinitialisierer läuft
+
+Das zweite Programm vergleicht eine Klasse mit explizitem statischem Konstruktor, eine ohne und eine, deren Initialisierer wirft.
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung ausführen. Erwartet: „[Praezise initialisiert]“ erscheint vor „Praezise.Hallo“, obwohl Hallo kein Feld anfasst. „[Lax initialisiert]“ erscheint erst vor „Lax.Wert“, denn Lax ist beforefieldinit. „[Kaputt.cctor läuft]“ erscheint genau einmal, „Absicht“ dagegen bei beiden Versuchen. Schau dir die Klassen danach in SharpLab im Tab IL an: Nur Lax trägt das Flag beforefieldinit."
+  code={cctorCode}
+/>
+
+{/* TODO(verify): Expected output of both samples on .NET 8 (Release), see typladen-verify.ts. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="typladen"
+  questions={[
+    {
+      q: 'Eine Anwendung referenziert Shop.dll mit 200 Typen und benutzt davon nur Order. Wie viele Typen aus Shop.dll bekommen eine MethodTable?',
+      options: [
+        'Alle 200, sobald Shop.dll geladen wird',
+        'Order und die Typen, von denen Order abhängt, etwa Basistyp und Interfaces',
+        'Keiner, MethodTables gibt es nur für Typen aus dem Framework',
+      ],
+      correct: 1,
+      explanation:
+        'Typen werden einzeln und bei Bedarf geladen. Das Laden der Assembly macht nur die Metadaten lesbar. Order zieht seinen Basistyp und seine Interfaces mit, weil seine MethodTable auf ihnen aufbaut.',
+    },
+    {
+      q: 'Wann wird ein Typ, der nur in Methode M vorkommt, normalerweise geladen?',
+      options: [
+        'Wenn die Zeile, in der er steht, zum ersten Mal ausgeführt wird',
+        'Wenn der JIT M übersetzt, also vor der ersten Zeile von M',
+        'Beim Start der Anwendung',
+      ],
+      correct: 1,
+      explanation:
+        'Der JIT braucht die Typen, um Code zu erzeugen, und übersetzt die ganze Methode vor ihrer Ausführung. Durch Inlining kann sich der Zeitpunkt sogar in den Aufrufer verschieben.',
+    },
+    {
+      q: 'Warum fängt ein try/catch in Bestellen() die FileNotFoundException für eine fehlende Shop.dll nicht?',
+      options: [
+        'Weil FileNotFoundException nicht gefangen werden kann',
+        'Weil die Ausnahme beim Übersetzen von Bestellen entsteht und im Aufrufer auftaucht',
+        'Weil die Runtime die Ausnahme verschluckt',
+      ],
+      correct: 1,
+      explanation:
+        'Die Assembly wird geladen, während der JIT Bestellen übersetzt. Zu diesem Zeitpunkt ist der try-Block noch nicht betreten. Abhilfe: die Abhängigkeit in eine eigene, nicht inlinebare Methode auslagern und deren Aufruf schützen.',
+    },
+    {
+      q: 'Eine Klasse hat einen statischen Konstruktor. Ihre statische Methode Hallo() greift auf kein Feld zu. Läuft der statische Konstruktor beim ersten Aufruf von Hallo()?',
+      options: [
+        'Ja, ohne beforefieldinit löst auch der erste Aufruf einer statischen Methode ihn aus',
+        'Nein, nur Feldzugriffe lösen ihn aus',
+        'Nein, er lief schon beim Laden der Assembly',
+      ],
+      correct: 0,
+      explanation:
+        'Mit explizitem statischem Konstruktor setzt C# kein beforefieldinit, und es gilt die präzise Semantik aus ECMA-335: erster Feldzugriff, erster Aufruf einer statischen Methode oder eines Konstruktors.',
+    },
+    {
+      q: 'Der statische Konstruktor eines Typs wirft beim ersten Zugriff. Was passiert beim zweiten Zugriff?',
+      options: [
+        'Der Konstruktor wird erneut ausgeführt',
+        'Es wird wieder eine TypeInitializationException geworfen, ohne neuen Versuch',
+        'Der Zugriff funktioniert, die Felder haben ihre Standardwerte',
+      ],
+      correct: 1,
+      explanation:
+        'Ein gescheiterter Typinitialisierer wird nicht wiederholt. Der Typ bleibt für die Lebensdauer seines Kontexts unbrauchbar.',
+    },
+    {
+      q: 'Wozu gibt es Ladestufen wie CLASS_LOAD_APPROXPARENTS?',
+      options: [
+        'Um zyklische Abhängigkeiten wie class Order : IComparable<Order> ohne endlose Rekursion zu laden',
+        'Um Typen schneller zu laden, indem Schritte übersprungen werden',
+        'Damit der GC Typen in Stufen einsammeln kann',
+      ],
+      correct: 0,
+      explanation:
+        'Ein Typ kann in seinem Basistyp oder seinen Interfaces als Typargument vorkommen. Der Loader baut ihn deshalb zuerst mit angenäherten Eltern und setzt die exakten Typen später ein.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Typen werden **bei Bedarf** geladen, meist wenn der JIT eine Methode übersetzt, die sie benutzt. Eine geladene Assembly heißt noch nicht, dass ihre Typen geladen sind.
+- Der Ablauf: TypeRef auflösen, Assembly über den aktiven `AssemblyLoadContext` laden, TypeDef per Name finden, **Basistyp und Interfaces zuerst** laden, dann MethodTable und EEClass im Loader Heap bauen.
+- Das **TypeHandle** bezeichnet einen geladenen Typ eindeutig. Generische Instanzen wie `List<Order>` entstehen bei Bedarf und werden in einer Tabelle wiedergefunden.
+- **Ladestufen** von `CLASS_LOAD_BEGIN` bis `CLASS_LOADED` erlauben zyklische Abhängigkeiten ohne endlose Rekursion.
+- **Laden ist nicht Initialisieren.** Die `.cctor` läuft beim ersten auslösenden Zugriff: präzise mit explizitem statischem Konstruktor, mit `beforefieldinit` dagegen zu einem beliebigen Zeitpunkt bis spätestens zum ersten Feldzugriff.
+- Ein gescheiterter Typinitialisierer wird **nie wiederholt**, jeder weitere Zugriff wirft `TypeInitializationException`.
+- Ladefehler entstehen **beim Übersetzen** der Methode, die den Typ benutzt, und tauchen deshalb im Aufrufer auf, nicht im `try` der Methode selbst.
+
+</Block>

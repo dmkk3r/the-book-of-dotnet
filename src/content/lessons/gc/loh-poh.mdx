@@ -1,0 +1,410 @@
+---
+id: loh-poh
+title: LOH, POH und Non-GC-Heap
+summary: Warum große Objekte einen eigenen Heap bekommen, weshalb der LOH fragmentiert, wofür der Pinned Object Heap da ist und welche Objekte der GC seit .NET 8 gar nicht mehr anfasst.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Der Large Object Heap auf Windows-Systemen (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/large-object-heap
+  - title: 'Grundlagen der Garbage Collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/fundamentals
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'GCSettings.LargeObjectHeapCompactionMode (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.gcsettings.largeobjectheapcompactionmode
+  - title: 'GC.AllocateArray (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.allocatearray
+  - title: 'Laufzeitkonfigurationsoptionen für die Garbage Collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/runtime-config/garbage-collector
+  - title: 'Stephen Toub: Performance Improvements in .NET 8'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+  - title: 'Quellcode des GC in dotnet/runtime (gc.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gc.cpp
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './loh-poh.steps';
+import fragmentationScript from './loh-poh-fragmentation.steps';
+import pohScript from './loh-poh-poh.steps';
+
+<Block n={1} title="Das Problem">
+
+Der GC hält die jungen Generationen sauber, indem er Überlebende zusammenschiebt. Das Kompaktieren ist der Grund, warum Allokation in .NET so billig ist: Hinter den Überlebenden entsteht ein zusammenhängender freier Bereich, und eine neue Allokation schiebt nur einen Zeiger weiter. Wie das im Einzelnen abläuft, zeigt die Lektion „Generationen“.
+
+Kompaktieren heißt aber Kopieren. Für ein Objekt mit 24 Byte ist das nichts. Für ein Array mit einem Megabyte ist es eine spürbare Speicheroperation, und wenn dieses Array mehrere Collections überlebt, wird es jedes Mal erneut kopiert, erst innerhalb von Gen0, dann nach Gen1, dann nach Gen2. Große Objekte sind außerdem oft langlebig: Puffer, Caches, Lookup-Tabellen. Sie durch die jungen Generationen zu schleusen, kostet viel und bringt wenig.
+
+Der Zielkonflikt: Kompaktieren hält den Heap dicht und die Allokation billig, wird aber mit der Objektgröße teuer. Die Runtime löst das, indem sie große Objekte von vornherein getrennt behandelt. Sie bekommen einen eigenen Bereich, den **Large Object Heap** (LOH), der nach anderen Regeln arbeitet.
+
+Aus derselben Überlegung sind später zwei weitere Sonderbereiche entstanden. Der **Pinned Object Heap** (POH) nimmt Objekte auf, die sich nie bewegen dürfen. Und der **Non-GC-Heap** enthält Objekte, die der GC überhaupt nicht mehr verwalten muss. Diese Lektion behandelt alle drei.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Für den LOH reichen fünf Sätze:
+
+1. **Ab 85.000 Byte ist ein Objekt groß.** Objekte dieser Größe oder darüber kommen nicht nach Gen0, sondern direkt in den LOH. Gezählt wird die Größe des ganzen Objekts, also inklusive Header.
+2. **Der LOH wird nur zusammen mit Gen2 eingesammelt.** Es gibt keine eigenen LOH-Collections. `GC.GetGeneration` liefert für ein LOH-Objekt deshalb 2.
+3. **Der LOH wird freigegeben, nicht kompaktiert.** Lebende Objekte bleiben, wo sie sind. Der Platz toter Objekte kommt in eine Freiliste.
+4. **Darum kann der LOH fragmentieren.** Neue große Objekte passen nicht immer in die Lücken, die tote hinterlassen haben.
+5. **Kompaktieren lässt sich einmalig anfordern.** Mit `GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce` kompaktiert die nächste blockierende volle Collection auch den LOH.
+
+Dazu kommen zwei jüngere Bereiche. Der POH (seit .NET 5) ist für Objekte gedacht, die dauerhaft fixiert sein sollen, er wird ebenfalls mit Gen2 eingesammelt und nie kompaktiert. Der Non-GC-Heap (seit .NET 8) enthält Objekte, die die Runtime selbst anlegt und die nie sterben, etwa String-Literale. Der GC durchsucht und verschiebt sie nicht.
+
+{/* TODO(verify): 85,000 byte threshold measured on the full object size including header (Microsoft Learn LOH page), POH introduced in .NET 5, Non-GC heap for string literals and RuntimeType objects introduced in .NET 8. */}
+
+<Callout kind="fehlannahme">
+  „Der LOH ist eine vierte Generation mit eigenen Collections.“ Nein. Physisch ist er ein eigener
+  Bereich, logisch gehört er zu Gen2. Ein großes Objekt kann nur bei einer vollen Collection sterben,
+  egal wie kurz es gebraucht wurde. Gerade das macht kurzlebige große Arrays so teuer.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel legt ein kleines und ein großes Array an und wirft das große sofort weg. Achte darauf, in welchen Schritten der LOH überhaupt angeschaut wird und wann der Speicher des großen Arrays wirklich frei wird.
+
+<StepPlayer script={script} />
+
+Die entscheidenden Schritte sind die beiden ephemeren Collections. Das kleine Array wandert brav durch die Generationen, das große dagegen liegt tot im LOH und wird schlicht ignoriert. Erst die volle Collection gibt seinen Platz frei, und zwar ohne die übrigen LOH-Objekte zu verschieben. In einem echten Programm vergeht bis zur nächsten Gen2-Collection oft viel Zeit, in der der Speicher gebunden bleibt.
+
+</Block>
+
+<Block n={4} title="Freigeben statt kompaktieren">
+
+### Freilisten und ihre Grenzen
+
+Weil der LOH nicht kompaktiert wird, kann der Allokator dort nicht einfach einen Zeiger weiterschieben. Er führt stattdessen eine **Freiliste**: Nach einer Gen2-Collection werden die Lücken, die tote Objekte hinterlassen haben, in diese Liste eingetragen. Eine neue große Allokation sucht zuerst dort nach einem passenden Platz und hängt erst am Ende an, wenn keine Lücke groß genug ist. Nebeneinanderliegende Lücken werden dabei zusammengefasst.
+
+{/* TODO(verify): Free list fit policy for UOH allocations (first fit vs. bucketed free lists, merging adjacent free objects) in gc.cpp, and how regions change where new LOH space comes from. */}
+
+Das funktioniert gut, solange große Objekte ähnlich groß sind. Haben sie sehr unterschiedliche Größen, entstehen Lücken, die rechnerisch genug freien Platz ergeben, aber für kein neues Objekt reichen. Der LOH wächst dann, obwohl er zu einem guten Teil leer ist. Dieses Missverhältnis heißt **Fragmentierung**.
+
+<StepPlayer script={fragmentationScript} />
+
+### Einmalig kompaktieren
+
+Seit .NET Framework 4.5.1 kannst du eine Kompaktierung des LOH ausdrücklich anfordern:
+
+```csharp
+GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+GC.Collect();
+```
+
+Die Einstellung wirkt bei der nächsten blockierenden Gen2-Collection, egal ob du sie selbst auslöst oder der GC sie von sich aus startet. Danach setzt die Runtime den Modus automatisch auf `Default` zurück. Eine Background-Collection kompaktiert nie, auch nicht den LOH.
+
+{/* TODO(verify): CompactOnce applies to the next blocking gen2 GC (induced or not) and resets to Default afterwards; background GCs never compact (Microsoft Learn API remarks). */}
+
+Das ist ein Werkzeug für Ausnahmen, etwa nach einer Ladephase, die viele große Objekte unterschiedlicher Größe hinterlassen hat. Als Dauerlösung taugt es nicht, denn jede LOH-Kompaktierung kopiert alle überlebenden großen Objekte, und das ist genau die Arbeit, die der LOH vermeiden soll. Unabhängig davon kann der GC sich in bestimmten Situationen selbst für eine LOH-Kompaktierung entscheiden, etwa wenn der Speicher unter einem festen Limit knapp wird.
+
+{/* TODO(verify): Conditions under which the GC decides to compact the LOH on its own (heap hard limit, high memory load, provisional mode) in gc.cpp. */}
+
+</Block>
+
+<Block n={5} title="Wann ein Objekt groß ist">
+
+### Die Schwelle und wie Arrays sie erreichen
+
+Die Grenze von 85.000 Byte gilt für die Größe des gesamten Objekts. Bei einem Array auf 64-Bit gehören dazu neben den Elementen der Object Header, der MethodTable-Zeiger und das Längenfeld, zusammen 24 Byte. Ein `byte[85_000]` ist also schon gut über der Grenze, und auch ein `byte[84_990]` landet im LOH. Bei anderen Elementtypen wird die Schwelle entsprechend früher erreicht:
+
+| Typ                     | Ungefähre Elementzahl ab der Schwelle (64-Bit) | Warum                                 |
+| ----------------------- | ---------------------------------------------- | ------------------------------------- |
+| `byte[]`                | etwa 84.980                                    | 1 Byte pro Element plus 24 Byte       |
+| `char[]`, `string`      | etwa 42.490                                    | 2 Byte pro Zeichen                    |
+| `int[]`                 | etwa 21.245                                    | 4 Byte pro Element                    |
+| `long[]`, `double[]`    | etwa 10.620                                    | 8 Byte pro Element                    |
+| `object[]`, `string[]`  | etwa 10.620                                    | 8 Byte pro Verweis auf 64-Bit         |
+
+{/* TODO(verify): Array header size 24 B on x64, string header (MethodTable, length, terminating null char), and the exact element counts at which each array type crosses 85,000 bytes. */}
+
+Das zeigt eine leicht übersehene Folge: Ein `object[]` mit gut zehntausend Einträgen liegt im LOH, obwohl es sich nur um ein Array von Verweisen handelt. Die Objekte, auf die es zeigt, liegen weiterhin in den normalen Generationen. Ein großes Array von Verweisen wird bei jeder ephemeren Collection außerdem über die Card Table berührt, sobald es auf junge Objekte zeigt.
+
+Warum ausgerechnet 85.000? Microsoft Learn begründet die Zahl mit Performance-Messungen, eine tiefere Herleitung gibt es nicht. Auf 32-Bit-Systemen gab es zusätzlich eine Sonderregel, nach der `double[]` schon ab 1.000 Elementen in den LOH kamen, damit sie auf 8 Byte ausgerichtet liegen. Auf 64-Bit spielt das keine Rolle.
+
+{/* TODO(verify): Microsoft Learn statement that 85,000 was determined by performance tuning, and the 32-bit double[] rule (1000 elements) still documented. */}
+
+### Die Schwelle verschieben
+
+Die Grenze lässt sich über die GC-Konfiguration anheben, mit `System.GC.LOHThreshold` in der `runtimeconfig.json` oder der Umgebungsvariable `DOTNET_GCLOHThreshold`. Sinnvoll ist das selten: Ein höherer Wert schickt mehr große Objekte durch die kopierenden jungen Generationen, also genau das, was der LOH verhindern soll. Hilfreich kann es sein, wenn ein Programm viele kurzlebige Arrays knapp über der Standardschwelle erzeugt.
+
+{/* TODO(verify): Config names System.GC.LOHThreshold and DOTNET_GCLOHThreshold, available since .NET Core 3.0, value in bytes (hex for env var), and that values below 85,000 are ignored. */}
+
+### Was eine LOH-Allokation kostet
+
+Eine große Allokation ist teurer als eine kleine, und zwar nicht wegen der Verwaltung, sondern wegen des Speichers selbst. Die Runtime garantiert, dass ein neues Array mit Nullen gefüllt ist. Bei einem Megabyte heißt das, ein Megabyte Speicher zu schreiben, bevor dein Code die erste Zeile damit arbeitet. Microsoft Learn nennt das Löschen des Speichers als dominierenden Kostenfaktor einer LOH-Allokation.
+
+Dazu kommt der Einfluss auf die Collections. Der LOH hat ein eigenes Allokationsbudget. Ist es erschöpft, löst das eine Gen2-Collection aus. Ein Programm, das viele große Arrays anlegt, erzeugt also volle Collections, auch wenn es kaum kleine Objekte alloziert und Gen0 sich langweilt.
+
+{/* TODO(verify): LOH budget exhaustion triggers a gen2 GC (Microsoft Learn lists "allocation exceeds the LOH threshold" as gen2 trigger), and that UOH allocations take a separate allocation lock. */}
+
+Wenn du einen Puffer ohnehin sofort vollständig überschreibst, kannst du das Nullen mit `GC.AllocateUninitializedArray<T>(length)` überspringen. Die Methode gibt bei kleinen Längen trotzdem genullten Speicher zurück und eignet sich nur für Typen ohne Verweise, weil der GC in einem Array mit Verweisen keine zufälligen Bitmuster finden darf.
+
+{/* TODO(verify): AllocateUninitializedArray zeroes anyway below a size threshold (2048 bytes?) and for types containing references. */}
+
+</Block>
+
+<Block n={6} title="Pinned Object Heap und Non-GC-Heap">
+
+### Der Pinned Object Heap
+
+Manche Objekte dürfen sich nicht bewegen, weil nativer Code ihre Adresse kennt, zum Beispiel ein Puffer, in den das Betriebssystem bei asynchroner I/O schreibt. Liegt so ein Puffer in Gen0 und ist dauerhaft fixiert, muss der GC bei jeder Collection um ihn herum planen. Was das für die Kompaktierung bedeutet, ist Thema von „Pinning und Fragmentierung“.
+
+Seit .NET 5 gibt es dafür einen eigenen Bereich, den **Pinned Object Heap**. Du allozierst dort ausdrücklich:
+
+```csharp
+byte[] a = GC.AllocateArray<byte>(4096, pinned: true);
+byte[] b = GC.AllocateUninitializedArray<byte>(4096, pinned: true);
+```
+
+Ohne `pinned: true` verhalten sich beide Methoden wie eine normale Allokation. Mit `pinned: true` landet das Array auf dem POH, unabhängig von seiner Größe. Dort wird nie kompaktiert, also bewegt sich kein Objekt jemals. Ein Pinned-Handle ist nicht nötig, die Adresse bleibt stabil, solange das Array lebt. Wie der LOH wird der POH nur mit Gen2 eingesammelt und über Freilisten verwaltet.
+
+Der Gewinn liegt woanders als beim Objekt selbst: Weil fixierte Objekte nicht mehr in Gen0 liegen, kann der GC die jungen Generationen wieder ungestört kompaktieren. Die Fixierung ist eine Eigenschaft des Orts, nicht mehr eine Markierung am Objekt.
+
+<StepPlayer script={pohScript} />
+
+Eine Einschränkung gibt es: Mit `pinned: true` sind nur Elementtypen ohne Objektverweise erlaubt, also etwa `byte`, `int` oder Structs aus solchen Feldern. Andernfalls wirft die Methode eine `ArgumentException`. Der Grund ist der Zweck: Der POH ist für Puffer gedacht, die an nativen Code gehen, und nativer Code kann mit Verweisen auf verwaltete Objekte ohnehin nichts anfangen.
+
+{/* TODO(verify): Exact restriction for pinned: true (T must not be a reference type or contain references, ArgumentException) and whether later .NET versions relaxed it. */}
+
+### Der Non-GC-Heap
+
+Einige Objekte leben garantiert so lange wie der Prozess: String-Literale aus deinem Code und die `RuntimeType`-Objekte hinter `typeof(T)`. Früher lagen auch sie im normalen Heap. Der GC musste sie bei vollen Collections mit markieren, und weil sie sich bewegen konnten, musste der JIT ihre Adresse zur Laufzeit über eine Indirektion laden, etwa über einen Handle.
+
+Seit .NET 8 legt die Runtime solche Objekte in einem **Non-GC-Heap** ab, auch „Frozen Segments“ genannt. Der GC durchsucht diesen Speicher nicht, sammelt ihn nicht ein und verschiebt nichts darin. Für den JIT ist das ein Geschenk: Die Adresse eines String-Literals steht schon beim Kompilieren fest, er kann sie als Konstante direkt in den Maschinencode schreiben und spart einen Speicherzugriff.
+
+{/* TODO(verify): Which objects .NET 8 places on the NonGC heap (string literals, RuntimeType objects, possibly boxed static fields and empty arrays), and that the JIT embeds their addresses as constants. */}
+
+Für dich als Entwickler ist der Non-GC-Heap unsichtbar, du kannst dort nichts selbst allozieren. Bemerkbar macht er sich in Messungen: `GC.GetGeneration` liefert für ein solches Objekt keinen der Werte 0 bis 2, und in JIT-Assembler aus SharpLab siehst du beim Laden eines Literals eine feste Adresse statt eines indirekten Zugriffs.
+
+{/* TODO(verify): GC.GetGeneration returns int.MaxValue for frozen objects on .NET 8+. */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Kurzlebige große Arrays
+
+Das häufigste Problem ist das aus dem Durchspielen, nur tausendfach: Ein Webdienst liest jede Anfrage in einen frischen `byte[]` mit 128 KB, verarbeitet ihn und wirft ihn weg. Jedes dieser Arrays landet im LOH, kostet beim Anlegen das Nullen von 128 KB und bleibt bis zur nächsten vollen Collection liegen. Gleichzeitig verbraucht jede Allokation LOH-Budget, sodass volle Collections häufiger werden. Aus „große Objekte sind teuer zu kopieren“ wird so „große kurzlebige Objekte sind teuer, Punkt“.
+
+### Unerwartete LOH-Allokationen
+
+Oft legt niemand bewusst ein großes Array an. Die üblichen Verdächtigen:
+
+- **`List<T>` wächst.** Wird die Kapazität überschritten, alloziert die Liste ein neues internes Array doppelter Größe und kopiert. Eine `List<object>` mit einigen zehntausend Einträgen hat ein internes Array im LOH, und bei jedem Wachstum bleibt das alte Array als Müll im LOH zurück.
+- **Große Strings.** Ein String mit gut 42.000 Zeichen liegt im LOH, etwa ein serialisiertes JSON-Dokument, ein `File.ReadAllText` oder das Ergebnis von `StringBuilder.ToString()` für einen langen Text.
+- **`MemoryStream`.** Er wächst intern ebenfalls durch Verdoppeln, und `ToArray()` legt zusätzlich eine vollständige Kopie an.
+- **Dictionaries und HashSets.** Ihre internen Arrays für Buckets und Einträge erreichen bei vielen Elementen ebenfalls die Schwelle.
+
+{/* TODO(verify): List<T> growth factor 2, MemoryStream growth strategy, and that StringBuilder uses chunks below the LOH threshold so only ToString() produces the large string. */}
+
+Gegenmittel sind eine passende Anfangskapazität (`new List<T>(capacity)`), Streaming statt Einlesen am Stück, `ArrayPool<T>` für Puffer und bei Strings, wo möglich, `ReadOnlySpan<char>` über einem gepoolten Puffer.
+
+### Fragmentierung durch gemischte Größen
+
+Die Visualisierung oben zeigt den Mechanismus: Wechseln sich große Objekte unterschiedlicher Lebensdauer und Größe ab, bleiben Lücken, die für neue Objekte nicht passen. Typisch ist das bei Caches mit großen Einträgen, die zu unterschiedlichen Zeiten ablaufen. Erkennbar ist es daran, dass die LOH-Größe nach Gen2-Collections hoch bleibt, obwohl wenig lebt. `CompactOnce` behebt den Zustand einmalig, die Ursache behebt nur ein anderes Allokationsmuster, etwa Puffer fester Größe aus einem Pool.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+### Muster und ihre Wirkung
+
+| Code                                        | Effekt                                        | Warum                                         | Ausweg                                                  |
+| ------------------------------------------- | --------------------------------------------- | --------------------------------------------- | ------------------------------------------------------- |
+| `new byte[128 * 1024]` pro Anfrage          | Viele volle Collections, hoher Speicher       | Jedes Array liegt bis zur Gen2-Collection     | `ArrayPool<byte>.Shared.Rent`                           |
+| `new List<T>()` und viele `Add`             | Mehrere große Zwischenarrays im LOH           | Wachstum durch Verdoppeln                     | Kapazität vorab setzen                                  |
+| `File.ReadAllText` auf großen Dateien       | Großer String und große Puffer im LOH         | Ganze Datei am Stück im Speicher              | Streaming, `System.IO.Pipelines`                        |
+| Cache mit großen Einträgen variabler Größe  | Wachsender LOH trotz wenig lebender Daten     | Fragmentierung, keine Kompaktierung           | Feste Blockgrößen, gelegentlich `CompactOnce`           |
+| Dauerhaft fixierter Puffer in Gen0          | Fragmentierte junge Generationen              | GC muss um das fixierte Objekt herum planen   | `GC.AllocateArray<byte>(n, pinned: true)`               |
+
+`ArrayPool<T>` ist das wichtigste Werkzeug gegen kurzlebige große Arrays. Ein Pool-Puffer wird einmal alloziert, liegt dann dauerhaft im LOH oder in Gen2 und wird immer wieder verwendet. Das passt perfekt zum Modell: Der LOH ist für langlebige große Objekte gebaut, nicht für Wegwerfpuffer. Beachte, dass `ArrayPool<T>.Shared` Arrays nur bis zu einer Obergrenze vorhält, größere Anforderungen werden jedes Mal neu alloziert. Mehr dazu in „ArrayPool und Pooling“.
+
+{/* TODO(verify): Maximum array length pooled by ArrayPool<T>.Shared in .NET 8 and later (previously 1 MiB per bucket, larger in newer versions). */}
+
+### Messen
+
+`dotnet-counters monitor --process-id <pid> --counters System.Runtime` zeigt neben den Generationen auch die Größe von LOH und POH und den Anteil fragmentierten Speichers. Steigt die LOH-Größe stetig, während die Zahl der Gen2-Collections hoch ist, sind kurzlebige große Allokationen der erste Verdacht. Im Code liefert `GC.GetGCMemoryInfo()` dieselben Daten pro Generation, LOH und POH eingeschlossen, darunter die fragmentierten Bytes vor und nach der letzten Collection.
+
+{/* TODO(verify): Counter names for LOH size, POH size and fragmentation in .NET 8 (EventCounters) and .NET 9+ (System.Runtime meter, gc.heap.generation = loh/poh), and GCMemoryInfo.GenerationInfo indices 3 (LOH) and 4 (POH). */}
+
+Wer Allokationen bis zur Aufrufstelle zurückverfolgen will, sammelt mit `dotnet-trace` GC-Ereignisse. Das Ereignis für Allokationen meldet dabei, ob ein Objekt im SOH, im LOH oder im POH angelegt wurde. Die Werkzeuge stellt „dotnet-counters, -trace, -dump, -gcdump“ vor.
+
+{/* TODO(verify): GCAllocationTick event includes the heap kind (AllocationKind: small, large, pinned). */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Mit den Regions seit .NET 7 bestehen LOH und POH wie die Generationen aus Regions, wobei große Objekte eigene, größere Regions bekommen. Ein einzelnes sehr großes Objekt kann eine Region für sich allein belegen. Wird es frei, kann die ganze Region an den Pool zurückgehen, statt als Lücke im LOH liegen zu bleiben. Die Details stehen in „Segments und Regions“.
+
+{/* TODO(verify): Regions: LOH/POH use "large regions" (default 32 MB on 64-bit), objects larger than a large region get a dedicated region that can be decommitted when freed. */}
+
+Im Quellcode des GC tauchen LOH und POH gemeinsam unter dem Begriff **UOH** auf, „user old heap“. Beide teilen sich Allokationspfad, Freilisten und die Regel, nur mit Gen2 eingesammelt zu werden. Der Non-GC-Heap ist dagegen kein GC-Bereich im eigentlichen Sinn: Die Runtime meldet dem GC nur, dass dieser Speicher existiert, damit er Verweise dorthin als gültig erkennt, ohne sie zu verfolgen.
+
+{/* TODO(verify): UOH naming in gc.cpp ("user old heap", uoh_start_generation, loh_generation = 3, poh_generation = 4) and frozen segment registration (RegisterFrozenSegment). */}
+
+Der JIT profitiert vom Non-GC-Heap direkt: Weil String-Literale und `typeof(T)`-Objekte nicht mehr wandern, kann er ihre Adressen als Konstanten in den Code schreiben. Das spart einen Speicherzugriff pro Verwendung und macht weitere Optimierungen möglich, etwa das Falten von Vergleichen mit `typeof`.
+
+{/* TODO(verify): Which JIT optimizations depend on frozen objects beyond embedding addresses (for example typeof comparisons); some were possible before .NET 8. */}
+
+<Callout kind="version">
+  Den LOH gibt es seit jeher, `CompactOnce` seit .NET Framework 4.5.1, die konfigurierbare Schwelle
+  seit .NET Core 3.0, den POH seit .NET 5, Regions seit .NET 7 und den Non-GC-Heap für Literale und
+  Typobjekte seit .NET 8.
+</Callout>
+
+{/* TODO(verify): Version numbers in the callout (CompactOnce 4.5.1, GCLOHThreshold .NET Core 3.0, POH .NET 5, regions .NET 7, NonGC heap .NET 8). */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Das erste Experiment zeigt, wo verschiedene Objekte landen. Führe es als Konsolenanwendung im Release-Modus aus.
+
+{/* TODO(verify): Expected output on .NET 8 x64: 0, 2, 2, 2, 2 and a large value (int.MaxValue) for the literal. */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung mit dotnet run -c Release ausführen. Erwartet: Das Array knapp unter der Schwelle meldet Generation 0, alle Arrays über der Schwelle, der lange String und das POH-Array melden 2. Das String-Literal meldet ab .NET 8 keinen normalen Generationswert, weil es im Non-GC-Heap liegt."
+  code={`static void Show(string label, object o) =>
+    Console.WriteLine($"{label}: Generation {GC.GetGeneration(o)}");
+
+Show("byte[84_900]", new byte[84_900]);   // 0, knapp unter 85.000 Byte
+Show("byte[85_000]", new byte[85_000]);   // 2, LOH
+Show("int[21_250]", new int[21_250]);     // 2, LOH
+Show("string(42_500)", new string('x', 42_500)); // 2, LOH
+Show("POH", GC.AllocateArray<byte>(16, pinned: true)); // 2, POH
+Show("Literal", "Hallo");                 // Non-GC-Heap (.NET 8+)
+
+var info = GC.GetGCMemoryInfo();
+Console.WriteLine($"LOH: {info.GenerationInfo[3].SizeAfterBytes} Byte");
+Console.WriteLine($"POH: {info.GenerationInfo[4].SizeAfterBytes} Byte");`}
+  benchmark={`[MemoryDiagnoser]
+public class LohBench
+{
+    [Benchmark(Baseline = true)]
+    public int NewArray()
+    {
+        var buffer = new byte[100_000];
+        return buffer.Length;
+    }
+
+    [Benchmark]
+    public int Pooled()
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(100_000);
+        int length = buffer.Length;
+        ArrayPool<byte>.Shared.Return(buffer);
+        return length;
+    }
+}`}
+  expected={[
+    { method: 'NewArray', allocated: 'rund 100 KB' },
+    { method: 'Pooled', allocated: 'keine' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. NewArray zeigt in der Spalte Gen2 regelmäßig volle Collections, Pooled keine."
+/>
+
+{/* TODO(verify): BenchmarkDotNet results for LohBench (allocated 100,024 B vs 0 B, Gen2 column non-zero only for NewArray) and that the JIT does not elide the unused array. */}
+
+Ein zweites Experiment macht die Fragmentierung sichtbar: Alloziere abwechselnd Arrays mit 100 KB und 300 KB, halte nur jedes zweite fest, löse `GC.Collect()` aus und gib `GC.GetGCMemoryInfo().GenerationInfo[3].FragmentationAfterBytes` aus. Wiederhole das nach `CompactOnce` und einem weiteren `GC.Collect()`: Die Fragmentierung sollte deutlich sinken.
+
+{/* TODO(verify): FragmentationAfterBytes for the LOH drops to near zero after CompactOnce plus GC.Collect(). */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="loh-poh"
+  questions={[
+    {
+      q: 'Wann wird der Speicher eines toten Objekts im LOH frühestens frei?',
+      options: [
+        'Bei der nächsten Gen0-Collection',
+        'Bei der nächsten Collection, die Gen2 einschließt',
+        'Sofort, wenn kein Verweis mehr darauf zeigt',
+      ],
+      correct: 1,
+      explanation:
+        'Der LOH wird logisch mit Gen2 eingesammelt. Ephemere Collections schauen ihn nicht an, egal wie kurz das Objekt gebraucht wurde.',
+    },
+    {
+      q: 'Was passiert standardmäßig mit überlebenden Objekten im LOH bei einer vollen Collection?',
+      options: [
+        'Sie werden zusammengeschoben wie in Gen0',
+        'Sie bleiben, wo sie sind, und tote Objekte hinterlassen Lücken in einer Freiliste',
+        'Sie werden nach Gen2 kopiert',
+      ],
+      correct: 1,
+      explanation:
+        'Der LOH wird standardmäßig nur freigegeben, nicht kompaktiert, weil das Kopieren großer Objekte teuer ist. Kompaktieren passiert nur mit CompactOnce oder wenn der GC es selbst für nötig hält.',
+    },
+    {
+      q: 'Liegt ein object[] mit 12.000 Einträgen auf 64-Bit im LOH?',
+      options: [
+        'Nein, es enthält ja nur Verweise',
+        'Ja, 12.000 Verweise mit je 8 Byte plus Header sind über 85.000 Byte',
+        'Nur, wenn die referenzierten Objekte groß sind',
+      ],
+      correct: 1,
+      explanation:
+        'Zählt wird die Größe des Arrays selbst. Die referenzierten Objekte liegen unabhängig davon in ihren eigenen Generationen.',
+    },
+    {
+      q: 'Was bewirkt GC.AllocateArray<byte>(4096, pinned: true)?',
+      options: [
+        'Ein normales Gen0-Array plus ein Pinned-Handle',
+        'Ein Array auf dem Pinned Object Heap, das sich nie bewegt',
+        'Ein Array im LOH, weil fixierte Objekte immer groß sind',
+      ],
+      correct: 1,
+      explanation:
+        'Mit pinned: true landet das Array auf dem POH, unabhängig von seiner Größe. Dort wird nie kompaktiert, ein Handle ist nicht nötig.',
+    },
+    {
+      q: 'Warum kann der JIT seit .NET 8 die Adresse eines String-Literals direkt in den Maschinencode schreiben?',
+      options: [
+        'Weil Literale im Non-GC-Heap liegen, den der GC nie verschiebt',
+        'Weil Literale auf dem Stack liegen',
+        'Weil der GC String-Literale im LOH fixiert',
+      ],
+      correct: 0,
+      explanation:
+        'Objekte im Non-GC-Heap werden weder eingesammelt noch verschoben. Ihre Adresse ist also stabil und kann als Konstante verwendet werden.',
+    },
+    {
+      q: 'Ein Dienst alloziert pro Anfrage ein byte[200_000] und gibt es danach frei. Was ist der wirksamste Ausweg?',
+      options: [
+        'Nach jeder Anfrage GC.Collect() aufrufen',
+        'Die LOH-Schwelle auf 300.000 Byte anheben',
+        'Die Puffer aus einem ArrayPool mieten und zurückgeben',
+      ],
+      correct: 2,
+      explanation:
+        'Pooling macht aus vielen kurzlebigen großen Arrays wenige langlebige. Eine höhere Schwelle schickt die Arrays nur durch die kopierenden jungen Generationen, GC.Collect() verursacht zusätzliche volle Collections.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Objekte ab **85.000 Byte** (inklusive Header) landen im **Large Object Heap**, weil das Kopieren großer Objekte beim Kompaktieren teuer ist.
+- Der LOH wird **nur mit Gen2** eingesammelt. `GC.GetGeneration` meldet 2, und kurzlebige große Arrays binden ihren Speicher bis zur nächsten vollen Collection.
+- Der LOH wird standardmäßig **freigegeben, nicht kompaktiert**. Gemischte Größen führen zu Fragmentierung, `CompactOnce` hilft einmalig.
+- Große Allokationen kosten vor allem das **Nullen des Speichers** und verbrauchen LOH-Budget, das volle Collections auslöst.
+- Der **Pinned Object Heap** (seit .NET 5) nimmt mit `pinned: true` allozierte Arrays ohne Verweise auf. Sie bewegen sich nie und stören die jungen Generationen nicht.
+- Der **Non-GC-Heap** (seit .NET 8) enthält String-Literale und Typobjekte. Der GC ignoriert ihn, der JIT kann ihre Adressen fest einbetten.
+- Gegen unerwartete LOH-Allokationen helfen **Pooling, Anfangskapazitäten und Streaming**. Messen lässt sich das mit `dotnet-counters` und `GC.GetGCMemoryInfo`.
+
+</Block>

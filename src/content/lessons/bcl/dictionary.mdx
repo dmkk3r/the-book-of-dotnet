@@ -1,0 +1,392 @@
+---
+id: dictionary
+title: Dictionary von innen
+summary: Wie Dictionary<TKey, TValue> mit zwei Arrays, gespeicherten Hashcodes und Ketten nachschlägt, wie es wächst, wie es entfernte Plätze wiederverwendet und woran es scheitert, wenn GetHashCode und Equals nicht zusammenpassen.
+status: draft
+sources:
+  - title: 'Dictionary.cs im dotnet/runtime-Repo'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Collections/Generic/Dictionary.cs
+  - title: 'HashHelpers.cs im dotnet/runtime-Repo (Primzahltabelle, ExpandPrime, FastMod)'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/Common/src/System/Collections/HashHelpers.cs
+  - title: 'NonRandomizedStringEqualityComparer.cs im dotnet/runtime-Repo'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Collections/Generic/NonRandomizedStringEqualityComparer.cs
+  - title: 'Dictionary<TKey,TValue>-Klasse (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.collections.generic.dictionary-2
+  - title: 'String.GetHashCode-Methode (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.string.gethashcode
+  - title: 'Object.GetHashCode-Methode (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.object.gethashcode
+  - title: 'dotnet/runtime PR 406: FastMod für Dictionary und HashSet'
+    url: https://github.com/dotnet/runtime/pull/406
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './dictionary.steps';
+import resizeScript from './dictionary-resize.steps';
+import removeScript from './dictionary-remove.steps';
+import mutationScript from './dictionary-mutation.steps';
+
+{/* Implementation details below were read from Dictionary.cs and HashHelpers.cs on dotnet/runtime main (2026-11-25). */}
+{/* TODO(verify): Pin the source links to a concrete commit and name the .NET version (dotnetVersion) the details refer to. */}
+
+<Block n={1} title="Das Problem">
+
+Stell dir vor, du speicherst 100.000 Kunden in einer `List<Kunde>` und suchst einen per Kundennummer. `list.Find(k => k.Nummer == 4711)` vergleicht im Mittel die Hälfte aller Einträge, im schlechtesten Fall alle. Der Aufwand wächst linear mit der Anzahl, man schreibt dafür O(n). Bei zehnmal so vielen Kunden dauert jede Suche zehnmal so lange.
+
+Eine sortierte Liste mit binärer Suche schafft O(log n), aber jedes Einfügen muss dann Elemente verschieben. Was man sich eigentlich wünscht, ist ein Array: Kennt man den Index, ist der Zugriff ein einziger Schritt, egal wie groß das Array ist. Nur ist eine Kundennummer wie 4711 oder ein Schlüssel wie `"rot"` kein Index.
+
+Genau hier setzt **Hashing** an. Eine Hashfunktion macht aus jedem Schlüssel eine Zahl, den **Hashcode**. Aus dieser Zahl lässt sich eine Position in einem Array berechnen. Wer den Schlüssel später wieder sucht, berechnet dieselbe Zahl und landet an derselben Stelle, ohne die anderen Einträge anzusehen.
+
+Der Haken: Es gibt unendlich viele mögliche Schlüssel, aber nur endlich viele Positionen. Verschiedene Schlüssel landen deshalb zwangsläufig manchmal an derselben Stelle, das nennt man **Kollision**. Eine Hashtabelle ist im Kern die Kunst, mit Kollisionen billig umzugehen. `Dictionary<TKey, TValue>` löst das mit Ketten in einem Array, und wie genau, darum geht es in dieser Lektion.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Ein `Dictionary` besteht im Kern aus zwei gleich langen Arrays:
+
+- `entries` hält die eigentlichen Einträge dicht hintereinander. Jeder Eintrag ist ein Struct mit vier Feldern: dem Hashcode, dem Index des nächsten Eintrags in derselben Kette (`next`), dem Schlüssel und dem Wert.
+- `buckets` ordnet jedem **Bucket** den Index des ersten Eintrags seiner Kette zu.
+
+Damit lässt sich alles in fünf Sätzen zusammenfassen:
+
+1. **Der Hashcode bestimmt den Bucket.** Bucket-Index ist der Rest der Division des Hashcodes durch die Anzahl der Buckets.
+2. **Kollisionen bilden Ketten.** Einträge im selben Bucket sind über `next` verkettet, ein neuer Eintrag wird vorne angehängt.
+3. **Suchen heißt: Bucket bestimmen, Kette ablaufen.** Für jeden Kandidaten wird erst der gespeicherte Hashcode verglichen und nur bei Gleichheit `Equals` aufgerufen.
+4. **Ist `entries` voll, wächst alles.** Beide Arrays werden durch größere ersetzt, und alle Einträge werden neu auf die Buckets verteilt.
+5. **Entfernte Plätze werden wiederverwendet.** Nichts rückt nach, die Lücken bilden eine Freiliste für die nächsten Einfügungen.
+
+Das Ganze funktioniert nur, wenn sich `GetHashCode` und `Equals` an einen Vertrag halten, den Microsoft Learn für `Object.GetHashCode` beschreibt: Zwei Objekte, die laut `Equals` gleich sind, **müssen** denselben Hashcode liefern. Umgekehrt dürfen ungleiche Objekte durchaus denselben Hashcode haben, das ist nur eine Kollision. Und solange ein Objekt als Schlüssel in einem Dictionary steckt, darf sich sein Hashcode nicht ändern.
+
+Den Vergleich übernimmt ein `IEqualityComparer<TKey>`. Gibst du keinen an, nimmt das Dictionary `EqualityComparer<TKey>.Default`, der wiederum `GetHashCode` und `Equals` des Schlüsseltyps aufruft (bevorzugt `IEquatable<TKey>.Equals`, wenn der Typ es implementiert).
+
+<Callout kind="fehlannahme">
+  „Ein Dictionary-Zugriff ist immer ein einziger Schritt.“ Nein: Ein Zugriff kostet einen Schritt
+  pro Eintrag in der Kette seines Buckets. Nur weil gute Hashcodes und genügend Buckets die Ketten
+  kurz halten, ist er im Mittel konstant. Mit schlechten Hashcodes wird daraus eine lineare Suche.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Drei Schlüssel, ein Dictionary in Startgröße. Achte auf Schritt 3, in dem zwei Schlüssel im selben Bucket landen, und auf die beiden letzten Schritte, in denen die Suche einer Kette folgt. Die Hashcodes sind ausgedacht, aber über alle Visualisierungen dieser Lektion hinweg gleich.
+
+<StepPlayer script={script} />
+
+<Callout kind="hinweis">
+  Intern speichert `buckets` die Indizes um eins verschoben, damit ein frisch angelegtes Array aus
+  Nullen „alle Buckets leer“ bedeutet. Die Visualisierungen zeigen sie zur besseren Lesbarkeit
+  direkt, leere Buckets als „leer“.
+</Callout>
+
+Zwei Dinge sind leicht zu übersehen. Erstens speichert jeder Eintrag seinen Hashcode. Das erlaubt den billigen Vorabvergleich bei der Suche und erspart später beim Wachsen jeden erneuten Aufruf von `GetHashCode`. Zweitens kostet die erfolglose Suche nach `"gelb"` am meisten: Erst am Ende der Kette steht fest, dass der Schlüssel fehlt.
+
+</Block>
+
+<Block n={4} title="Vom Hash zum Bucket">
+
+### Rest-Division und Primzahlen
+
+Der Hashcode ist ein `int`. Das Dictionary behandelt ihn als vorzeichenlose Zahl (`uint`), negative Hashcodes sind also kein Problem. Der Bucket-Index ist dann schlicht `hashCode % buckets.Length`.
+
+Interessant ist die Länge. `Dictionary` verwendet als Größe immer eine **Primzahl**. Sie stammen aus einer festen Tabelle in `HashHelpers`, die mit 3, 7, 11, 17, 23 beginnt. Für sehr große Kapazitäten jenseits der Tabelle sucht `HashHelpers` die nächste passende Primzahl per Rechnung.
+
+{/* TODO(verify): Prime table start (3, 7, 11, 17, 23) is from HashHelpers.Primes on main; confirm for the targeted .NET version. */}
+
+Warum Primzahlen? Weil die Rest-Division sonst Muster im Hashcode verstärkt. Angenommen, alle Hashcodes deiner Schlüssel sind Vielfache von 4 (das passiert schnell, etwa bei Adressen oder Feldern, die immer in Viererschritten wachsen). Bei 16 Buckets landen sie nur in den Buckets 0, 4, 8 und 12, drei Viertel der Buckets bleiben leer. Bei 17 Buckets verteilen sie sich über alle. Allgemein gilt: Haben Hashcodes und Bucket-Anzahl einen gemeinsamen Teiler, wird nur ein Teil der Buckets benutzt. Eine Primzahl hat keine Teiler, mit denen das passieren könnte.
+
+### FastMod auf 64-Bit
+
+Eine Division ist für den Prozessor eine der teuersten Grundrechenarten, und sie steht in jedem einzelnen Zugriff. Auf 64-Bit-Plattformen ersetzt `Dictionary` sie deshalb durch ein Verfahren nach Daniel Lemire: Bei jeder Größenänderung berechnet es einmal einen Multiplikator (`_fastModMultiplier`), und `HashHelpers.FastMod` gewinnt den Rest danach mit Multiplikationen und Shifts. Das Ergebnis ist exakt dasselbe wie `hashCode % buckets.Length`, nur schneller. Auf 32-Bit bleibt es bei der normalen Rest-Division.
+
+{/* TODO(verify): .NET version that introduced FastMod in Dictionary (PR 406, likely .NET 5) and the speedup claimed there. */}
+
+Für das mentale Modell darfst du FastMod also vergessen. Es erklärt nur, warum im Quellcode an dieser Stelle kein `%` steht.
+
+</Block>
+
+<Block n={5} title="Wachsen: das Resize">
+
+`buckets` und `entries` haben im `Dictionary` immer dieselbe Länge. Ein Resize ist fällig, sobald ein neuer Eintrag kommt, `entries` voll ist und die Freiliste (siehe nächster Abschnitt) leer. Es gibt also keinen Füllgrad unter 100 Prozent, ab dem vorzeitig gewachsen wird: Im Mittel kommt auf jeden Bucket höchstens ein Eintrag.
+
+Die neue Größe berechnet `HashHelpers.ExpandPrime`: Sie verdoppelt die bisherige Anzahl und nimmt die nächste Primzahl, die mindestens so groß ist. Aus 3 wird so 7, danach 17, 37 und 89.
+
+{/* TODO(verify): Growth sequence 3, 7, 17, 37, 89 derived from ExpandPrime/GetPrime on main; confirm with a quick EnsureCapacity(0) experiment or by reading the targeted version. */}
+
+<StepPlayer script={resizeScript} />
+
+Drei Beobachtungen aus der Visualisierung:
+
+- **Die Einträge behalten ihre Indizes.** `entries` wird mit `Array.Copy` in das größere Array kopiert. Nur `buckets` wird komplett neu aufgebaut, und jedes `next` wird neu gesetzt.
+- **Kein erneutes `GetHashCode`.** Die neue Verteilung nutzt die gespeicherten Hashcodes. Bei teuren Hashfunktionen (lange Strings, große Structs) ist das ein spürbarer Vorteil.
+- **Ketten zerfallen und entstehen neu.** Zwei Schlüssel, die sich bei 3 Buckets einen Bucket teilten, landen bei 7 Buckets meist in verschiedenen. Andere treffen sich dafür neu.
+
+Ein Resize kostet O(n): Alle Einträge werden angefasst, zwei neue Arrays alloziert, die alten werden zu Müll für den GC. Weil sich die Größe jedes Mal ungefähr verdoppelt, passiert das aber selten genug, dass Einfügen im Mittel trotzdem konstant bleibt. Teuer wird es, wenn du von vornherein weißt, dass eine Million Einträge kommen, und das Dictionary trotzdem bei 3 anfangen lässt. Dazu mehr in „In der Praxis“.
+
+</Block>
+
+<Block n={6} title="Entfernen und die Freiliste">
+
+Bei einer `List<T>` schiebt `RemoveAt` alle folgenden Elemente um eine Position nach vorn. Beim `Dictionary` ginge das nicht: Die Indizes in `buckets` und in jedem `next` müssten mitwandern. Stattdessen bleibt der entfernte Eintrag als Lücke stehen.
+
+`Remove` sucht den Eintrag wie beim Nachschlagen und merkt sich dabei den Vorgänger in der Kette. Dann wird der Eintrag ausgehängt: Entweder zeigt der Bucket direkt auf den Nachfolger, oder der Vorgänger übernimmt dessen `next`. Enthalten Schlüssel oder Wert Verweise, werden sie auf `default` gesetzt, damit der GC die Objekte einsammeln kann.
+
+Die Lücke kommt auf eine **Freiliste**. Das `Dictionary` merkt sich in `_freeList` den Index des zuletzt freigegebenen Eintrags und in `_freeCount`, wie viele freie Einträge es gibt. Die Verkettung der freien Einträge steckt im Feld `next`, das in einer Lücke ja nicht mehr gebraucht wird.
+
+<StepPlayer script={removeScript} />
+
+Beim nächsten Einfügen nimmt das Dictionary zuerst einen Platz von der Freiliste, und zwar den zuletzt freigegebenen. Erst wenn sie leer ist, wird hinten angehängt, und erst wenn auch dort kein Platz mehr ist, folgt ein Resize. `Count` ist intern die Zahl der jemals belegten Plätze minus die Zahl der freien.
+
+Woran erkennt das Dictionary, ob ein Eintrag frei ist? Im Quellcode wird der Freilisten-Verweis negativ kodiert, als `-3 - index`. Ein `next` von `-1` bedeutet „Ende der Kette“, `-2` „Ende der Freiliste“, alles darunter „frei, der nächste freie Eintrag ist …“. So können Enumerator und Resize mit einem Blick auf `next` freie Einträge überspringen. Die Visualisierung zeigt den Verweis vereinfacht als normalen Index.
+
+{/* TODO(verify): Free list encoding (StartOfFreeList = -3, next = -3 - index) is from Dictionary.cs on main; confirm for the targeted version. */}
+
+Eine Folge davon zeigt der letzte Schritt: Der Enumerator läuft `entries` nach Index ab. Nach Entfernen und Wiedereinfügen erscheinen neue Schlüssel an den Stellen alter. Die Dokumentation legt sich ausdrücklich nicht auf eine Reihenfolge fest, und dein Code sollte es auch nicht.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Der Schlüssel ändert sich nach dem Einfügen
+
+Das Dictionary rechnet den Hashcode genau einmal aus, beim Einfügen. Ändert sich danach ein Feld, das in `GetHashCode` einfließt, steht der Eintrag im falschen Bucket, und niemand korrigiert das.
+
+<StepPlayer script={mutationScript} />
+
+Der Eintrag ist danach verloren: weder mit dem veränderten noch mit einem neuen, gleich aussehenden Schlüssel erreichbar. Er belegt Speicher, hält das Schlüsselobjekt am Leben und taucht beim Aufzählen auf. Die Regel lautet deshalb: Schlüssel sind unveränderlich, zumindest in allen Feldern, die in `GetHashCode` und `Equals` eingehen. `string`, `int`, `Guid` und `record`-Typen mit `init`-Eigenschaften sind gute Schlüssel.
+
+### Ein schlechter Hashcode
+
+```csharp
+class Kunde
+{
+    public int Nummer { get; init; }
+    public override bool Equals(object? o) => o is Kunde k && k.Nummer == Nummer;
+    public override int GetHashCode() => 1;   // erfüllt den Vertrag, aber ...
+}
+```
+
+Dieser Code ist **korrekt**: Gleiche Objekte haben denselben Hashcode, der Vertrag ist erfüllt. Aber alle Einträge landen im selben Bucket und bilden eine einzige Kette. Jede Suche wird zur linearen Suche, und jedes Einfügen auch, weil `TryInsert` vor dem Anhängen die ganze Kette nach einem vorhandenen Schlüssel absucht. Eine Million Einträge einzufügen kostet dann quadratisch viele Vergleiche.
+
+In der Praxis sind es selten so offensichtliche Fälle. Typischer sind Hashcodes, die nur ein Feld berücksichtigen, das bei vielen Schlüsseln gleich ist, oder ein XOR zweier Felder, bei dem `(1, 2)` und `(2, 1)` kollidieren. `HashCode.Combine(a, b)` mischt die Felder gründlich und ist fast immer die richtige Wahl. `record`- und `record struct`-Typen erzeugen passende Implementierungen automatisch.
+
+### Struct-Schlüssel ohne IEquatable&lt;T&gt;
+
+Für einen Struct als Schlüssel ruft `EqualityComparer<TKey>.Default` bevorzugt `IEquatable<TKey>.Equals` auf. Implementiert der Struct dieses Interface nicht, bleibt nur `Equals(object)`, und dafür muss der Schlüssel bei jedem Vergleich geboxt werden. Wie teuer das ist und warum es passiert, zeigt die Lektion „Boxing und Unboxing“.
+
+Dazu kommt die geerbte Implementierung von `ValueType.GetHashCode` und `ValueType.Equals`. Sie funktioniert für jeden Struct, kann aber auf Reflection zurückfallen und berücksichtigt je nach Layout womöglich nicht alle Felder, was die Verteilung verschlechtert. Für Struct-Schlüssel gilt deshalb: `IEquatable<T>` implementieren und `GetHashCode` überschreiben, oder gleich `readonly record struct` verwenden.
+
+{/* TODO(verify): ValueType.GetHashCode details (reflection fallback, which fields are used) in the targeted .NET version; Microsoft Learn recommends overriding it. */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Code                                                  | Effekt                                       | Warum                                  | Ausweg                                       |
+| ----------------------------------------------------- | -------------------------------------------- | -------------------------------------- | -------------------------------------------- |
+| `new Dictionary<K, V>()` und dann 100.000 Einfügungen | viele Resizes, viel Müll                     | Wachstum ab 3 in Verdopplungsschritten | `new Dictionary<K, V>(100_000)`              |
+| `if (d.ContainsKey(k)) x = d[k];`                     | zwei Suchen                                  | jeder Aufruf hasht und läuft die Kette | `d.TryGetValue(k, out x)`                    |
+| `if (!d.ContainsKey(k)) d.Add(k, v);`                 | zwei Suchen                                  | wie oben                               | `d.TryAdd(k, v)`                             |
+| `d[k] = d[k] + 1;` als Zähler                         | zwei Suchen                                  | Lesen und Schreiben suchen getrennt    | `CollectionsMarshal.GetValueRefOrAddDefault` |
+| `d.Clear();` nach einer großen Füllung                | Speicher bleibt belegt                       | `Clear` behält die Arrays              | danach `d.TrimExcess()`                      |
+| Schreibzugriffe aus mehreren Threads                  | kaputte Ketten, Exception oder falsche Werte | `Dictionary` ist nicht threadsicher    | Lock oder `ConcurrentDictionary`             |
+
+### Kapazität vorgeben
+
+Der Konstruktor `Dictionary(int capacity)` legt die Arrays sofort an, in der Größe der nächsten Primzahl ab der gewünschten Kapazität. Bei 1.000 sind das laut Primzahltabelle 1.103 Plätze. Mit `EnsureCapacity(n)` geht das auch nachträglich, bevor du einen großen Schwung Einträge hinzufügst. `TrimExcess()` verkleinert die Arrays auf die passende Größe für die aktuelle Anzahl und schließt dabei die Lücken der Freiliste.
+
+{/* TODO(verify): GetPrime(1000) = 1103 from the prime table on main. */}
+
+### Einmal suchen statt zweimal
+
+`TryGetValue` liefert Fund und Wert in einer Suche. `ContainsKey` gefolgt vom Indexer sucht zweimal. Für Zähler und Caches gibt es `CollectionsMarshal.GetValueRefOrAddDefault(d, key, out bool exists)`: Es liefert eine `ref` auf den Wert im Eintrag und legt ihn bei Bedarf an. So wird `ref int n = ref CollectionsMarshal.GetValueRefOrAddDefault(d, wort, out _); n++;` zu einer einzigen Suche. Vorsicht: Die Referenz zeigt direkt in das `entries`-Array. Fügst du danach etwas hinzu und löst ein Resize aus, zeigt sie in das alte Array. Benutze sie also nur sofort und ohne das Dictionary dazwischen zu verändern.
+
+### Nur lesen? Dann einfrieren
+
+Wird ein Dictionary einmal aufgebaut und danach nur noch gelesen, etwa eine Konfiguration oder eine Lookup-Tabelle, lohnt sich ein Blick auf `FrozenDictionary<TKey, TValue>`. Es investiert beim Erzeugen Zeit in eine Struktur, die für die konkreten Schlüssel optimiert ist, und schlägt danach schneller nach. Wie das funktioniert, zeigt die Lektion „Frozen Collections“.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+### Randomisierte String-Hashes
+
+`string.GetHashCode` liefert in .NET (Core) für denselben String in jedem Prozess einen anderen Wert, weil in die Berechnung ein zufälliger Startwert pro Prozess eingeht. Microsoft Learn weist ausdrücklich darauf hin, dass man String-Hashcodes deshalb nie speichern oder zwischen Prozessen austauschen darf. Der Grund ist Sicherheit: Wären die Hashcodes vorhersagbar, könnte ein Angreifer gezielt tausende Schlüssel mit demselben Bucket schicken, etwa als Formularfelder oder JSON-Eigenschaften, und jede Anfrage in eine quadratische Einfügeorgie verwandeln.
+
+{/* TODO(verify): Hash algorithm used for randomized string hashing (Marvin) and since which version it is the default. */}
+
+### Der Trick bei Dictionary&lt;string, …&gt;
+
+Randomisiertes Hashing ist gründlicher und damit etwas teurer. `Dictionary<string, TValue>` startet deshalb mit einem internen `NonRandomizedStringEqualityComparer`, wenn du keinen Comparer, `StringComparer.Ordinal` oder `StringComparer.OrdinalIgnoreCase` angibst. Er nutzt eine schnellere, nicht randomisierte Hashfunktion.
+
+Gegen Angriffe schützt sich das Dictionary trotzdem: Muss `TryInsert` beim Einfügen mehr als `HashHelpers.HashCollisionThreshold` Einträge einer Kette ablaufen (im aktuellen Quellcode 100), wechselt es auf den randomisierten Comparer und berechnet alle Hashcodes neu. Das passiert nur bei String-Schlüsseln und nur beim Einfügen. Die Eigenschaft `Comparer` liefert dabei weiterhin den Comparer, den du übergeben hast.
+
+{/* TODO(verify): HashCollisionThreshold = 100 and the .NET version that introduced the non-randomized start comparer (likely .NET 5). */}
+
+<Callout kind="version">
+  Startgröße, Primzahltabelle, FastMod und der Comparer-Wechsel sind Implementierungsdetails. Die
+  Beschreibung folgt dem aktuellen Quellcode von dotnet/runtime. Ältere Versionen und .NET Framework
+  weichen in Einzelheiten ab, das Grundprinzip aus Buckets, Einträgen und Ketten ist seit Langem
+  dasselbe.
+</Callout>
+
+### Werttyp-Schlüssel und Devirtualisierung
+
+Bei Referenztypen als Schlüssel speichert das Dictionary immer einen Comparer und ruft ihn über das Interface auf. Bei Werttypen ohne eigenen Comparer verzichtet es darauf und ruft direkt `EqualityComparer<TKey>.Default.Equals` auf. Weil der JIT für jeden Werttyp eigenen Code erzeugt, kann er diesen Aufruf devirtualisieren und oft inlinen. Ein `Dictionary<int, …>` vergleicht seine Schlüssel deshalb praktisch so schnell wie ein direkter `==`-Vergleich. Mehr dazu in „Devirtualisierung“ und „Generics zur Laufzeit“.
+
+### Schutz vor Endlosschleifen
+
+Parallele Schreibzugriffe können Ketten zu einem Kreis verbiegen. Damit eine Suche dann nicht ewig läuft, zählt das Dictionary die besuchten Einträge mit. Übersteigt die Zahl die Länge von `entries`, wirft es eine `InvalidOperationException`, die auf nicht unterstützte parallele Operationen hinweist. Verlassen solltest du dich darauf nicht: Nicht jede Beschädigung führt zu einem Kreis.
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente in einem Benchmark: gute gegen schlechte Hashcodes beim Nachschlagen, und Befüllen mit und ohne vorgegebene Kapazität. Achte beim schlechten Hashcode darauf, den **zuerst** eingefügten Schlüssel zu suchen. Weil neue Einträge vorne in die Kette kommen, steht er ganz am Ende.
+
+{/* TODO(verify): Run the benchmark (x64, .NET version noted) and replace the qualitative expectations with measured values. */}
+
+<VerifyCard
+  sharplab="Öffne Dictionary.cs im dotnet/runtime-Repo und lies FindValue, TryInsert, Resize und Remove. Verfolge, wie GetBucket den Bucket berechnet, wie TryInsert zuerst die Freiliste prüft und wie Resize die Einträge mit den gespeicherten Hashcodes neu verkettet."
+  benchmark={`[MemoryDiagnoser]
+public class DictionaryBench
+{
+    const int N = 1_000;
+    readonly Dictionary<GoodKey, int> _good = new();
+    readonly Dictionary<BadKey, int> _bad = new();
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        for (int i = 0; i < N; i++)
+        {
+            _good[new GoodKey(i)] = i;
+            _bad[new BadKey(i)] = i;
+        }
+    }
+
+    // Schlüssel 0 wurde zuerst eingefügt: im schlechten Fall am Ende der einzigen Kette.
+    [Benchmark] public int LookupGood() => _good[new GoodKey(0)];
+    [Benchmark] public int LookupBad()  => _bad[new BadKey(0)];
+
+    [Benchmark]
+    public Dictionary<int, int> FillDefault()
+    {
+        var d = new Dictionary<int, int>();
+        for (int i = 0; i < N; i++) d[i] = i;
+        return d;
+    }
+
+    [Benchmark]
+    public Dictionary<int, int> FillPresized()
+    {
+        var d = new Dictionary<int, int>(N);
+        for (int i = 0; i < N; i++) d[i] = i;
+        return d;
+    }
+}
+
+readonly record struct GoodKey(int Value);
+
+// Erfüllt den Vertrag, landet aber immer im selben Bucket.
+readonly record struct BadKey(int Value)
+{
+    public override int GetHashCode() => 42;
+}`}
+expected={[
+{ method: 'LookupGood', mean: 'wenige Nanosekunden', allocated: 'nichts' },
+{ method: 'LookupBad', mean: 'um Größenordnungen mehr', allocated: 'nichts' },
+{ method: 'FillDefault', mean: 'langsamer', allocated: 'deutlich mehr' },
+{ method: 'FillPresized', mean: 'schneller', allocated: 'nur die endgültigen Arrays' },
+]}
+note="Erwartung qualitativ, noch nicht gemessen. LookupBad vergleicht rund tausend Einträge, LookupGood meist einen. FillDefault alloziert unterwegs alle Zwischengrößen der Arrays."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="dictionary"
+  questions={[
+    {
+      q: 'Was passiert, wenn zwei verschiedene Schlüssel im selben Bucket landen?',
+      options: [
+        'Der zweite überschreibt den ersten',
+        'Sie werden über next verkettet, der neue steht vorne',
+        'Das Dictionary wächst sofort',
+      ],
+      correct: 1,
+      explanation:
+        'Kollisionen sind normal. Der neue Eintrag wird Kopf der Kette und verweist über next auf den bisherigen Kopf. Überschrieben wird nur bei gleichem Schlüssel laut Equals.',
+    },
+    {
+      q: 'GetHashCode liefert für alle Objekte 1, Equals ist korrekt. Was gilt?',
+      options: [
+        'Das Dictionary wirft eine Exception',
+        'Es findet manchmal falsche Einträge',
+        'Es bleibt korrekt, aber Suchen und Einfügen werden linear',
+      ],
+      correct: 2,
+      explanation:
+        'Der Vertrag ist erfüllt, Equals findet immer den richtigen Eintrag. Aber alle Einträge stehen in einer einzigen Kette, die bei jeder Suche abgelaufen wird.',
+    },
+    {
+      q: 'Ein Objekt wird als Schlüssel eingefügt, danach ändert sich ein Feld, das in GetHashCode eingeht. Was liefert ContainsKey mit demselben Objekt?',
+      options: ['True', 'Meistens False'],
+      correct: 1,
+      explanation:
+        'Der gespeicherte Eintrag liegt im Bucket des alten Hashcodes. Die Suche berechnet den neuen Hashcode und schaut in der Regel in einen anderen Bucket. Nur bei zufälliger Gleichheit von Bucket und gespeichertem Hash würde sie ihn finden.',
+    },
+    {
+      q: 'Ein Dictionary mit 7 Plätzen ist voll. Was passiert beim nächsten neuen Schlüssel?',
+      options: [
+        'Es wächst auf 8 Plätze',
+        'Es wächst auf die nächste Primzahl ab 14 und verteilt alle Einträge neu',
+        'Der Schlüssel kommt in einen Überlaufbereich',
+      ],
+      correct: 1,
+      explanation:
+        'ExpandPrime verdoppelt und nimmt die nächste Primzahl aus der Tabelle, hier 17. Danach werden alle Einträge anhand ihrer gespeicherten Hashcodes neu auf die Buckets verteilt.',
+    },
+    {
+      q: 'Du entfernst einen Eintrag und fügst danach einen neuen hinzu. Wo landet er in entries?',
+      options: [
+        'Immer am Ende',
+        'Im Platz des entfernten Eintrags',
+        'Das Array wird vorher kompaktiert',
+      ],
+      correct: 1,
+      explanation:
+        'Entfernte Einträge kommen auf die Freiliste und werden beim nächsten Einfügen zuerst wiederverwendet. Deshalb ist auch die Reihenfolge beim Aufzählen nicht die Einfügereihenfolge.',
+    },
+    {
+      q: 'Was ist an if (d.ContainsKey(k)) x = d[k]; ungünstig?',
+      options: [
+        'Nichts, der Indexer ist gecacht',
+        'Es sucht zweimal, TryGetValue sucht nur einmal',
+      ],
+      correct: 1,
+      explanation:
+        'Jeder Aufruf berechnet den Hashcode und läuft die Kette ab. TryGetValue liefert Fund und Wert mit einer einzigen Suche.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Ein `Dictionary` besteht aus zwei Arrays: `buckets` zeigt auf den Kopf jeder Kette, `entries` hält Hashcode, `next`, Schlüssel und Wert dicht hintereinander.
+- Der Bucket ist der Rest des Hashcodes geteilt durch die Bucket-Anzahl, eine Primzahl. Kollisionen bilden Ketten, gesucht wird erst per Hashvergleich, dann per `Equals`.
+- Gleiche Schlüssel müssen gleiche Hashcodes haben, und der Hashcode darf sich nicht ändern, solange der Schlüssel im Dictionary steckt. Sonst ist der Eintrag unauffindbar.
+- Ist `entries` voll, wächst das Dictionary auf die nächste Primzahl ab dem Doppelten und verteilt alle Einträge mit den gespeicherten Hashcodes neu.
+- Entfernte Einträge hinterlassen Lücken auf einer Freiliste, die beim nächsten Einfügen zuerst belegt werden. Eine Reihenfolge ist nicht garantiert.
+- Schlechte Hashcodes machen aus O(1) eine lineare Suche. Struct-Schlüssel brauchen `IEquatable<T>`, sonst wird bei jedem Vergleich geboxt.
+- Kapazität vorgeben, `TryGetValue` statt `ContainsKey` plus Indexer, und für reine Lese-Tabellen `FrozenDictionary`.
+
+</Block>

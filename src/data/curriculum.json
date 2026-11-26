@@ -1,0 +1,230 @@
+{
+  "chapters": [
+    {
+      "id": "architektur",
+      "title": "Architektur und Start der Runtime",
+      "tier": "fortgeschritten",
+      "summary": "Das große Bild: welche Bausteine .NET hat und was zwischen dem Prozessstart und Main passiert.",
+      "lessons": [
+        { "id": "bausteine", "title": "Die Bausteine von .NET" },
+        { "id": "host", "title": "Der Host: dotnet, hostfxr, hostpolicy" },
+        { "id": "runtimeconfig", "title": "runtimeconfig.json und deps.json" },
+        { "id": "start-bis-main", "title": "Vom Prozessstart bis Main" },
+        { "id": "runtime-repo", "title": "Orientierung im dotnet/runtime-Repo" }
+      ]
+    },
+    {
+      "id": "metadaten",
+      "title": "Assemblies, Metadaten und Typladen",
+      "tier": "fortgeschritten",
+      "summary": "Woraus eine Assembly besteht und wie die Runtime daraus lebendige Typen macht.",
+      "lessons": [
+        { "id": "pe-format", "title": "Aufbau einer Assembly" },
+        { "id": "metadaten-tabellen", "title": "Metadatentabellen und Tokens" },
+        { "id": "typladen", "title": "Wie ein Typ geladen wird" },
+        { "id": "assembly-load-context", "title": "AssemblyLoadContext und Isolierung" },
+        { "id": "binding", "title": "Versionierung und Binding" }
+      ]
+    },
+    {
+      "id": "typsystem",
+      "title": "Typsystem und Objektlayout",
+      "tier": "kern",
+      "summary": "Wie Werte und Objekte im Speicher liegen und wie Aufrufe ihr Ziel finden.",
+      "lessons": [
+        { "id": "werttypen", "title": "Wert- und Referenztypen" },
+        { "id": "boxing", "title": "Boxing und Unboxing" },
+        { "id": "objektheader", "title": "Objekt-Header und Sync Block" },
+        { "id": "method-table", "title": "MethodTable und EEClass" },
+        { "id": "struct-layout", "title": "Struct-Layout und Padding" },
+        { "id": "arrays-strings", "title": "Layout von Arrays und Strings" },
+        { "id": "virtual-dispatch", "title": "Virtuelle Aufrufe und Interface-Dispatch" },
+        { "id": "generics-runtime", "title": "Generics zur Laufzeit" },
+        { "id": "static-abstract", "title": "Statische abstrakte Interface-Member" }
+      ]
+    },
+    {
+      "id": "gc",
+      "title": "Garbage Collector",
+      "tier": "kern",
+      "summary": "Wie alloziert und aufgeräumt wird, was überlebt und warum manche Objekte teuer sind.",
+      "lessons": [
+        { "id": "allokation", "title": "Allokation und Allocation Contexts" },
+        { "id": "generationen", "title": "Generationen" },
+        { "id": "regions", "title": "Segments und Regions" },
+        { "id": "gc-phasen", "title": "Mark, Plan, Relocate, Compact" },
+        { "id": "card-tables", "title": "Write Barriers und Card Tables" },
+        { "id": "loh-poh", "title": "LOH, POH und Non-GC-Heap" },
+        { "id": "pinning", "title": "Pinning und Fragmentierung" },
+        { "id": "finalisierung", "title": "Finalisierung" },
+        { "id": "gc-handles", "title": "WeakReference und GC-Handles" },
+        { "id": "background-gc", "title": "Background GC" },
+        { "id": "gc-modi", "title": "Workstation, Server und DATAS" },
+        { "id": "gc-konfiguration", "title": "GC-Konfiguration und Container" }
+      ]
+    },
+    {
+      "id": "speicher-apis",
+      "title": "Moderne Speicher-APIs",
+      "tier": "kern",
+      "summary": "Die Werkzeuge, mit denen man Allokationen vermeidet, ohne unsicher zu werden.",
+      "lessons": [
+        { "id": "span", "title": "Span<T> und Memory<T>" },
+        { "id": "ref-struct", "title": "ref struct, ref-Locals und scoped" },
+        { "id": "stackalloc", "title": "stackalloc" },
+        { "id": "pooling", "title": "ArrayPool und Pooling" },
+        { "id": "unsafe-api", "title": "Unsafe und MemoryMarshal" },
+        { "id": "pipelines", "title": "System.IO.Pipelines" }
+      ]
+    },
+    {
+      "id": "il",
+      "title": "Von C# zu IL",
+      "tier": "kern",
+      "summary": "Was der Compiler aus Sprachfeatures macht, bevor die Runtime sie zu sehen bekommt.",
+      "lessons": [
+        { "id": "il-grundlagen", "title": "IL und der Evaluation Stack" },
+        { "id": "lowering-closures", "title": "Lambdas und Closures" },
+        { "id": "lowering-schleifen", "title": "foreach, using und lock" },
+        { "id": "iteratoren", "title": "yield und Iteratoren" },
+        { "id": "pattern-matching", "title": "Pattern Matching im IL" }
+      ]
+    },
+    {
+      "id": "jit",
+      "title": "Der JIT-Compiler",
+      "tier": "kern",
+      "summary": "Wie aus IL Maschinencode wird und welche Optimierungen den Unterschied machen.",
+      "lessons": [
+        { "id": "jit-pipeline", "title": "Die Pipeline von RyuJIT" },
+        { "id": "tiered", "title": "Tiered Compilation und OSR" },
+        { "id": "pgo", "title": "Dynamic PGO" },
+        { "id": "inlining", "title": "Inlining" },
+        { "id": "devirtualisierung", "title": "Devirtualisierung" },
+        { "id": "bounds-checks", "title": "Bounds-Check-Elimination" },
+        { "id": "escape-analysis", "title": "Escape Analysis" },
+        { "id": "simd", "title": "Hardware-Intrinsics und SIMD" },
+        { "id": "asm-lesen", "title": "JIT-Assembler lesen" }
+      ]
+    },
+    {
+      "id": "aot",
+      "title": "Ahead-of-Time-Kompilierung",
+      "tier": "fortgeschritten",
+      "summary": "Wann Code vor der Ausführung kompiliert wird und was man dafür aufgibt.",
+      "lessons": [
+        { "id": "readytorun", "title": "ReadyToRun und Crossgen" },
+        { "id": "native-aot", "title": "Native AOT" },
+        { "id": "trimming", "title": "Trimming und Reflection" },
+        { "id": "start-vs-durchsatz", "title": "Startzeit gegen Spitzenleistung" }
+      ]
+    },
+    {
+      "id": "ausfuehrung",
+      "title": "Ausführung, Stack und Exceptions",
+      "tier": "fortgeschritten",
+      "summary": "Was auf dem Stack passiert, wie die Runtime Threads anhält und wie Exceptions wirklich laufen.",
+      "lessons": [
+        { "id": "calling-conventions", "title": "Calling Conventions und Frames" },
+        { "id": "stack-walking", "title": "Stack Walking" },
+        { "id": "safe-points", "title": "GC-Info und Safe Points" },
+        { "id": "suspension", "title": "Wie Threads für den GC angehalten werden" },
+        { "id": "exception-handling", "title": "Exception Handling in zwei Durchläufen" },
+        { "id": "exception-kosten", "title": "Was Exceptions kosten" }
+      ]
+    },
+    {
+      "id": "threading",
+      "title": "Threading und Speichermodell",
+      "tier": "kern",
+      "summary": "Threads, Sichtbarkeit von Speicher zwischen Kernen und wie Locks gebaut sind.",
+      "lessons": [
+        { "id": "threads-os", "title": "Threads und Betriebssystem" },
+        { "id": "speichermodell", "title": "Das .NET-Speichermodell" },
+        { "id": "interlocked", "title": "volatile, Barriers und Interlocked" },
+        { "id": "locks", "title": "Locks von innen" },
+        { "id": "sync-primitive", "title": "SpinLock, SemaphoreSlim und Co." },
+        { "id": "threadpool", "title": "Der ThreadPool" },
+        { "id": "io-threads", "title": "I/O: IOCP und epoll" },
+        { "id": "timer", "title": "Timer" }
+      ]
+    },
+    {
+      "id": "async",
+      "title": "Async von innen",
+      "tier": "kern",
+      "summary": "Was aus async/await wird und wer den Code nach einem await ausführt.",
+      "lessons": [
+        { "id": "state-machine", "title": "Die async State Machine" },
+        { "id": "method-builder", "title": "AsyncMethodBuilder und Awaiter" },
+        { "id": "task-interna", "title": "Task von innen" },
+        { "id": "valuetask", "title": "ValueTask und IValueTaskSource" },
+        { "id": "sync-context", "title": "SynchronizationContext und TaskScheduler" },
+        { "id": "execution-context", "title": "ExecutionContext und AsyncLocal" },
+        { "id": "configureawait", "title": "ConfigureAwait" },
+        { "id": "channels", "title": "Channels und Async Streams" },
+        { "id": "deadlocks", "title": "Typische Deadlocks" },
+        { "id": "runtime-async", "title": "Runtime Async" }
+      ]
+    },
+    {
+      "id": "interop",
+      "title": "Interop und unmanaged Code",
+      "tier": "fortgeschritten",
+      "summary": "Die Grenze zwischen verwaltetem und nativem Code sicher überqueren.",
+      "lessons": [
+        { "id": "pinvoke", "title": "P/Invoke und Marshalling" },
+        { "id": "libraryimport", "title": "LibraryImport" },
+        { "id": "blittable", "title": "Blittable Typen" },
+        { "id": "funktionszeiger", "title": "Funktionszeiger und Callbacks" },
+        { "id": "safehandle", "title": "SafeHandle" },
+        { "id": "com-interop", "title": "COM-Interop und ComWrappers" }
+      ]
+    },
+    {
+      "id": "reflection",
+      "title": "Reflection und Metaprogrammierung",
+      "tier": "vertiefung",
+      "summary": "Code, der Code untersucht oder erzeugt, zur Laufzeit und zur Compile-Zeit.",
+      "lessons": [
+        { "id": "reflection-interna", "title": "Wie Reflection arbeitet" },
+        { "id": "emit", "title": "Reflection.Emit" },
+        { "id": "expression-trees", "title": "Expression Trees" },
+        { "id": "source-generators", "title": "Source Generators" },
+        { "id": "dynamic", "title": "dynamic und der DLR" }
+      ]
+    },
+    {
+      "id": "bcl",
+      "title": "Interna der Basisbibliothek",
+      "tier": "vertiefung",
+      "summary": "Wie die Typen gebaut sind, die du täglich benutzt.",
+      "lessons": [
+        { "id": "dictionary", "title": "Dictionary von innen" },
+        { "id": "list", "title": "List<T> und Wachstum" },
+        { "id": "frozen", "title": "Frozen Collections" },
+        { "id": "strings", "title": "Strings und Interning" },
+        { "id": "utf8", "title": "UTF-8 und Encoding" },
+        { "id": "linq", "title": "LINQ-Iteratoren" },
+        { "id": "streams", "title": "Streams und Dateisystem" },
+        { "id": "sockets", "title": "Sockets" }
+      ]
+    },
+    {
+      "id": "diagnose",
+      "title": "Diagnose und Analyse",
+      "tier": "kern",
+      "summary": "Die Werkzeuge, mit denen man Annahmen über die Runtime überprüft. Parallel zu allen Kapiteln nutzen.",
+      "lessons": [
+        { "id": "sharplab", "title": "SharpLab als Mikroskop" },
+        { "id": "benchmarkdotnet", "title": "BenchmarkDotNet richtig nutzen" },
+        { "id": "eventpipe", "title": "EventPipe und ETW" },
+        { "id": "dotnet-tools", "title": "dotnet-counters, -trace, -dump, -gcdump" },
+        { "id": "sos", "title": "SOS mit WinDbg und lldb" },
+        { "id": "perfview", "title": "PerfView" },
+        { "id": "profiling-api", "title": "Die Profiling-API" },
+        { "id": "metrics", "title": "Metrics und Activity" }
+      ]
+    }
+  ]
+}

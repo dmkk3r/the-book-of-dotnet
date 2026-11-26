@@ -1,0 +1,394 @@
+---
+id: pinning
+title: Pinning und Fragmentierung
+summary: Warum nativer Code fixierte Objekte braucht, was ein fixiertes Objekt beim Kompaktieren anrichtet, weshalb kurzes Pinning fast nichts kostet und langes Pinning in Gen0 den Heap zerstückelt.
+status: draft
+dotnetVersion: '5+'
+sources:
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'fixed-Anweisung (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/language-reference/statements/fixed
+  - title: 'GCHandleType (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.interopservices.gchandletype
+  - title: 'Kopieren und Fixieren beim Marshalling (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/framework/interop/copying-and-pinning
+  - title: 'Memory<T>.Pin (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.memory-1.pin
+  - title: 'GC.AllocateArray (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.allocatearray
+  - title: 'Quellcode des GC in dotnet/runtime (gc.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gc.cpp
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './pinning.steps';
+import longlivedScript from './pinning-longlived.steps';
+
+<Block n={1} title="Das Problem">
+
+Der .NET-GC verschiebt Objekte. Beim Kompaktieren rücken Überlebende zusammen, damit hinter ihnen ein zusammenhängender freier Bereich entsteht. Für verwalteten Code ist das unsichtbar: Der GC passt alle Verweise an, und deine Variablen zeigen danach auf die neue Adresse. Das funktioniert, weil der GC jeden Verweis kennt, in jedem Objekt, auf jedem Stack, in jedem Register.
+
+Nativer Code spielt dabei nicht mit. Wenn du einem C-Funktionsaufruf einen Zeiger auf ein `byte[]` übergibst, wenn das Betriebssystem bei einer asynchronen Leseoperation direkt in deinen Puffer schreibt oder wenn du mit `unsafe`-Code über einen Zeiger iterierst, steht die Adresse an Stellen, die der GC nicht kennt und nicht anpassen kann. Verschiebt er das Objekt in diesem Moment, schreibt der native Code in Speicher, der inzwischen einem ganz anderen Objekt gehört. Das Ergebnis sind beschädigte Heaps und Abstürze, die sich kaum reproduzieren lassen.
+
+Es gibt zwei Auswege. Man kann die Daten in nativen Speicher kopieren, der sich nie bewegt, und nach dem Aufruf zurückkopieren. Das ist sicher, kostet aber Zeit und doppelten Speicher. Oder man sagt dem GC: Dieses eine Objekt darfst du gerade nicht verschieben. Das heißt **Pinning** (Fixieren).
+
+Pinning ist billig, solange es kurz bleibt. Der Zielkonflikt liegt in der Dauer: Je länger ein Objekt fixiert ist und je jünger seine Generation, desto mehr stört es den GC bei genau der Arbeit, die die Allokation in .NET schnell macht.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze reichen für den Rest der Lektion:
+
+1. **Pinning heißt: nicht verschieben.** Ein fixiertes Objekt bleibt bei einer Collection an seiner Adresse. Alles andere verschiebt der GC wie gewohnt.
+2. **Pinning wirkt nur, wenn währenddessen ein GC läuft.** Der GC erfährt erst beim Durchsuchen der Roots, dass ein Objekt fixiert ist. Ohne Collection hat das Pinning keinerlei Effekt.
+3. **Ein fixiertes Objekt ist ein Hindernis beim Kompaktieren.** Überlebende können nicht an ihm vorbeirutschen, vor ihm bleibt eine Lücke. Das ist **Fragmentierung**.
+4. **Die Dauer entscheidet über die Kosten.** `fixed` für einen kurzen Aufruf kostet fast nichts. Ein Pinned-Handle, das über viele Collections in Gen0 hält, zerstückelt die jungen Generationen.
+5. **Langlebig fixierte Puffer gehören auf den Pinned Object Heap.** Dort bewegt sich ohnehin nichts, und die jungen Generationen bleiben frei von Hindernissen.
+
+Die Werkzeuge dafür sind `fixed` (eine fixierte lokale Variable), `GCHandle.Alloc(obj, GCHandleType.Pinned)` (fixiert bis zum `Free`), `Memory<T>.Pin()` (liefert ein `MemoryHandle`) und das automatische Pinning der Interop-Schicht bei P/Invoke. Alle fixierten Verweise sind zugleich Roots: Ein fixiertes Objekt lebt mindestens so lange, wie es fixiert ist.
+
+<Callout kind="fehlannahme">
+  „`fixed` kostet bei jedem Aufruf spürbar Zeit.“ Nein. Eine fixierte lokale Variable ist nur ein
+  Stack-Slot, den der JIT dem GC als „pinned“ meldet. Läuft während des Blocks kein GC, hat sie
+  keinerlei Wirkung. Teuer wird Pinning nicht durch den Vorgang, sondern durch seine Dauer.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Im Beispiel liegen fünf Arrays in Gen0, zwei davon sind tot, und das mittlere ist gerade fixiert, als eine Collection läuft. Achte auf Schritt 6: Wo bleibt beim Kompaktieren eine Lücke, und warum genau dort?
+
+<StepPlayer script={script} />
+
+Der Kern ist die Lücke vor `buf`. Ohne Pinning hätte der GC alle drei Überlebenden lückenlos nach vorn geschoben. Mit dem fixierten Objekt in der Mitte bleibt genau so viel Platz frei, wie die toten Objekte davor belegt hatten. Diese Lücke ist nicht verloren: Der GC trägt sie als freien Bereich ein, und neue Allokationen können sie nutzen. Aber sie ist kleiner und verstreuter als ein zusammenhängender Block. Die Darstellung vereinfacht dabei bewusst: Die Promotion der Überlebenden nach Gen1 ist weggelassen, damit nur der Effekt des fixierten Objekts sichtbar bleibt.
+
+{/* TODO(verify): That gaps in front of pinned plugs become free objects usable for gen0 allocation (allocation contexts can be placed into them), per BOTR and gc.cpp. */}
+
+</Block>
+
+<Block n={4} title="Wie der GC fixierte Objekte behandelt">
+
+### Woher der GC weiß, was fixiert ist
+
+Der GC kennt drei Quellen für fixierte Objekte. Die erste sind **pinned locals** auf dem Stack. Wenn der C#-Compiler eine `fixed`-Anweisung übersetzt, legt er eine lokale Variable an, die im IL als `pinned` deklariert ist:
+
+```
+.locals init (uint8& pinned V_1)
+```
+
+{/* TODO(verify): Exact IL emitted by Roslyn for fixed over a byte[] (pinned managed pointer local, null and length checks, clearing the local at the end of the block). */}
+
+Der JIT überträgt diese Kennzeichnung in die GC-Info der Methode. Hält der GC einen Thread an und durchsucht seinen Stack, findet er den Slot, sieht das Pinned-Flag und vermerkt das Zielobjekt als fixiert. Am Ende des `fixed`-Blocks setzt der generierte Code die Variable auf null, damit das Objekt danach wieder frei beweglich ist.
+
+Die zweite Quelle sind **Pinned-Handles** in der Handle-Tabelle der Runtime, angelegt mit `GCHandle.Alloc(obj, GCHandleType.Pinned)`. Die Handle-Tabelle ist ohnehin eine Quelle von Roots, ein Handle vom Typ `Pinned` wird beim Markieren zusätzlich als Fixierung behandelt. Die dritte Quelle ist die Interop-Schicht: Wenn der Marshaller ein Argument fixiert statt kopiert, geschieht das intern ebenfalls über eine fixierte Variable im Marshalling-Code.
+
+{/* TODO(verify): How P/Invoke IL stubs and LibraryImport-generated code pin arguments (pinned locals vs. handles). */}
+
+### Pinned Plugs beim Kompaktieren
+
+Das Book of the Runtime beschreibt die Planphase so: Der GC läuft durch den betroffenen Bereich und fasst zusammenhängende Überlebende zu **Plugs** zusammen, die toten Bereiche dazwischen heißen **Gaps**. Für jeden Plug berechnet er eine neue Adresse, indem er ihn so weit wie möglich nach vorn schiebt.
+
+Ein Plug, der ein fixiertes Objekt enthält, ist ein **pinned plug**: Seine neue Adresse ist gleich seiner alten. Für die Plugs davor heißt das, dass sie nur bis zum pinned plug nachrücken können, nicht über ihn hinweg. Passt ein Plug nicht mehr in den Platz davor, wird er hinter dem pinned plug untergebracht. Was vor dem pinned plug frei bleibt, wird zu einem freien Bereich in der Freiliste.
+
+{/* TODO(verify): Plan phase details in gc.cpp: pinned plug queue (mark_stack), how adjacent survivors are merged into the pinned plug, and how gaps before pinned plugs become free objects. */}
+
+Ein einzelnes kurz fixiertes Objekt richtet damit wenig Schaden an, eine kleine Lücke bei einer Collection. Problematisch wird es, wenn viele Objekte fixiert sind oder wenn ein Objekt über viele Collections hinweg fixiert bleibt.
+
+### Demotion: Gen0 bleibt nutzbar
+
+Ein fixiertes Objekt in Gen0, das eine Collection überlebt, müsste nach den Regeln aus „Generationen“ promotet werden. Würde der GC es samt umgebendem Bereich zu Gen1 erklären, ginge der Platz um das Objekt herum für Gen0-Allokationen verloren, und bei vielen fixierten Objekten schrumpfte Gen0 auf ein paar Krümel. Der GC kann ein fixiertes Objekt deshalb in Gen0 belassen, statt es zu promoten. Das heißt **Demotion**. Die Lücken um das Objekt herum stehen dann sofort wieder für neue Allokationen bereit.
+
+{/* TODO(verify): Demotion rules for pinned survivors in gen0 (segments: demotion range; regions: how regions with pinned objects are kept in gen0 or promoted), per Maoni's mem-doc and gc.cpp. */}
+
+Demotion ist eine Schadensbegrenzung, keine Lösung. Bleibt ein Puffer lange fixiert, steckt er bei jeder Gen0-Collection wieder mitten im Weg:
+
+<StepPlayer script={longlivedScript} />
+
+Der Vergleich zeigt, warum der POH so wirkungsvoll ist. Das Problem waren nie die fixierten Objekte an sich, sondern dass sie dort lagen, wo der GC am häufigsten kompaktiert. Auf dem POH kompaktiert er nie, also kann ein fixiertes Objekt dort nichts behindern. Mehr zum POH in „LOH, POH und Non-GC-Heap“.
+
+</Block>
+
+<Block n={5} title="Die Werkzeuge im Vergleich">
+
+### fixed
+
+`fixed` fixiert ein Objekt für die Dauer eines Blocks. Neben Arrays und Strings funktioniert es mit jedem Typ, der eine passende `GetPinnableReference`-Methode anbietet, darunter `Span<T>` und `ReadOnlySpan<T>`:
+
+```csharp
+fixed (byte* p = buffer) { NativeMethods.Fill(p, buffer.Length); }
+fixed (char* c = text) { /* text bleibt an seiner Adresse */ }
+fixed (byte* s = span) { /* fixiert das Objekt hinter dem Span, falls es eines gibt */ }
+```
+
+Die Kosten sind minimal: ein zusätzlicher Stack-Slot, der Null-Check des Compilers und das Zurücksetzen am Ende. Der Haken ist die Bindung an den Block. Der Zeiger darf den Block nicht verlassen, und in `async`-Methoden ist `fixed` über ein `await` hinweg nicht möglich.
+
+### GCHandle
+
+`GCHandle.Alloc(obj, GCHandleType.Pinned)` legt einen Eintrag in der Handle-Tabelle an, der das Objekt fixiert und am Leben hält, bis du `Free()` aufrufst. Das ist das Werkzeug, wenn die Fixierung über einen Methodenaufruf hinaus bestehen muss, etwa bis ein nativer Callback eintrifft. `AddrOfPinnedObject()` liefert dann die Adresse.
+
+Ein Pinned-Handle ist nur für Objekte erlaubt, deren Inhalt nativer Code sinnvoll lesen kann, also Arrays aus primitiven oder blitfähigen Typen und Strings. Für andere Objekte wirft `Alloc` eine `ArgumentException`. Die Kosten sind höher als bei `fixed`: Anlegen und Freigeben brauchen einen Eintrag in einer gemeinsamen Tabelle, und der GC muss die Handle-Tabelle bei jeder Collection durchsuchen.
+
+{/* TODO(verify): Exact GCHandle.Alloc Pinned restriction (non-primitive or non-blittable data throws ArgumentException), and relative cost of GCHandle.Alloc/Free compared to fixed. */}
+
+### `Memory<T>.Pin`
+
+`Memory<T>` kann, anders als `Span<T>`, auf dem Heap gespeichert und über `await` hinweg verwendet werden. Entsprechend bietet es mit `Pin()` eine Fixierung ohne Blockbindung an. Das Ergebnis ist ein `MemoryHandle` mit einem Zeiger, das per `Dispose` wieder freigegeben wird. Bei einem `Memory<T>` über einem Array steckt dahinter ein Pinned-Handle, bei einem `MemoryManager<T>` entscheidet dessen eigene `Pin`-Implementierung. Einzelheiten zu `Memory<T>` stehen in „Span&lt;T&gt; und Memory&lt;T&gt;“.
+
+{/* TODO(verify): Memory<T>.Pin implementation for array-backed memory (GCHandle.Alloc Pinned) and whether it skips the handle for arrays allocated on the POH. */}
+
+### P/Invoke
+
+Beim Aufruf nativer Funktionen fixiert die Interop-Schicht bestimmte Argumente automatisch für die Dauer des Aufrufs, statt sie zu kopieren. Microsoft Learn nennt vor allem Arrays aus blitfähigen Elementen und Strings, die als UTF-16 übergeben werden. Nach der Rückkehr ist die Fixierung wieder aufgehoben. Wer dem nativen Code einen Zeiger mitgibt, den dieser sich merkt und später verwendet, hat deshalb einen Fehler, denn nach dem Aufruf darf der GC das Objekt wieder verschieben. Die Regeln im Detail behandelt „P/Invoke und Marshalling“.
+
+{/* TODO(verify): Which parameter types the built-in marshaller and LibraryImport pin instead of copy (blittable arrays by value, strings with CharSet.Unicode/UTF-16, in vs. out/ref), per Microsoft Learn "Copying and Pinning". */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Puffer für die ganze Dauer einer I/O-Operation fixieren
+
+Das klassische Beispiel stammt aus Netzwerkservern. Für jede offene Verbindung wird ein Empfangspuffer angelegt und an eine asynchrone Leseoperation des Betriebssystems übergeben. Bis Daten eintreffen, muss der Puffer fixiert bleiben, und das kann bei einer ruhenden Verbindung Minuten dauern. Liegen Tausende solcher Puffer frisch alloziert in Gen0, ist Gen0 mit Hindernissen übersät, wie es die zweite Visualisierung zeigt.
+
+Der früher empfohlene Ausweg war, einen großen Block früh beim Start zu allozieren und in Abschnitte für die einzelnen Verbindungen zu zerlegen. Der Block wanderte schnell nach Gen2 oder lag gleich im LOH, wo fixierte Objekte kaum stören. Seit .NET 5 ist der POH die direkte Lösung, und die Infrastruktur nutzt ihn selbst: Der Speicherpool von Kestrel alloziert seine Blöcke mit `pinned: true`.
+
+{/* TODO(verify): Kestrel's PinnedBlockMemoryPool allocates blocks via GC.AllocateUninitializedArray<byte>(..., pinned: true) since .NET 5. */}
+
+### Ein vergessenes Free
+
+Ein Pinned-Handle ohne `Free()` ist doppelt schädlich. Erstens ist es eine Root, das Objekt wird also nie eingesammelt, ein klassisches Speicherleck. Zweitens bleibt das Objekt für immer fixiert. Liegt es in einer jungen Generation, ist es ein dauerhaftes Hindernis. Deshalb gehört jedes `GCHandle.Alloc` in ein `try`/`finally`:
+
+```csharp
+var h = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+try
+{
+    NativeMethods.Process(h.AddrOfPinnedObject(), buffer.Length);
+}
+finally
+{
+    h.Free();
+}
+```
+
+Für reine Aufrufdauer ist allerdings `fixed` die bessere Wahl, es kann nicht vergessen werden.
+
+### Viele kleine fixierte Objekte
+
+Jedes fixierte Objekt ist ein eigener pinned plug. Hundert kleine fixierte Puffer, verstreut über Gen0, erzeugen hundert Lücken, während ein einziger großer Puffer, aus dem hundert Abschnitte vergeben werden, nur ein Hindernis ist. Wenn du viele Puffer fixieren musst, fasse sie zu einem Block zusammen oder alloziere sie auf dem POH.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Welche Technik wann
+
+| Technik                                   | Dauer der Fixierung                | Kosten                                        | Wann                                                      |
+| ----------------------------------------- | ---------------------------------- | --------------------------------------------- | --------------------------------------------------------- |
+| `fixed`                                   | Bis zum Ende des Blocks            | Praktisch keine, solange kein GC läuft        | Kurzer synchroner Zugriff, nativer Aufruf mit Zeiger      |
+| Automatisch bei P/Invoke                  | Dauer des Aufrufs                  | Wie `fixed`                                   | Blitfähige Arrays und Strings an native Funktionen        |
+| `GCHandle.Alloc(..., Pinned)`             | Bis `Free()`                       | Eintrag in der Handle-Tabelle                 | Fixierung über einen Aufruf hinaus, nativer Callback      |
+| `Memory<T>.Pin()`                         | Bis `Dispose()` des `MemoryHandle` | Bei Arrays ein Pinned-Handle                  | Asynchroner Code mit `Memory<T>`                          |
+| `GC.AllocateArray<T>(n, pinned: true)`    | Lebensdauer des Arrays             | Allokation auf dem POH, nur mit Gen2 frei     | Langlebige Puffer für nativen Code oder I/O               |
+| Nativer Speicher (`NativeMemory.Alloc`)   | Bis zur Freigabe                   | Keine GC-Kosten, manuelle Verwaltung          | Große, langlebige Puffer ohne Bedarf an Arrays            |
+
+Die Faustregel: so kurz wie möglich fixieren, und wenn es lange sein muss, dann gleich an einem Ort, an dem nichts verschoben wird.
+
+### Erkennen
+
+`GC.GetGCMemoryInfo()` liefert mit `PinnedObjectsCount` die Zahl der fixierten Objekte, die die letzte Collection gefunden hat, und mit `FragmentedBytes` den fragmentierten Speicher. Pro Generation gibt es in `GenerationInfo` zusätzlich die Fragmentierung vor und nach der Collection. Ein dauerhaft hoher Fragmentierungsanteil in Gen0 bei gleichzeitig vielen fixierten Objekten ist ein deutliches Signal. Für die Ursachensuche zeigen GC-Traces mit `dotnet-trace` und PerfView, welche Objekte fixiert waren und woher die Fixierung kam (siehe „dotnet-counters, -trace, -dump, -gcdump“).
+
+{/* TODO(verify): GCMemoryInfo.PinnedObjectsCount semantics (pinned objects found during the last GC), and which trace events report pinned objects (PinObjectAtGCTime, BGCPinnedObjects). */}
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Der JIT meldet fixierte lokale Variablen in der GC-Info jeder Methode. Weil der GC Threads nur an sicheren Punkten anhält (siehe „GC-Info und Safe Points“), weiß er für jeden angehaltenen Frame genau, welche Slots gerade fixierte Verweise enthalten. Das macht `fixed` so billig: Es gibt keine Registrierung zur Laufzeit, nur Metadaten, die der GC bei Bedarf liest.
+
+Der GC selbst begrenzt den Schaden durch fixierte Objekte mit Demotion und indem er die Lücken vor pinned plugs für neue Allokationen wiederverwendet. Mit den Regions seit .NET 7 hat sich der Umgang mit fixierten Objekten im Detail geändert, weil der GC nun ganze Regions einer Generation zuordnen kann, statt Grenzen in einem Segment zu verschieben.
+
+{/* TODO(verify): How regions (.NET 7+) handle regions containing pinned objects in ephemeral GCs (special sweep or keeping the region in gen0), per gc.cpp and Maoni's blog. */}
+
+Die wirkungsvollste Änderung der Runtime ist aber keine Optimierung des Pinnings, sondern das Vermeiden: Der POH seit .NET 5 nimmt langlebig fixierte Puffer aus den jungen Generationen heraus, und Bibliotheken wie Kestrel und `System.Net.Sockets` nutzen ihn oder kommen ganz ohne langes Pinning aus.
+
+<Callout kind="version">
+  Den Pinned Object Heap gibt es seit .NET 5. Regions sind seit .NET 7 der Standard. Mit .NET 10
+  kommen typisierte Handles wie `PinnedGCHandle<T>` hinzu, die die Arbeit mit Pinned-Handles
+  typsicherer machen.
+</Callout>
+
+{/* TODO(verify): PinnedGCHandle<T> and GCHandle<T> introduced in .NET 10, and System.Net.Sockets avoiding long-lived pinning on Unix/Windows. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das erste Experiment macht die fixierte Variable sichtbar. Stelle in SharpLab die Ausgabe auf „IL“ und suche in der Deklaration der lokalen Variablen nach dem Schlüsselwort `pinned`. Das zweite Experiment misst die Fixierung zur Laufzeit.
+
+{/* TODO(verify): Expected output: generation of the pinned array after GC.Collect(0) (0 when demoted), PinnedObjectsCount at least 1, and FragmentedBytes larger with the handle than without. */}
+
+<VerifyCard
+  sharplab="Den ersten Teil auf sharplab.io einfügen (Projekteinstellung unsafe ist dort aktiv) und die Ausgabe auf „IL“ stellen: Die lokale Variable für fixed ist als pinned deklariert. Den zweiten Teil als Konsolenanwendung mit dotnet run -c Release ausführen. Erwartet: PinnedObjectsCount ist mindestens 1, und das fixierte Array bleibt nach der Gen0-Collection oft in Generation 0."
+  code={`public unsafe class C
+{
+    public int Sum(byte[] data)
+    {
+        int sum = 0;
+        fixed (byte* p = data)
+        {
+            for (int i = 0; i < data.Length; i++) sum += p[i];
+        }
+        return sum;
+    }
+}
+
+// Zweiter Teil: Konsolenanwendung
+var pinned = new byte[1024];
+var h = GCHandle.Alloc(pinned, GCHandleType.Pinned);
+var sink = new object[1];
+for (int i = 0; i < 100_000; i++) sink[0] = new byte[64];
+GC.Collect(0);
+var info = GC.GetGCMemoryInfo();
+Console.WriteLine($"Generation: {GC.GetGeneration(pinned)}");
+Console.WriteLine($"Fixierte Objekte: {info.PinnedObjectsCount}");
+Console.WriteLine($"Fragmentiert: {info.FragmentedBytes} Byte");
+h.Free();`}
+  benchmark={`[MemoryDiagnoser]
+public unsafe class PinningBench
+{
+    private readonly byte[] _data = new byte[256];
+
+    [Benchmark(Baseline = true)]
+    public byte Fixed()
+    {
+        fixed (byte* p = _data) return p[0];
+    }
+
+    [Benchmark]
+    public byte Handle()
+    {
+        var h = GCHandle.Alloc(_data, GCHandleType.Pinned);
+        try { return *(byte*)h.AddrOfPinnedObject(); }
+        finally { h.Free(); }
+    }
+
+    [Benchmark]
+    public byte MemoryPin()
+    {
+        using MemoryHandle mh = new Memory<byte>(_data).Pin();
+        return *(byte*)mh.Pointer;
+    }
+}`}
+  expected={[
+    { method: 'Fixed', mean: 'wenige Nanosekunden', allocated: 'keine' },
+    { method: 'Handle', mean: 'deutlich langsamer als Fixed', allocated: 'keine' },
+    { method: 'MemoryPin', mean: 'ähnlich wie Handle', allocated: 'keine' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. Keine der Varianten alloziert auf dem verwalteten Heap. Der Unterschied liegt in den Kosten für den Eintrag in der Handle-Tabelle."
+/>
+
+{/* TODO(verify): BenchmarkDotNet results for PinningBench (relative means of Fixed vs. Handle vs. MemoryPin, zero allocations) on .NET 8 or later. */}
+
+Ein drittes Experiment zeigt den Unterschied zum POH: Ersetze `new byte[1024]` samt Handle durch `GC.AllocateArray<byte>(1024, pinned: true)` und vergleiche `PinnedObjectsCount` und `FragmentedBytes`. Das POH-Array zählt nicht als fixiertes Objekt im Sinne der Collection, weil es ohnehin nicht verschoben werden kann.
+
+{/* TODO(verify): That POH objects are not counted in GCMemoryInfo.PinnedObjectsCount. */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="pinning"
+  questions={[
+    {
+      q: 'Was kostet ein fixed-Block, während dessen kein GC läuft?',
+      options: [
+        'Einen Eintrag in der Handle-Tabelle',
+        'Praktisch nichts, die pinned local ist nur ein Stack-Slot mit Kennzeichnung',
+        'Eine blockierende Gen0-Collection',
+      ],
+      correct: 1,
+      explanation:
+        'Der GC liest die Pinned-Kennzeichnung nur, wenn er während des Blocks den Stack durchsucht. Ohne Collection hat sie keine Wirkung.',
+    },
+    {
+      q: 'Was passiert beim Kompaktieren mit Überlebenden vor einem fixierten Objekt?',
+      options: [
+        'Sie werden über das fixierte Objekt hinweg ans Ende geschoben',
+        'Sie rücken nur bis zum fixierten Objekt auf, davor kann eine Lücke bleiben',
+        'Sie werden ebenfalls fixiert',
+      ],
+      correct: 1,
+      explanation:
+        'Ein pinned plug behält seine Adresse. Plugs davor können nur bis zu ihm nachrücken, was übrig bleibt, wird zum freien Bereich.',
+    },
+    {
+      q: 'Hält ein fixiertes Objekt den GC davon ab, andere Objekte zu verschieben?',
+      options: [
+        'Ja, solange irgendein Objekt fixiert ist, kompaktiert der GC nicht',
+        'Nein, nur das fixierte Objekt bleibt an seiner Adresse',
+        'Ja, aber nur in derselben Generation',
+      ],
+      correct: 1,
+      explanation:
+        'Der GC kompaktiert ganz normal und plant nur um das fixierte Objekt herum. Der Preis ist Fragmentierung, kein Stillstand.',
+    },
+    {
+      q: 'Warum ist ein Puffer, der für eine lange asynchrone I/O-Operation in Gen0 fixiert ist, problematisch?',
+      options: [
+        'Weil er bei jeder Gen0-Collection als Hindernis mitten im Bereich liegt und Gen0 zerstückelt',
+        'Weil fixierte Objekte doppelt so viel Speicher brauchen',
+        'Weil der GC ihn einsammelt, obwohl das Betriebssystem noch hineinschreibt',
+      ],
+      correct: 0,
+      explanation:
+        'Solange die Operation läuft, ist der Puffer bei jeder Gen0-Collection ein pinned plug. Ein fixiertes Objekt wird dagegen nie eingesammelt, denn die Fixierung ist zugleich eine Root.',
+    },
+    {
+      q: 'Was ist die Folge eines GCHandle mit GCHandleType.Pinned, für das nie Free() aufgerufen wird?',
+      options: [
+        'Keine, der Finalizer gibt es frei',
+        'Das Objekt wird nie eingesammelt und bleibt dauerhaft fixiert',
+        'Das Objekt wird beim nächsten Gen2 automatisch gelöst',
+      ],
+      correct: 1,
+      explanation:
+        'Ein GCHandle ist ein Werttyp ohne Finalizer. Das Handle bleibt eine Root und eine Fixierung, bis Free() aufgerufen wird.',
+    },
+    {
+      q: 'Welche Technik passt am besten für einen Empfangspuffer, der für die gesamte Lebensdauer einer Verbindung fixiert sein muss?',
+      options: [
+        'Ein fixed-Block um die gesamte Verbindung',
+        'Ein normales Array mit einem Pinned-Handle',
+        'Ein Array, das mit GC.AllocateArray<byte>(n, pinned: true) auf dem POH liegt',
+      ],
+      correct: 2,
+      explanation:
+        'Auf dem POH bewegt sich nie etwas, ein Handle ist nicht nötig, und die jungen Generationen bleiben frei von pinned plugs. fixed ist an einen synchronen Block gebunden.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- **Pinning** sagt dem GC, dass ein Objekt bei einer Collection nicht verschoben werden darf. Alles andere verschiebt er normal.
+- Pinning wirkt **nur, wenn währenddessen ein GC läuft**. `fixed` ist deshalb fast kostenlos, solange der Block kurz ist.
+- Ein fixiertes Objekt bildet einen **pinned plug**: Überlebende können nicht an ihm vorbei, davor bleiben Lücken. Das ist **Fragmentierung**.
+- Fixierte Objekte in Gen0 lässt der GC oft per **Demotion** in Gen0, damit der Platz um sie herum nutzbar bleibt. Langes Pinning in Gen0 zerstückelt die jungen Generationen trotzdem.
+- `GCHandle.Alloc(..., Pinned)` fixiert bis `Free()`. Ein vergessenes `Free` ist **Leck und Dauerhindernis** zugleich.
+- **Langlebige fixierte Puffer** gehören auf den POH (`GC.AllocateArray<T>(n, pinned: true)`), viele kleine Puffer besser in einen großen Block.
+- Messen lässt sich das mit `GC.GetGCMemoryInfo()` (`PinnedObjectsCount`, `FragmentedBytes`) und GC-Traces.
+
+</Block>

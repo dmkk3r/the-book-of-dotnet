@@ -1,0 +1,171 @@
+---
+// Dev-only author overview (injected by integrations/dev-pages.mjs, never part of the build).
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { curriculum, lessonPath, chapterPath } from '@/lib/curriculum';
+import { getLessons } from '@/lib/lessons';
+import { authorHints, countTodos, countVerifyTodos, STATUS_LABELS } from '@/lib/lesson-status';
+import { withBase } from '@/lib/paths';
+
+const lessons = await getLessons();
+const rows = curriculum.lessons.map((lesson) => {
+  const info = lessons.get(lesson.id);
+  if (!info) return { lesson, info };
+  const data = info.entry.data;
+  const input = { ...data, texts: info.texts };
+  return {
+    lesson,
+    info,
+    status: data.status,
+    verifyTodos: info.texts.reduce((n, t) => n + countVerifyTodos(t), 0),
+    todos: info.texts.reduce((n, t) => n + countTodos(t), 0),
+    sources: data.sources.length,
+    hints: authorHints(input),
+    updated: data.updated.toISOString().slice(0, 10),
+  };
+});
+
+const count = (status?: string) =>
+  rows.filter((r) => (status ? r.status === status : !r.info)).length;
+const summary = [
+  ['Ohne Inhalt', count()],
+  [STATUS_LABELS.draft, count('draft')],
+  [STATUS_LABELS.reviewed, count('reviewed')],
+  [STATUS_LABELS.verified, count('verified')],
+] as const;
+const openVerify = rows.reduce((n, r) => n + (r.verifyTodos ?? 0), 0);
+---
+
+<BaseLayout title="Autorenansicht">
+  <h1>Autorenansicht</h1>
+  <p class="lead">
+    Nur im Entwicklungsmodus sichtbar. Neue Lektion anlegen:{' '}
+    <code>npm run new:lesson -- &lt;chapterId&gt; &lt;lessonId&gt;</code>
+  </p>
+
+  <ul class="summary">
+    {summary.map(([label, n]) => (
+      <li>
+        <b>{n}</b> {label}
+      </li>
+    ))}
+    <li>
+      <b>{openVerify}</b> offene TODO(verify)
+    </li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Kapitel</th>
+          <th scope="col">Lektion</th>
+          <th scope="col">Status</th>
+          <th scope="col">TODO(verify)</th>
+          <th scope="col">TODO</th>
+          <th scope="col">Quellen</th>
+          <th scope="col">Stand</th>
+          <th scope="col">Hinweise</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr data-status={r.status ?? 'missing'}>
+            <td>
+              <a href={withBase(chapterPath(r.lesson.chapter.id))}>{r.lesson.chapter.number}</a>
+            </td>
+            <td>
+              <a href={withBase(lessonPath(r.lesson.chapter.id, r.lesson.id))}>{r.lesson.title}</a>
+              <div class="id">{r.lesson.id}</div>
+            </td>
+            <td>
+              <span class="status">{r.status ? STATUS_LABELS[r.status] : 'ohne Inhalt'}</span>
+            </td>
+            <td class={r.verifyTodos ? 'warn num' : 'num'}>{r.info ? r.verifyTodos : ''}</td>
+            <td class={r.todos ? 'warn num' : 'num'}>{r.info ? r.todos : ''}</td>
+            <td class={r.info && r.hints?.some((h) => h.includes('Quellen')) ? 'warn num' : 'num'}>
+              {r.info ? r.sources : ''}
+            </td>
+            <td>{r.updated ?? ''}</td>
+            <td>{r.hints?.join(', ')}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+</BaseLayout>
+
+<style>
+  .summary {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 24px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .summary li {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 8px 14px;
+  }
+  .table-wrap {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  th,
+  td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 500;
+    position: sticky;
+    top: 0;
+    background: var(--surface);
+  }
+  .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .id {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  tr[data-status='missing'] td {
+    color: var(--muted);
+  }
+  tr[data-status='missing'] a {
+    color: var(--muted);
+  }
+  .status {
+    white-space: nowrap;
+  }
+  tr[data-status='draft'] .status {
+    color: var(--heap);
+    font-weight: 500;
+  }
+  tr[data-status='reviewed'] .status {
+    color: var(--accent);
+    font-weight: 500;
+  }
+  tr[data-status='verified'] .status {
+    color: var(--ok);
+    font-weight: 500;
+  }
+  .warn {
+    color: var(--bad);
+    font-weight: 500;
+  }
+</style>

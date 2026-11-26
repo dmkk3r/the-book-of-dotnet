@@ -1,0 +1,240 @@
+---
+id: method-table
+title: MethodTable und EEClass
+summary: Wie die Runtime zu jedem Objekt seinen Typ kennt, was in dieser Typbeschreibung steht und wofür Casts, virtuelle Aufrufe und der GC sie brauchen.
+status: draft
+sources:
+  - title: 'Book of the Runtime: Type System Overview'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-system.md
+  - title: 'Book of the Runtime: Method Descriptor'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/method-descriptor.md
+  - title: 'methodtable.h im dotnet/runtime-Repo'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/methodtable.h
+  - title: 'class.h (EEClass) im dotnet/runtime-Repo'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/class.h
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './method-table.steps';
+import castScript from './method-table-cast.steps';
+
+<Block n={1} title="Das Problem">
+
+Ein Objekt auf dem Heap ist zunächst nur eine Folge von Bytes. Damit die Runtime damit arbeiten kann, muss sie zu jedem Objekt in kürzester Zeit Fragen beantworten können: Welcher Typ ist das? Wie groß ist es? Wo darin liegen Verweise auf andere Objekte? Welche Methode ist gemeint, wenn jemand `Speak()` aufruft? Ist dieses Objekt ein `Animal`?
+
+Diese Fragen stellen sich ständig. Der GC fragt bei jedem Objekt, das er besucht, nach Größe und Verweisen. Jeder virtuelle Aufruf braucht das Ziel, jeder Cast den Typ. Die Antworten müssen deshalb mit einem einzigen Speicherzugriff erreichbar sein und dürfen pro Objekt kaum Platz kosten.
+
+Die Lösung von CoreCLR: Alles, was alle Objekte eines Typs gemeinsam haben, steht **einmal pro Typ** in einer Struktur namens **MethodTable**. Jedes Objekt trägt nur einen Zeiger darauf. Was selten gebraucht wird, steht in einer zweiten Struktur, der **EEClass**.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+1. **Pro Typ gibt es genau eine MethodTable**, bei generischen Typen eine pro Instanziierung (`List<int>` und `List<string>` haben verschiedene).
+2. **Jedes Objekt enthält einen Zeiger auf die MethodTable seines Typs.** Er steht direkt hinter dem Object Header, und ein Verweis auf das Objekt zeigt genau auf ihn.
+3. **Die MethodTable enthält, was häufig gebraucht wird:** Größe, Basistyp, Interfaces, die Einsprungpunkte der virtuellen Methoden und die Information für den GC, wo Verweise liegen.
+4. **Die EEClass enthält, was selten gebraucht wird:** Felddeskriptoren, Bezug zu den Metadaten, Daten für Reflection.
+5. **Beide liegen im Loader Heap**, nicht auf dem GC-Heap. Sie leben so lange, wie der Typ geladen ist.
+
+<Callout kind="fehlannahme">
+  „Jedes Objekt trägt seine Typbeschreibung mit sich.“ Ein Objekt trägt nur einen Zeiger. Alle 1.000
+  `Dog`-Objekte teilen sich eine einzige MethodTable.
+</Callout>
+
+<Callout kind="hinweis">
+  In den Visualisierungen erscheinen MethodTable und EEClass in der Heap-Spalte, damit die Verweise
+  sichtbar werden. Sie gehören aber nicht zum GC-Heap.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel legt zwei Objekte derselben Klasse an und vergleicht ihre Typen. Achte darauf, wohin die MethodTable-Zeiger der beiden Objekte zeigen.
+
+<StepPlayer script={script} />
+
+`GetType()` ist deshalb so billig: Die Runtime liest den MethodTable-Zeiger und liefert das zugehörige `Type`-Objekt. Auch `typeof(Dog).TypeHandle.Value` gibt dir die Adresse der MethodTable direkt.
+
+</Block>
+
+<Block n={4} title="Was in der MethodTable steht">
+
+Die genaue Struktur ist ein Implementierungsdetail von CoreCLR, die Bausteine sind aber seit Langem stabil:
+
+| Inhalt                  | Wofür                                                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------- |
+| Basisgröße              | Wie viele Bytes ein Objekt belegt, für Allokation und GC                                |
+| Elementgröße            | Bei Arrays und Strings: Größe eines Elements, die Gesamtgröße ergibt sich mit der Länge |
+| Flags                   | Zum Beispiel: enthält Verweise, hat einen Finalizer, ist ein Werttyp, ist ein Interface |
+| Basistyp                | Zeiger auf die MethodTable der Basisklasse, für Casts und Vererbung                     |
+| Interface-Map           | Welche Interfaces der Typ implementiert                                                 |
+| Slots                   | Einsprungpunkte der virtuellen und weiterer Methoden                                    |
+| Verweis auf die EEClass | Für alles Seltene                                                                       |
+| GC-Beschreibung         | Wo im Objekt Verweise liegen, damit der GC ihnen folgen kann                            |
+
+{/* TODO(verify): Field list and the location of the GC descriptor (stored in front of the MethodTable) in methodtable.h. */}
+
+Die Aufteilung in MethodTable und EEClass folgt einem einfachen Prinzip: Heiße Daten, die bei fast jeder Operation gebraucht werden, liegen kompakt beisammen und passen gut in den CPU-Cache. Kalte Daten, die nur Reflection, der Klassenlader oder Debugger brauchen, stören dort nicht.
+
+### Werttypen haben auch eine MethodTable
+
+Auch `int` oder ein eigenes Struct haben eine MethodTable. Ein Werttyp auf dem Stack trägt aber keinen Zeiger darauf, denn der JIT weiß beim Übersetzen, welcher Typ dort liegt. Gebraucht wird die MethodTable erst, wenn der Wert geboxt wird: Die Box ist ein echtes Objekt und zeigt auf die MethodTable des Werttyps. Mehr dazu in der Lektion „Boxing und Unboxing“.
+
+</Block>
+
+<Block n={5} title="Wie ein Cast funktioniert">
+
+Ein `is` oder ein Cast auf eine Klasse fragt: Ist der Typ des Objekts dieser Typ oder davon abgeleitet? Die Antwort steht in der Kette der Basistypen, die die MethodTables miteinander bilden.
+
+<StepPlayer script={castScript} />
+
+Für Interfaces funktioniert das nicht über die Basiskette, denn ein Typ kann viele Interfaces implementieren, die nichts miteinander zu tun haben. Hier durchsucht die Runtime die Interface-Map der MethodTable. Ein Cast auf ein Interface ist deshalb meist etwas teurer als einer auf eine Klasse. Besonders billig sind Casts auf `sealed` Klassen: Weil es keine abgeleiteten Typen geben kann, genügt immer der eine Zeigervergleich.
+
+</Block>
+
+<Block n={6} title="Wofür der GC die MethodTable braucht">
+
+Der Garbage Collector durchläuft beim Markieren alle erreichbaren Objekte. Bei jedem Objekt muss er wissen, wo darin weitere Verweise stehen, denen er folgen muss. Ein `byte[]` enthält keine Verweise, ein `object[]` nur Verweise, eine Klasse mit gemischten Feldern einige an bestimmten Stellen.
+
+All das steht in der MethodTable: ein Flag, ob der Typ überhaupt Verweise enthält, und eine Beschreibung, an welchen Positionen. Beim Kompaktieren braucht der GC außerdem die Größe jedes Objekts, um zum nächsten zu springen. Ohne MethodTable-Zeiger wäre der Heap für den GC unlesbar. Deshalb steht er bei jedem Objekt an derselben Stelle.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### GetType() ist nicht is
+
+```csharp
+Animal a = new Dog();
+Console.WriteLine(a is Animal);                 // True
+Console.WriteLine(a.GetType() == typeof(Animal)); // False
+```
+
+`GetType()` liefert immer den **exakten** Laufzeittyp, hier `Dog`. `is` dagegen prüft die ganze Hierarchie. Wer mit `GetType() ==` vergleicht, schließt abgeleitete Typen aus, oft ohne es zu wollen.
+
+### Typinformation lebt lange
+
+Weil MethodTables im Loader Heap liegen, werden sie nicht wie Objekte eingesammelt. Wer zur Laufzeit viele Typen erzeugt, etwa mit `MakeGenericType` in einer Schleife oder durch dynamisch generierten Code, belegt dauerhaft Speicher. Freigegeben wird er erst, wenn der zugehörige `AssemblyLoadContext` entladen wird, sofern er als entladbar angelegt wurde.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Situation              | Was passiert                      | Tipp                                                         |
+| ---------------------- | --------------------------------- | ------------------------------------------------------------ |
+| `obj is SealedType`    | ein Zeigervergleich               | Klassen, die nicht abgeleitet werden sollen, `sealed` machen |
+| `obj is BaseClass`     | Vergleich entlang der Basiskette  | flache Hierarchien sind billiger                             |
+| `obj is IInterface`    | Suche in der Interface-Map        | in heißen Schleifen bevorzugt einmal casten und merken       |
+| `obj.GetType()`        | MethodTable lesen, `Type` liefern | für exakte Typvergleiche gut geeignet                        |
+| viele generierte Typen | dauerhaft Speicher im Loader Heap | Typen cachen, entladbare `AssemblyLoadContext`s nutzen       |
+
+`sealed` hat neben billigeren Casts einen weiteren Vorteil: Der JIT kann virtuelle Aufrufe auf `sealed` Typen direkt aufrufen. Das zeigt die Lektion „Virtuelle Aufrufe und Interface-Dispatch“.
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Mit einem Debugger und der SOS-Erweiterung kannst du die Strukturen direkt ansehen: `!dumpobj` zeigt den MethodTable-Zeiger eines Objekts, `!dumpmt -md` die MethodTable mit ihren Methoden und `!dumpclass` die EEClass. Ohne Debugger zeigt `TypeHandle.Value`, dass alle Objekte eines Typs dieselbe MethodTable haben.
+
+{/* TODO(verify): SOS output format on .NET 8, and benchmark results for sealed vs non-sealed casts. */}
+
+<VerifyCard
+  sharplab="Im Debugger mit SOS: Programm anhalten, dann !dumpheap -type Dog, !dumpobj auf eine Adresse und !dumpmt -md auf die angezeigte MethodTable."
+  code={`var a = new Dog { Name = "Rex" };
+var b = new Dog { Name = "Bello" };
+Console.WriteLine(a.GetType() == b.GetType());
+Console.WriteLine(typeof(Dog).TypeHandle.Value);
+System.Diagnostics.Debugger.Break();
+
+class Animal { public virtual string Speak() => "..."; }
+class Dog : Animal
+{
+    public string Name = "";
+    public override string Speak() => "Wuff";
+}`}
+  benchmark={`public class CastBench
+{
+    object _o = new Leaf();
+
+    [Benchmark] public bool IsSealedLeaf() => _o is Leaf;
+    [Benchmark] public bool IsBase()       => _o is Base;
+    [Benchmark] public bool IsInterface()  => _o is IMarker;
+}
+
+class Base { }
+class Middle : Base { }
+sealed class Leaf : Middle, IMarker { }
+interface IMarker { }`}
+note="Die Unterschiede sind klein. Wichtiger als absolute Zahlen ist die Reihenfolge."
+/>
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="method-table"
+  questions={[
+    {
+      q: 'Wie viele MethodTables gibt es für 1.000 Dog-Objekte?',
+      options: ['1', '1.000'],
+      correct: 0,
+      explanation: 'Alle Objekte eines Typs zeigen auf dieselbe MethodTable.',
+    },
+    {
+      q: 'Wo liegt die MethodTable?',
+      options: ['Auf dem GC-Heap', 'Im Loader Heap, nicht vom GC verwaltet'],
+      correct: 1,
+      explanation:
+        'Typinformation lebt, solange der Typ geladen ist, und wird mit ihrem AssemblyLoadContext entladen.',
+    },
+    {
+      q: 'Animal a = new Dog(); Was ergibt a.GetType() == typeof(Animal)?',
+      options: ['True', 'False'],
+      correct: 1,
+      explanation: 'GetType() liefert den exakten Typ Dog. Für die Hierarchie ist is zuständig.',
+    },
+    {
+      q: 'Warum braucht der GC die MethodTable?',
+      options: ['Um Methoden aufzurufen', 'Um Größe und Lage der Verweise im Objekt zu kennen'],
+      correct: 1,
+      explanation: 'Beim Markieren folgt er den Verweisen, beim Kompaktieren braucht er die Größe.',
+    },
+    {
+      q: 'Warum ist ein Cast auf eine sealed Klasse besonders billig?',
+      options: [
+        'Weil es keine abgeleiteten Typen gibt und ein Zeigervergleich genügt',
+        'Weil sealed Klassen keine MethodTable haben',
+      ],
+      correct: 0,
+      explanation:
+        'Ist die MethodTable nicht genau die gesuchte, kann das Objekt kein solcher Typ sein.',
+    },
+    {
+      q: 'Wann braucht ein int eine MethodTable-Referenz?',
+      options: ['Immer', 'Erst wenn er geboxt wird'],
+      correct: 1,
+      explanation:
+        'Auf dem Stack kennt der JIT den Typ. Die Box ist ein echtes Objekt und zeigt auf die MethodTable von Int32.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Jeder Typ hat eine MethodTable, jedes Objekt einen Zeiger darauf. Generische Typen haben eine pro Instanziierung.
+- Die MethodTable enthält das Häufige: Größe, Basistyp, Interfaces, Slots, GC-Beschreibung. Die EEClass das Seltene.
+- Beide liegen im Loader Heap und leben, solange der Typ geladen ist.
+- Casts auf Klassen folgen der Kette der Basistypen, Casts auf Interfaces durchsuchen die Interface-Map. `sealed` macht Casts besonders billig.
+- `GetType()` liefert den exakten Typ, `is` prüft die Hierarchie.
+- Der GC liest aus der MethodTable, wie groß ein Objekt ist und wo seine Verweise liegen.
+
+</Block>

@@ -1,0 +1,31 @@
+---
+import Icon from '@/components/Icon.astro';
+// Cycles System → Hell → Dunkel. Hidden without JavaScript (the system setting applies).
+---
+
+<button type="button" class="theme-toggle" data-theme-toggle hidden>
+  <span aria-hidden="true" class="theme-icon" data-theme-icon>
+    <Icon name="theme-system" />
+  </span>
+  <span data-theme-label>Design: System</span>
+</button>
+
+<style>
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    background: transparent;
+    font-size: 14px;
+  }
+  .theme-toggle:hover {
+    background: var(--surface-alt);
+  }
+  .theme-icon {
+    display: inline-flex;
+    font-size: 16px;
+  }
+</style>

@@ -1,0 +1,218 @@
+---
+id: struct-layout
+title: Struct-Layout und Padding
+summary: Warum Felder ausgerichtet werden, wie die Runtime Structs und Klassen im Speicher anordnet und wie du das Layout steuerst, misst und für Interop richtig einsetzt.
+status: draft
+sources:
+  - title: 'StructLayoutAttribute (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.interopservices.structlayoutattribute
+  - title: 'Unsafe.SizeOf<T> (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.compilerservices.unsafe.sizeof
+  - title: 'Marshal.SizeOf (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.runtime.interopservices.marshal.sizeof
+  - title: 'ObjectLayoutInspector (Sergey Teplyakov, GitHub)'
+    url: https://github.com/SergeyTeplyakov/ObjectLayoutInspector
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './struct-layout.steps';
+import classScript from './struct-layout-class.steps';
+import explicitScript from './struct-layout-explicit.steps';
+
+<Block n={1} title="Das Problem">
+
+Der Prozessor liest Speicher nicht Byte für Byte, sondern in Blöcken. Liegt ein 8-Byte-Wert an einer Adresse, die durch 8 teilbar ist, passt er in einen einzigen Zugriff. Liegt er schief über einer Blockgrenze, braucht die CPU unter Umständen zwei Zugriffe und muss die Hälften zusammensetzen. Auf manchen Plattformen ist ein solcher Zugriff noch teurer, und atomare Operationen funktionieren nur auf korrekt ausgerichteten Werten.
+
+Deshalb gilt eine einfache Regel: Jeder Wert soll an einer Adresse liegen, die durch seine Größe teilbar ist, höchstens aber durch 8. Ein `int` an einer durch 4 teilbaren, ein `long` oder ein Verweis an einer durch 8 teilbaren Adresse. Das nennt man **Ausrichtung** (Alignment).
+
+Damit das klappt, fügt die Runtime zwischen Feldern ungenutzte Bytes ein, das **Padding**. Es kostet Speicher, spart aber Zeit. Und es hängt davon ab, in welcher Reihenfolge die Felder liegen. Genau hier hast du bei Structs Einfluss, bei Klassen übernimmt die Runtime.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+1. **Jedes Feld beginnt an einem Vielfachen seiner Ausrichtung.** Die Ausrichtung ist die Feldgröße, höchstens 8 Byte. Ein eingebettetes Struct hat die Ausrichtung seines größten Felds.
+2. **Die Gesamtgröße ist ein Vielfaches der größten Ausrichtung.** Nur so liegen in einem Array alle Elemente korrekt.
+3. **Structs verwenden standardmäßig `LayoutKind.Sequential`:** Die Felder bleiben in Deklarationsreihenfolge, Padding entsteht dazwischen.
+4. **Klassen verwenden standardmäßig `LayoutKind.Auto`:** Die Runtime ordnet die Felder selbst und minimiert das Padding.
+5. **Mit `LayoutKind.Explicit` bestimmst du jede Position selbst**, bis hin zu überlappenden Feldern.
+
+<Callout kind="hinweis">Alle Größen in dieser Lektion gelten für 64-Bit-Prozesse.</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Zwei Structs mit genau denselben Feldern, nur in anderer Reihenfolge. Rechne bei jedem Schritt mit: An welcher Adresse darf das nächste Feld beginnen?
+
+<StepPlayer script={script} />
+
+Die Rechnung ist immer dieselbe. Für `Ungünstig`: `A` bei 0, `B` braucht eine durch 8 teilbare Adresse, also 8, `C` bei 16, Gesamtgröße aufgerundet auf ein Vielfaches von 8, also 24. Für `Günstig`: `B` bei 0, `A` bei 8, `C` bei 9, Gesamtgröße 16. Faustregel: große Felder zuerst, kleine dahinter.
+
+</Block>
+
+<Block n={4} title="Klassen: die Runtime ordnet selbst">
+
+Bei Klassen fällt dieses Problem weg, weil sie standardmäßig `LayoutKind.Auto` verwenden. Die Runtime darf die Felder beliebig anordnen und tut das so, dass möglichst wenig Platz verloren geht.
+
+<StepPlayer script={classScript} />
+
+Der Preis: Du kannst dich bei Klassen nicht auf eine bestimmte Feldreihenfolge verlassen, und sie kann sich zwischen .NET-Versionen ändern. Für normalen Code spielt das keine Rolle, denn auf Felder greifst du über ihren Namen zu, nicht über ihre Position.
+
+### Structs mit Verweisen
+
+Auch bei Structs gilt `Sequential` nicht ganz uneingeschränkt. Enthält ein Struct Verweise, kann die Runtime je nach Version für das Layout im verwalteten Speicher davon abweichen. Verlässliche, feste Positionen bekommst du für Structs, die nur aus Werttypen bestehen, oder mit `LayoutKind.Explicit`.
+
+{/* TODO(verify): Whether CoreCLR ignores LayoutKind.Sequential for the managed layout of structs that contain GC references, and since which version. */}
+
+</Block>
+
+<Block n={5} title="Explizites Layout und Pack">
+
+Mit `[StructLayout(LayoutKind.Explicit)]` und `[FieldOffset(n)]` legst du die Position jedes Felds selbst fest. Das wird vor allem für Interop gebraucht, wenn ein Struct exakt einer C-Struktur entsprechen muss. Es erlaubt aber auch Felder, die sich denselben Speicher teilen.
+
+<StepPlayer script={explicitScript} />
+
+### Pack: Ausrichtung begrenzen
+
+Mit `[StructLayout(LayoutKind.Sequential, Pack = 1)]` begrenzt du die Ausrichtung auf ein Byte. Dann entfällt das Padding komplett, und die Felder liegen lückenlos hintereinander:
+
+```csharp
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+struct Packed { byte A; long B; byte C; }   // 10 Byte statt 24
+```
+
+Das spart Speicher, erkauft das aber mit schief liegenden Feldern. Sinnvoll ist es fast nur, um ein vorgegebenes Binärformat oder eine native Struktur exakt nachzubilden. Für normale Datenstrukturen ist es keine Optimierung, sondern eine Verlangsamung.
+
+{/* TODO(verify): Size of Packed with Pack = 1 (10 B) via Unsafe.SizeOf. */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Verwaltetes Layout ist nicht Interop-Layout
+
+`Unsafe.SizeOf<T>()` liefert die Größe im verwalteten Speicher. `Marshal.SizeOf<T>()` liefert die Größe, die ein Struct beim **Marshalling** an nativen Code hat. Die beiden können sich unterscheiden. Klassisches Beispiel ist `bool`: Im verwalteten Speicher belegt er 1 Byte, beim Marshalling standardmäßig 4 Byte, weil er dem Win32-Typ `BOOL` entspricht.
+
+```csharp
+struct Flags { public bool A; public int B; }
+
+Console.WriteLine(Unsafe.SizeOf<Flags>());   // verwaltet
+Console.WriteLine(Marshal.SizeOf<Flags>());  // für Interop
+```
+
+Wer Layouts für Interop prüft, muss also wissen, welche Größe gerade gemeint ist. Mehr dazu in der Lektion „Blittable Typen“.
+
+{/* TODO(verify): Expected output of the Flags example (8 and 8, or different) on x64. */}
+
+### Die Reihenfolge ändern bricht Binärformate
+
+Wer Structs direkt in Dateien oder über das Netzwerk schreibt, etwa mit `MemoryMarshal.Write`, macht das Layout zu einem Teil des Formats. Eine harmlose Umsortierung der Felder ändert dann die Bedeutung der Bytes. In solchen Fällen gehört ein explizites Layout dazu.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+| Situation                                               | Empfehlung                                                                                                    |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Struct mit Feldern unterschiedlicher Größe              | Felder nach Größe absteigend ordnen                                                                           |
+| Großes Array von Structs                                | Padding zählt pro Element, Reihenfolge lohnt sich besonders                                                   |
+| Klasse                                                  | Reihenfolge egal, die Runtime ordnet selbst                                                                   |
+| Interop mit nativer Struktur                            | `Sequential` oder `Explicit` passend zur C-Definition, mit `Marshal.SizeOf` prüfen                            |
+| Vorgegebenes Binärformat                                | `Explicit` oder `Pack`, bewusst und dokumentiert                                                              |
+| Felder, die von mehreren Threads oft geschrieben werden | auf getrennte Cache-Zeilen achten (False Sharing), siehe die Lektion „volatile, Barriers und Interlocked“ |
+
+Padding fällt vor allem bei Mengen ins Gewicht. Ein Struct, das statt 16 Byte 24 Byte belegt, kostet in einem Array mit zehn Millionen Elementen rund 80 MB zusätzlich, und die CPU muss entsprechend mehr Daten durch den Cache schieben.
+
+</Block>
+
+<Block n={8} title="Selbst nachweisen">
+
+Die schnellste Prüfung ist `Unsafe.SizeOf<T>()`. Für eine Darstellung Feld für Feld, auch für Klassen, eignet sich die Bibliothek ObjectLayoutInspector, die das Layout mit Offsets und Padding ausgibt.
+
+{/* TODO(verify): Expected output 24 and 16, and the ObjectLayoutInspector output for Mixed. */}
+
+<VerifyCard
+  sharplab="In SharpLab kannst du den Code mit „Run“ ausführen. Die Ausgabe zeigt die beiden Größen. Mit dem NuGet-Paket ObjectLayoutInspector zeigt TypeLayout.PrintLayout<T>() das komplette Layout inklusive Padding."
+  code={`using System.Runtime.CompilerServices;
+
+Console.WriteLine(Unsafe.SizeOf<Ungünstig>());
+Console.WriteLine(Unsafe.SizeOf<Günstig>());
+
+struct Ungünstig { byte A; long B; byte C; }
+struct Günstig { long B; byte A; byte C; }`}
+/>
+
+</Block>
+
+<Block n={9} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="struct-layout"
+  questions={[
+    {
+      q: 'Wie groß ist struct S { int A; byte B; } auf 64-Bit?',
+      options: ['5 Byte', '8 Byte', '16 Byte'],
+      correct: 1,
+      explanation:
+        'Die größte Ausrichtung ist 4. Nach B wird auf ein Vielfaches von 4 aufgefüllt: 4 + 1 + 3 = 8.',
+    },
+    {
+      q: 'Ordnet der C#-Compiler die Felder eines Structs automatisch platzsparend an?',
+      options: ['Ja', 'Nein'],
+      correct: 1,
+      explanation:
+        'Structs sind standardmäßig Sequential. Nur bei LayoutKind.Auto, dem Standard für Klassen, ordnet die Runtime um.',
+    },
+    {
+      q: 'Muss man bei Klassen auf die Feldreihenfolge achten, um Padding zu sparen?',
+      options: ['Ja', 'Nein, die Runtime ordnet selbst'],
+      correct: 1,
+      explanation:
+        'Klassen verwenden LayoutKind.Auto. Die Runtime legt Verweise zuerst und die übrigen Felder platzsparend ab.',
+    },
+    {
+      q: 'Was bewirkt Pack = 1?',
+      options: [
+        'Kein Padding, dafür schief liegende Felder',
+        'Schnellerer Zugriff auf alle Felder',
+      ],
+      correct: 0,
+      explanation:
+        'Es spart Platz, kostet aber Zugriffszeit. Gedacht ist es für vorgegebene Binärformate.',
+    },
+    {
+      q: 'Warum können Unsafe.SizeOf und Marshal.SizeOf unterschiedliche Werte liefern?',
+      options: [
+        'Das eine misst den verwalteten Speicher, das andere die Größe beim Marshalling',
+        'Marshal.SizeOf zählt den Object Header mit',
+      ],
+      correct: 0,
+      explanation:
+        'Beim Marshalling können Typen anders dargestellt werden, zum Beispiel bool mit 4 statt 1 Byte.',
+    },
+    {
+      q: 'Darf sich in einem Explicit-Struct ein Verweis mit einem int überlappen?',
+      options: ['Ja', 'Nein'],
+      correct: 1,
+      explanation:
+        'Der GC muss eindeutig wissen, wo Verweise liegen. Solche Typen lehnt die Runtime beim Laden ab.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={10} title="Das Wichtigste in Kürze">
+
+- Jedes Feld liegt an einem Vielfachen seiner Ausrichtung, die Gesamtgröße an einem Vielfachen der größten Ausrichtung.
+- Structs sind standardmäßig `Sequential`: Die Reihenfolge der Felder bestimmt das Padding. Große Felder zuerst.
+- Klassen sind standardmäßig `Auto`: Die Runtime ordnet selbst, Verweise zuerst.
+- `Explicit` legt jede Position fest und erlaubt Unions, aber keine Überlappung von Verweisen.
+- `Pack` entfernt Padding auf Kosten der Zugriffsgeschwindigkeit.
+- `Unsafe.SizeOf` misst das verwaltete Layout, `Marshal.SizeOf` das Layout für Interop.
+
+</Block>

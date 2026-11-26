@@ -1,0 +1,226 @@
+---
+id: objektheader
+title: Objekt-Header und Sync Block
+summary: Was in den ersten Bytes jedes Objekts steht, wie lock und GetHashCode sich diesen Platz teilen und warum ein Sync Block nur bei Bedarf entsteht.
+status: draft
+sources:
+  - title: 'syncblk.h im dotnet/runtime-Repo'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/syncblk.h
+  - title: 'object.h im dotnet/runtime-Repo'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/object.h
+  - title: 'Die lock-Anweisung (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/language-reference/statements/lock
+  - title: 'System.Threading.Lock (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.threading.lock
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './objektheader.steps';
+import contentionScript from './objektheader-contention.steps';
+
+<Block n={1} title="Das Problem">
+
+Die Runtime muss über jedes Objekt ein paar Dinge wissen, ohne nachzufragen. Vor allem seinen Typ: Davon hängen Casts, virtuelle Aufrufe und die Arbeit des Garbage Collectors ab. Diese Information steckt im MethodTable-Zeiger, den jedes Objekt trägt.
+
+Daneben gibt es Dinge, die nur **manche** Objekte brauchen, dann aber dringend. In .NET kann jedes Objekt mit `lock` als Sperre benutzt werden, eine Designentscheidung aus den Anfangstagen der Plattform. Jedes Objekt hat einen Hashcode, der sich nie ändern darf, auch wenn der GC das Objekt im Speicher verschiebt. Und manche Objekte arbeiten mit COM zusammen und brauchen dafür Verwaltungsdaten.
+
+Würde jedes Objekt Platz für all das mitbringen, wäre selbst ein leeres Objekt riesig. Die meisten Objekte werden aber nie gesperrt und nie gehasht. Die Runtime löst das mit einem kleinen Mehrzweckfeld vor jedem Objekt, dem **Object Header**, und lagert alles, was nicht hineinpasst, bei Bedarf in einen **Sync Block** aus.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+1. **Jedes Objekt beginnt mit zwei Verwaltungsfeldern:** dem Object Header (auf 64-Bit 8 Byte) und dem MethodTable-Zeiger. Ein Verweis auf das Objekt zeigt auf den MethodTable-Zeiger, der Header liegt direkt davor.
+2. **Der Header ist ein Mehrzweckfeld.** Er kann den Besitzer einer einfachen Sperre enthalten (Thin Lock) oder den Hashcode des Objekts, aber nicht beides zugleich.
+3. **Reicht der Header nicht, entsteht ein Sync Block.** Er liegt außerhalb des Objekts in einer Tabelle der Runtime, und der Header enthält nur noch dessen Index.
+4. **Sync Blocks entstehen nur bei Bedarf** und werden wiederverwendet, wenn ihr Objekt stirbt.
+
+<Callout kind="fehlannahme">
+  „Jedes Objekt hat einen Sync Block.“ Die allermeisten Objekte bekommen nie einen. Sie kommen mit
+  ihren 8 Byte Header aus, oft sogar mit einem leeren.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel sperrt ein Objekt, holt dann seinen Hashcode und sperrt es erneut. Beobachte, was im Header steht, und an welcher Stelle er nicht mehr ausreicht.
+
+<StepPlayer script={script} />
+
+Die Visualisierung zeigt den Header als Ganzes. In Wirklichkeit ist er in Bitfelder unterteilt: Einige Bits sagen, wie der Rest zu lesen ist, als Thin Lock, als Hashcode oder als Sync-Block-Index. Die genaue Aufteilung ist ein Implementierungsdetail und kann sich zwischen Versionen ändern.
+
+{/* TODO(verify): Bit layout of the object header (BIT_SBLK_* constants in syncblk.h) for the current runtime. */}
+
+</Block>
+
+<Block n={4} title="Wie lock wirklich arbeitet">
+
+`lock (o) { … }` ist in C# eine Kurzform für `Monitor.Enter(o)` und `Monitor.Exit(o)` in einem `try`/`finally`. Der Monitor arbeitet in Stufen, damit der häufigste Fall billig bleibt:
+
+- **Unumkämpft:** Die Sperre ist frei. Der Thread schreibt mit einer einzigen atomaren Operation seine ID in den Header. Verlässt er den `lock`, löscht er sie wieder. Kein Betriebssystemaufruf, keine zusätzliche Struktur.
+- **Rekursiv:** Betritt derselbe Thread die Sperre erneut, zählt der Header die Tiefe mit. Monitor-Sperren sind in .NET wiedereintrittsfähig.
+- **Umkämpft:** Hält ein anderer Thread die Sperre, wartet der Neue zunächst kurz aktiv. Dauert es länger, braucht er eine Möglichkeit zu schlafen und geweckt zu werden. Dafür wird die Sperre in einen Sync Block überführt.
+
+<StepPlayer script={contentionScript} />
+
+Auch `Monitor.Wait` und `Monitor.Pulse` brauchen einen Sync Block, denn sie verwalten eine Warteschlange von Threads, die auf ein Signal warten.
+
+</Block>
+
+<Block n={5} title="Der Hashcode im Detail">
+
+Wenn eine Klasse `GetHashCode` nicht überschreibt, liefert `object.GetHashCode` einen Hashcode, der an die **Identität** des Objekts gebunden ist: Zwei verschiedene Objekte haben in der Regel verschiedene Hashcodes, und ein Objekt behält seinen Hashcode, solange es lebt.
+
+Naheliegend wäre, einfach die Adresse des Objekts zu nehmen. Das geht aber nicht, denn der GC verschiebt Objekte beim Kompaktieren. Ein aus der Adresse berechneter Hashcode würde sich ändern, und ein `Dictionary` fände das Objekt danach nicht mehr. Die Runtime erzeugt den Hashcode deshalb beim ersten Aufruf unabhängig von der Adresse und **merkt ihn sich im Header**. Bei jedem weiteren Aufruf wird er nur gelesen.
+
+Dasselbe liefert `RuntimeHelpers.GetHashCode(obj)`, auch für Klassen, die `GetHashCode` überschrieben haben. Das ist nützlich, wenn du Objekte nach Identität statt nach Inhalt in einem `Dictionary` ablegen willst, zusammen mit `ReferenceEqualityComparer`.
+
+{/* TODO(verify): How the identity hash is generated (per-thread pseudo random sequence) in the current runtime. */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Sperren auf Werttypen
+
+```csharp
+int counter = 0;
+lock (counter) { }        // Compilerfehler CS0185
+
+object boxed = counter;   // jedes Boxing erzeugt ein neues Objekt
+```
+
+Ein Werttyp hat keinen Header, also kann er nicht gesperrt werden. Der Compiler verbietet es. Gefährlich wird es, wenn ein Werttyp unbemerkt geboxt wird, etwa über einen Parameter vom Typ `object`: Jeder Aufruf sperrt dann eine neue Box, und zwei Threads sperren nie dasselbe Objekt. Die Sperre schützt nichts.
+
+### Öffentlich erreichbare Sperrobjekte
+
+`lock (this)`, `lock (typeof(MyClass))` oder `lock ("name")` sperren Objekte, die auch fremder Code erreichen kann. String-Literale sind sogar im ganzen Prozess dasselbe Objekt, weil sie interniert werden. Fremder Code kann dann dieselbe Sperre nehmen und im schlimmsten Fall einen Deadlock auslösen. Die Empfehlung ist ein privates Feld, das nur zum Sperren da ist.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+| Sperrobjekt                              | Bewertung            | Warum                                                        |
+| ---------------------------------------- | -------------------- | ------------------------------------------------------------ |
+| `private readonly object _gate = new();` | gut                  | nur der eigene Code kennt es                                 |
+| `private readonly Lock _gate = new();`   | sehr gut (ab .NET 9) | eigener Typ, eigene Implementierung                          |
+| `lock (this)`                            | vermeiden            | auch Aufrufer können das Objekt sperren                      |
+| `lock (typeof(X))`                       | vermeiden            | Typobjekte sind global erreichbar                            |
+| `lock ("text")`                          | vermeiden            | internierte Strings sind prozessweit dasselbe Objekt         |
+| `lock (wert)` mit Werttyp                | Fehler               | kein Header, Boxing würde jedes Mal ein neues Objekt sperren |
+
+Für den Speicherbedarf spielt der Header in der Praxis selten eine Rolle, er ist bei jedem Objekt gleich. Er erklärt aber, warum selbst kleine Objekte nie kleiner als ein paar Dutzend Byte sind und warum viele winzige Objekte teurer sind als wenige große.
+
+</Block>
+
+<Block n={8} title="Was die Runtime dazu tut">
+
+<Callout kind="version">
+  Seit .NET 9 gibt es den Typ `System.Threading.Lock`. Ein `lock` auf ein Objekt dieses Typs
+  verwendet nicht Monitor und den Object Header, sondern die eigene Implementierung von `Lock`. Der
+  C#-Compiler erkennt den Typ und ruft automatisch `EnterScope` auf.
+</Callout>
+
+`Lock` ist ausdrücklich nur zum Sperren gedacht. Weil er seinen Zustand selbst verwaltet, muss nie ein Sync Block angelegt werden, und Hashcode und Sperre kommen sich nicht in die Quere. Für neuen Code ab .NET 9 ist er die naheliegende Wahl.
+
+{/* TODO(verify): Compiler behaviour for lock on System.Threading.Lock (C# 13) and performance relative to Monitor. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Den Speicherbedarf eines leeren Objekts zeigt der MemoryDiagnoser. Den Header selbst kannst du mit einem Debugger und der SOS-Erweiterung ansehen: `!dumpobj` zeigt ein Objekt, `!syncblk` listet die vorhandenen Sync Blocks. Lass dafür ein kleines Programm laufen, das ein Objekt gleichzeitig sperrt und hasht, und halte es im `lock` an.
+
+{/* TODO(verify): Expected allocation for new object() on x64 (24 B) and SOS output for !syncblk with one entry. */}
+
+<VerifyCard
+  sharplab="Mit einem Debugger und SOS: Programm im lock anhalten, dann !syncblk ausführen. Ohne vorherigen GetHashCode-Aufruf erscheint das Objekt nicht in der Liste, weil ein Thin Lock genügt."
+  code={`var gate = new object();
+_ = gate.GetHashCode();     // Hashcode belegt den Header
+lock (gate)                 // Sperre braucht jetzt einen Sync Block
+{
+    System.Diagnostics.Debugger.Break();
+}`}
+  benchmark={`[MemoryDiagnoser]
+public class HeaderBench
+{
+    readonly object _gate = new();
+    int _value;
+
+    [Benchmark] public object NewObject() => new object();
+
+    [Benchmark]
+    public void Uncontended()
+    {
+        lock (_gate) { _value++; }
+    }
+}`}
+expected={[
+{ method: 'NewObject', allocated: '24 B' },
+{ method: 'Uncontended', allocated: '-' },
+]}
+note="Werte für 64-Bit-Prozesse. Ein unumkämpfter lock alloziert nichts."
+/>
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="objektheader"
+  questions={[
+    {
+      q: 'Bekommt jedes Objekt einen Sync Block?',
+      options: ['Ja, bei der Erzeugung', 'Nein, nur bei Bedarf'],
+      correct: 1,
+      explanation:
+        'Er entsteht erst, wenn der Header nicht mehr ausreicht, etwa für Sperre und Hashcode zugleich oder für Warten.',
+    },
+    {
+      q: 'Worauf zeigt ein Verweis auf ein Objekt?',
+      options: ['Auf den Header', 'Auf den MethodTable-Zeiger'],
+      correct: 1,
+      explanation: 'Der Header liegt direkt vor der Adresse, auf die der Verweis zeigt.',
+    },
+    {
+      q: 'Warum ist der Standard-Hashcode nicht einfach die Adresse des Objekts?',
+      options: ['Adressen sind zu groß', 'Der GC verschiebt Objekte, die Adresse ändert sich'],
+      correct: 1,
+      explanation:
+        'Ein Hashcode darf sich nie ändern. Deshalb wird er einmal erzeugt und im Header gespeichert.',
+    },
+    {
+      q: 'Was kostet ein unumkämpfter lock im Wesentlichen?',
+      options: ['Einen Wechsel in den Betriebssystemkern', 'Eine atomare Operation auf dem Header'],
+      correct: 1,
+      explanation: 'Erst bei Konkurrenz wird gewartet und ein Sync Block angelegt.',
+    },
+    {
+      q: 'Warum ist lock ("name") eine schlechte Idee?',
+      options: [
+        'Strings können nicht gesperrt werden',
+        'Internierte Strings sind im ganzen Prozess dasselbe Objekt',
+      ],
+      correct: 1,
+      explanation:
+        'Fremder Code kann dasselbe Literal sperren. Besser ist ein privates Sperrobjekt.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Jedes Objekt trägt einen Object Header (8 Byte auf 64-Bit) und einen MethodTable-Zeiger. Verweise zeigen auf den MethodTable-Zeiger.
+- Der Header speichert bei Bedarf einen Thin Lock oder den Hashcode, aber nicht beides.
+- Reicht er nicht, entsteht ein Sync Block, und der Header enthält nur dessen Index.
+- Unumkämpfte Sperren sind billig. Erst Konkurrenz, `Wait` und `Pulse` brauchen einen Sync Block.
+- Der Standard-Hashcode ist an die Identität gebunden und wird im Header gemerkt, weil Adressen sich ändern.
+- Sperre auf private Objekte, nie auf Werttypen, Strings oder öffentlich erreichbare Objekte. Ab .NET 9 bietet sich `System.Threading.Lock` an.
+
+</Block>

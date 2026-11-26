@@ -1,0 +1,333 @@
+---
+id: state-machine
+title: Die async State Machine
+summary: Was der Compiler aus async und await macht, warum während eines await kein Thread wartet und wann die State Machine überhaupt auf dem Heap landet.
+status: draft
+sources:
+  - title: 'How Async/Await Really Works in C# (Stephen Toub, .NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/how-async-await-really-works/
+  - title: 'Asynchrone Programmierung mit async und await (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/asynchronous-programming/
+  - title: 'Task asynchronous programming model (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/asynchronous-programming/task-asynchronous-programming-model
+  - title: 'Async/Await: Best Practices in Asynchronous Programming (Stephen Cleary, MSDN Magazine)'
+    url: https://learn.microsoft.com/en-us/archive/msdn-magazine/2013/march/async-await-best-practices-in-asynchronous-programming
+  - title: 'Understanding the Whys, Whats, and Whens of ValueTask (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/understanding-the-whys-whats-and-whens-of-valuetask/
+  - title: 'AsyncTaskMethodBuilderT.cs (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Runtime/CompilerServices/AsyncTaskMethodBuilderT.cs
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './state-machine.steps';
+import boxScript from './state-machine-box.steps';
+import parallelScript from './state-machine-parallel.steps';
+import { sharplabCode, benchmarkCode } from './state-machine-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein großer Teil der Zeit, die ein Programm „arbeitet“, ist in Wahrheit Warten: auf die Datenbank, auf eine HTTP-Antwort, auf die Festplatte. Schreibst du solchen Code synchron, etwa mit `stream.Read(...)`, sitzt der Thread während der ganzen Wartezeit untätig da. Er rechnet nichts, ist aber trotzdem belegt.
+
+Bei einem einzelnen Aufruf ist das egal. Bei einem Server mit tausend gleichzeitigen Anfragen bedeutet es tausend blockierte Threads. Jeder Thread kostet Speicher für seinen Stack und Verwaltungsaufwand im Betriebssystem, und der ThreadPool erzeugt neue Threads nur zögerlich. Das Ergebnis: Der Server ist ausgelastet, obwohl die CPU sich langweilt. In einer UI-Anwendung ist es noch direkter: Blockiert der UI-Thread, friert das Fenster ein.
+
+Die Alternative ist seit Langem bekannt: Man startet die Operation, gibt ihr eine **Fortsetzung** (Callback) mit, die sie bei Abschluss aufruft, und gibt den Thread sofort zurück. Das Betriebssystem meldet das Ende einer I/O-Operation ohnehin von sich aus, dafür muss kein Thread warten. Das Problem ist der Code: Schon zwei Operationen hintereinander werden zu verschachtelten Callbacks. Schleifen, `try`/`catch`, `using` und lokale Variablen über mehrere Schritte hinweg muss man von Hand nachbauen. Das ist mühsam und fehleranfällig.
+
+`async` und `await` lösen diesen Zielkonflikt: Du schreibst Code, der aussieht wie sequenzieller, blockierender Code, und der Compiler macht daraus Code im Callback-Stil, der den Thread während des Wartens freigibt.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir diese Sätze, dann erklärt sich der Rest der Lektion fast von selbst:
+
+1. **async ist vor allem ein Compiler-Feature.** Der Compiler schreibt deine Methode in eine **State Machine** um. Für die Runtime ist das am Ende gewöhnlicher Code mit gewöhnlichen Methodenaufrufen.
+2. **Jedes await ist eine mögliche Unterbrechungsstelle.** Der Compiler zerlegt die Methode dort in Abschnitte. Ein Feld `state` merkt sich, an welcher Stelle es weitergeht, lokale Variablen, die ein `await` überleben müssen, werden zu Feldern.
+3. **Bis zum ersten echten Warten läuft alles synchron** auf dem Thread des Aufrufers.
+4. **await gibt den Thread nur zurück, wenn der Task noch nicht fertig ist.** Dann registriert sich die State Machine als Fortsetzung und kehrt zurück. Ist der Task schon fertig, geht es ohne Unterbrechung weiter.
+5. **Die Fortsetzung ist dasselbe MoveNext noch einmal.** Wenn der Task fertig wird, ruft er `MoveNext` erneut auf, das anhand von `state` an die richtige Stelle springt, oft auf einem anderen Thread.
+
+Damit `await` mit einem Ausdruck funktioniert, muss er das **Awaiter-Muster** erfüllen. Es ist ein reines Namensmuster, kein Interface, das man implementieren müsste:
+
+- `GetAwaiter()` liefert einen Awaiter (als Instanz- oder Erweiterungsmethode).
+- `IsCompleted` sagt, ob das Ergebnis schon da ist.
+- `OnCompleted(Action)` registriert eine Fortsetzung (Interface `INotifyCompletion`). Optional gibt es `UnsafeOnCompleted` aus `ICriticalNotifyCompletion`, das den ExecutionContext nicht selbst weiterreicht, weil der Builder sich darum kümmert.
+- `GetResult()` liefert das Ergebnis oder wirft die gespeicherte Exception.
+
+`Task`, `Task<T>`, `ValueTask` und `Task.Yield()` erfüllen dieses Muster jeweils mit eigenen Awaiter-Typen. Wie Builder und Awaiter im Detail zusammenspielen, vertieft die Lektion „AsyncMethodBuilder und Awaiter“.
+
+<Callout kind="fehlannahme">
+  „await blockiert den Thread, bis das Ergebnis da ist.“ Genau das tut es nicht. Ein noch nicht
+  fertiger Task führt dazu, dass die Methode zurückkehrt und der Thread frei wird. Blockieren würden
+  `.Result`, `.Wait()` oder `GetAwaiter().GetResult()`.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ist eine async-`Main` mit genau einem `await`. Achte darauf, wo `MoveNext` zurückkehrt, auf welcher Spur der Code nach dem `await` läuft und dass auf der Timer-Spur kein Thread wartet.
+
+<StepPlayer script={script} />
+
+Im Tab „Gelowert“ siehst du eine stark vereinfachte Fassung von `MoveNext`. Das Muster ist immer gleich: `GetAwaiter()`, Prüfung auf `IsCompleted`, bei `false` Zustand sichern, Fortsetzung registrieren und `return`. Beim erneuten Aufruf führt `state == 0` in den `else`-Zweig, der den Awaiter zurückholt, und beide Wege treffen sich bei `GetResult()`. Der `catch`-Block um alles herum ist der Grund, warum Exceptions im Task landen statt beim Aufrufer.
+
+{/* TODO(verify): State values -1 (running or not started), 0..n (suspended at await n), -2 (completed) as emitted by Roslyn. */}
+
+</Block>
+
+<Block n={4} title="Was der Compiler erzeugt">
+
+Aus einer async-Methode werden zwei Dinge: ein neuer Typ für die State Machine und eine stark geschrumpfte Methode mit dem ursprünglichen Namen, der **Kickoff**.
+
+### Die State Machine
+
+Der generierte Typ implementiert `IAsyncStateMachine` und enthält:
+
+- das Feld `state` (im echten Code `<>1__state`), das die aktuelle Position kodiert,
+- einen **Builder**, bei `Task<int>` etwa `AsyncTaskMethodBuilder<int>`. Er erzeugt den zurückgegebenen Task, setzt Ergebnis oder Exception und verwaltet das Warten,
+- Felder für die Parameter und für jede lokale Variable, die über ein `await` hinweg leben muss (im Debug-Build werden alle lokalen Variablen zu Feldern),
+- je ein Feld pro Awaiter-Typ, damit der Awaiter die Unterbrechung übersteht,
+- die Methode `MoveNext`, die den eigentlichen Methodenrumpf enthält.
+
+{/* TODO(verify): Field naming (<>1__state, <>t__builder, <>u__1, <name>5__N) and that Debug builds hoist all locals while Release hoists only those that live across an await. */}
+
+### Der Kickoff
+
+Die Methode mit dem ursprünglichen Namen enthält keinen deiner Befehle mehr. Sie legt die State Machine an, kopiert die Argumente hinein, setzt `state = -1`, ruft `builder.Start(ref sm)` und gibt `builder.Task` zurück:
+
+```csharp
+// stark vereinfacht
+static Task<int> SumAsync(Task<int> fast, Task<int> slow)
+{
+    var sm = new SumAsyncStateMachine();
+    sm.builder = AsyncTaskMethodBuilder<int>.Create();
+    sm.fast = fast; sm.slow = slow;
+    sm.state = -1;
+    sm.builder.Start(ref sm);   // ruft sm.MoveNext() synchron auf
+    return sm.builder.Task;
+}
+```
+
+`Start` ruft `MoveNext` sofort auf dem aktuellen Thread auf. Deshalb läuft eine async-Methode bis zum ersten echten Warten synchron, und deshalb kann ein aufwendiger Abschnitt vor dem ersten `await` den Aufrufer genauso lange aufhalten wie eine normale Methode.
+
+### Der synchrone Fast Path
+
+Die Prüfung auf `IsCompleted` ist kein Detail, sondern eine wichtige Optimierung. Ist der erwartete Task schon fertig, etwa weil ein Wert aus einem Cache kam oder ein Puffer noch Daten hatte, ruft `MoveNext` einfach `GetResult()` auf und läuft im selben Aufruf weiter. Es wird keine Fortsetzung registriert, es gibt keinen Threadwechsel und keinen Umweg über den ThreadPool.
+
+Läuft eine async-Methode auf diese Weise komplett durch, ohne je zu warten, ist sie beim Rückkehren des Kickoffs bereits fertig, und der Aufrufer erhält einen abgeschlossenen Task. Für viele I/O-APIs ist genau das der häufige Fall: Ein `ReadAsync` auf einem gepufferten Stream muss oft gar nicht warten.
+
+</Block>
+
+<Block n={5} title="Vom Stack auf den Heap">
+
+Wenn eine Methode an einem `await` unterbrochen wird, kehrt `MoveNext` zurück, danach auch der Kickoff. Ihre Stack-Frames verschwinden. Der Zustand, also `state`, die gehobenen Variablen und der Awaiter, muss aber weiterleben, bis die Fortsetzung läuft. Er braucht also einen Platz auf dem Heap.
+
+Im **Release-Build** erzeugt der C#-Compiler die State Machine als **Struct**. Der Kickoff legt sie als lokale Variable auf seinem eigenen Stack an. Solange kein `await` tatsächlich warten muss, bleibt sie dort, und es entsteht nichts auf dem Heap. Erst beim ersten echten Unterbrechen kopiert der Builder in `AwaitUnsafeOnCompleted` das Struct in ein Box-Objekt auf dem Heap. Ab dann läuft jedes weitere `MoveNext` auf dieser Box.
+
+Im **Debug-Build** ist die State Machine dagegen eine **Klasse**, also ein Heap-Objekt von Anfang an. Das erleichtert das Debuggen, kostet aber eine Allokation pro Aufruf, auch wenn nie gewartet wird. Miss Allokationen deshalb immer im Release-Build.
+
+{/* TODO(verify): Reason for class in Debug builds (debugging, Edit and Continue) per Roslyn/Toub. */}
+
+Das folgende Beispiel zeigt beides in einem Ablauf: Das erste `await` nimmt den Fast Path, das zweite muss warten und löst den Umzug auf den Heap aus.
+
+<StepPlayer script={boxScript} />
+
+Bemerkenswert ist Schritt 4: Die Box ist zugleich der Task, den der Aufrufer bekommt. Seit .NET Core 3.0 leitet der Box-Typ der Runtime (`AsyncStateMachineBox<TStateMachine>`) von `Task<TResult>` ab, sodass Task und State Machine zusammen ein einziges Objekt sind. In älteren Versionen waren es mehrere Objekte.
+
+{/* TODO(verify): AsyncStateMachineBox<TStateMachine> derives from Task<TResult> since .NET Core 3.0, and the older .NET Framework implementation allocated several objects (Task, box, MoveNextRunner, delegate). */}
+
+Das erklärt auch, warum Werte, die du als lokale Variablen hältst, nach einem `await` noch da sind: Sie sind in Wahrheit Felder dieser Box. Ein Debugger zeigt sie dir nur so an, als wären es lokale Variablen.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### async macht nichts parallel
+
+Ein `await` wartet, bis die Operation fertig ist, bevor der Code danach weiterläuft. Zwei `await` hintereinander bedeuten also zwei Wartezeiten hintereinander. Gleichzeitigkeit entsteht nur, wenn du mehrere Operationen startest, bevor du auf sie wartest.
+
+<StepPlayer script={parallelScript} />
+
+Auch rechenintensiver Code wird durch `async` nicht in einen anderen Thread verlagert. Eine async-Methode ohne echtes Warten läuft vollständig auf dem Thread des Aufrufers, der Compiler warnt in diesem Fall sogar, wenn gar kein `await` vorkommt. Wer CPU-Arbeit auslagern will, muss das ausdrücklich tun, etwa mit `Task.Run`.
+
+### async void
+
+Eine `async void`-Methode hat keinen Task, den der Aufrufer erwarten könnte. Der Compiler verwendet dafür einen eigenen Builder (`AsyncVoidMethodBuilder`). Wirft die Methode eine Exception, kann sie nirgends gespeichert werden. Sie wird auf dem SynchronizationContext ausgelöst, der beim Start aktiv war, oder, wenn es keinen gibt, auf dem ThreadPool. Dort ist sie unbehandelt und beendet den Prozess.
+
+```csharp
+async void Fire()            // schlecht: niemand kann das erwarten
+{
+    await Task.Delay(10);
+    throw new InvalidOperationException();
+}
+
+try { Fire(); }              // dieser catch fängt nichts
+catch (InvalidOperationException) { }
+```
+
+Das `try` umschließt nur den synchronen Teil bis zum ersten Warten. Die Exception fliegt später, wenn niemand mehr zuhört. `async void` ist nur für Event-Handler gedacht, deren Signatur `void` verlangt. Überall sonst gehört `async Task` hin.
+
+### Blockieren mit .Result oder .Wait()
+
+Wer auf einen Task mit `.Result`, `.Wait()` oder `GetAwaiter().GetResult()` wartet, macht den Vorteil zunichte: Der Thread blockiert genau so, wie es `await` vermeiden sollte. Mit einem SynchronizationContext (etwa in UI-Anwendungen) kann das sogar einen Deadlock auslösen, und auf Servern führt es zur Thread-Starvation. Die Lektion „Typische Deadlocks“ zeigt, warum.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Die Kosten einer async-Methode hängen fast nur davon ab, ob sie tatsächlich wartet:
+
+| Situation                                     | Kosten                                         | Warum                                                                 | Ausweg                                     |
+| --------------------------------------------- | ---------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------ |
+| `async Task`, endet ohne zu warten            | meist keine Allokation                         | Struct bleibt auf dem Stack, die Runtime liefert einen gecachten Task |                                            |
+| `async Task<T>`, endet ohne zu warten         | ein `Task<T>`, außer für wenige gecachte Werte | das Ergebnis muss in einem Task-Objekt stehen                         | `ValueTask<T>`                             |
+| async-Methode wartet mindestens einmal        | eine Box, die zugleich der Task ist            | der Zustand muss den Stack-Frame überleben                            | seltener warten, Fast Path ermöglichen     |
+| Debug-Build                                   | eine Allokation pro Aufruf                     | State Machine ist eine Klasse                                         | im Release-Build messen                    |
+| `async`-Wrapper, der nur `await` weiterreicht | zusätzliche State Machine                      | eine Ebene mehr                                                       | Task direkt zurückgeben, wenn nichts folgt |
+
+{/* TODO(verify): Cached completed tasks: non-generic Task, Task<bool>, default(T) and small Int32 values (range); allocation counts in each row with BenchmarkDotNet MemoryDiagnoser. */}
+
+Wo eine Methode sehr häufig synchron endet, kann `ValueTask<T>` die `Task<T>`-Allokation vermeiden, weil das Ergebnis dann direkt im Struct steht. Das hat Regeln (nur einmal erwarten, nicht gleichzeitig), die die Lektion „ValueTask und IValueTaskSource“ erklärt. Der Wrapper-Tipp aus der letzten Zeile hat einen Haken: Ohne `async` landet eine Exception, die vor dem Zurückgeben geworfen wird, nicht im Task, und die Methode taucht nicht im Stacktrace auf. Für die meisten Anwendungen ist der Unterschied unerheblich.
+
+### Exceptions wohnen im Task
+
+Weil der Compiler den gesamten Rumpf in `try`/`catch` legt, fängt die State Machine jede Exception ab und übergibt sie mit `builder.SetException` an den Task. Erst `await` holt sie über `GetResult()` wieder heraus und wirft sie erneut, mit dem ursprünglichen Stacktrace. `.Wait()` und `.Result` dagegen verpacken sie in eine `AggregateException`.
+
+Das gilt auch für Code vor dem ersten `await`. Eine Argumentprüfung in einer async-Methode wirft deshalb nicht beim Aufruf, sondern erst, wenn jemand den Task erwartet:
+
+```csharp
+async Task SaveAsync(string path)
+{
+    ArgumentNullException.ThrowIfNull(path);   // landet im Task
+    await File.WriteAllTextAsync(path, "...");
+}
+
+Task t = SaveAsync(null!);   // noch keine Exception
+await t;                     // erst hier: ArgumentNullException
+```
+
+Und wird ein fehlgeschlagener Task nie erwartet, bleibt die Exception unbemerkt. Den Prozess beendet sie in modernem .NET nicht, aber sie geht verloren. Auch deshalb sollte jeder Task irgendwo erwartet werden.
+
+{/* TODO(verify): Unobserved task exceptions do not crash the process since .NET Framework 4.5 (TaskScheduler.UnobservedTaskException). */}
+
+### Wo die Fortsetzung läuft
+
+Wer die Fortsetzung ausführt, entscheidet nicht die State Machine, sondern der Awaiter. Ein `await` auf einen Task merkt sich beim Unterbrechen den aktuellen SynchronizationContext (in UI-Anwendungen der UI-Thread) und schickt die Fortsetzung dorthin zurück. Gibt es keinen, läuft sie typischerweise auf einem ThreadPool-Thread oder direkt auf dem Thread, der den Task abschließt. Außerdem wird der ExecutionContext mitgenommen, damit etwa `AsyncLocal<T>`-Werte nach dem `await` noch stimmen. Das vertiefen die Lektionen „SynchronizationContext und TaskScheduler“, „ConfigureAwait“ und „ExecutionContext und AsyncLocal“.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Bisher war die Arbeitsteilung klar: Der C#-Compiler baut die State Machine, die Runtime sieht davon nur gewöhnliche Typen und Methodenaufrufe. Ihre Rolle beschränkt sich auf die Bibliothek: Builder, Box-Typ, Task-Caching und Threadpool. Diese Teile wurden über die Versionen stark optimiert, was die Kosten einer wartenden async-Methode deutlich gesenkt hat.
+
+Daneben arbeitet das .NET-Team an **Runtime Async**: Die Runtime versteht async-Methoden selbst, und der Compiler muss keine State Machine mehr erzeugen. Das Unterbrechen und Fortsetzen übernimmt dann die Runtime, was weniger Code und geringere Kosten verspricht. Die Lektion „Runtime Async“ behandelt das genauer.
+
+<Callout kind="version">
+  Runtime Async ist eine neue Entwicklung und war zunächst nur experimentell verfügbar. Ob und ab
+  welcher Version es standardmäßig aktiv ist, hängt von deiner .NET-Version und deinem Projekt ab.
+  Alles in dieser Lektion beschreibt die klassische, vom C#-Compiler erzeugte State Machine.
+</Callout>
+
+{/* TODO(verify): Runtime Async status: experimental in .NET 10 (opt-in), planned or default in .NET 11; how it is enabled. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Zwei Experimente: die generierte State Machine in SharpLab ansehen und die Allokationen von synchron endenden und wartenden Methoden mit BenchmarkDotNet messen.
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „C#“. Im Modus „Release“ siehst du ein struct mit IAsyncStateMachine, dem Feld <>1__state, dem Builder und einem Feld für den Awaiter. Schalte auf „Debug“ um: Aus dem struct wird eine class, und auch b wird zum Feld."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'Sync', allocated: 'keine' },
+    { method: 'SyncInt', allocated: 'ein Task<int>' },
+    { method: 'Yielding', allocated: 'eine Box (zugleich der Task)' },
+  ]}
+  note="Im Release-Build messen. Task.Yield liefert einen Awaiter, dessen IsCompleted immer false ist, und erzwingt damit eine echte Unterbrechung."
+/>
+
+{/* TODO(verify): Expected allocations and byte sizes for the three benchmarks on x64 and the .NET version used; that 1000 is outside the cached Int32 task range; that Yielding allocates nothing besides the box. */}
+
+Zum Vergleich der Threads genügt ein kleines Konsolenprogramm: Gib vor und nach `await Task.Delay(100)` die Thread-ID aus (`Environment.CurrentManagedThreadId`). In einer Konsolenanwendung ohne SynchronizationContext sind es typischerweise zwei verschiedene IDs. Ersetze `Task.Delay(100)` durch `Task.CompletedTask`, und beide IDs sind gleich: der Fast Path.
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="state-machine"
+  questions={[
+    {
+      q: 'Welcher Thread wartet während await Task.Delay(100)?',
+      options: ['Der aufrufende Thread', 'Ein ThreadPool-Thread', 'Keiner'],
+      correct: 2,
+      explanation:
+        'Es wartet nur ein Timer. Die State Machine ist zurückgekehrt, und ein Thread wird erst wieder für die Fortsetzung gebraucht.',
+    },
+    {
+      q: 'Eine async-Methode erwartet nur Tasks, die schon abgeschlossen sind. Was passiert?',
+      options: [
+        'Sie läuft komplett synchron durch, ohne Fortsetzung und ohne Threadwechsel',
+        'Jedes await gibt trotzdem den Thread ab und springt in den ThreadPool',
+      ],
+      correct: 0,
+      explanation:
+        'MoveNext prüft IsCompleted. Ist es true, ruft es GetResult auf und macht im selben Aufruf weiter. Das ist der synchrone Fast Path.',
+    },
+    {
+      q: 'Was ist die State Machine einer async-Methode im Release-Build?',
+      options: [
+        'Eine Klasse, die bei jedem Aufruf auf dem Heap angelegt wird',
+        'Ein Struct, das erst beim ersten echten Warten in eine Box auf dem Heap kopiert wird',
+      ],
+      correct: 1,
+      explanation:
+        'Im Release-Build ist sie ein Struct auf dem Stack des Kickoffs. Erst wenn ein await wirklich warten muss, kopiert der Builder sie auf den Heap. Eine Klasse ist sie im Debug-Build.',
+    },
+    {
+      q: 'Wie lange dauern zwei aufeinanderfolgende await Task.Delay(100)?',
+      options: ['Etwa 100 ms, weil async parallel ausführt', 'Etwa 200 ms'],
+      correct: 1,
+      explanation:
+        'Jedes await wartet, bevor der nächste Code startet. Gleichzeitig wird es erst, wenn du beide Tasks startest und dann gemeinsam erwartest, zum Beispiel mit Task.WhenAll.',
+    },
+    {
+      q: 'Eine async void-Methode wirft nach einem await eine Exception. Der Aufrufer hat ein try/catch um den Aufruf. Was passiert ohne SynchronizationContext?',
+      options: [
+        'Der catch-Block des Aufrufers fängt sie',
+        'Sie wird auf dem ThreadPool ausgelöst und beendet den Prozess',
+      ],
+      correct: 1,
+      explanation:
+        'Es gibt keinen Task, in dem sie gespeichert werden könnte. Das try umschließt nur den synchronen Teil, die Exception fliegt später unbehandelt.',
+    },
+    {
+      q: 'Eine async Task-Methode wirft vor ihrem ersten await eine ArgumentNullException. Wann bemerkt der Aufrufer sie?',
+      options: ['Sofort beim Aufruf', 'Erst beim await auf den zurückgegebenen Task'],
+      correct: 1,
+      explanation:
+        'Der gesamte Rumpf steckt in einem try/catch der State Machine. Die Exception wird per SetException im Task gespeichert und erst von await erneut geworfen.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- `async`/`await` ist ein Compiler-Feature: Die Methode wird zu einer **State Machine** mit Zustandsfeld, gehobenen Variablen, Builder und `MoveNext`. Der Kickoff ruft `MoveNext` sofort synchron auf.
+- `await` prüft `IsCompleted`. Ist der Task fertig, geht es **ohne Unterbrechung** weiter. Sonst registriert sich die State Machine als Fortsetzung und **gibt den Thread zurück**.
+- Während des Wartens auf I/O oder einen Timer **wartet kein Thread**. Die Fortsetzung ist ein erneuter Aufruf von `MoveNext`, oft auf einem anderen Thread.
+- Im Release-Build ist die State Machine ein **Struct** und landet erst beim ersten echten Warten in einer Box auf dem Heap, die zugleich der Task ist. Im Debug-Build ist sie eine Klasse.
+- `async` macht nichts parallel. Gleichzeitig wird es erst, wenn du mehrere Operationen startest, bevor du wartest.
+- Exceptions landen im Task und werden beim `await` erneut geworfen. `async void` hat keinen Task, seine Exceptions können den Prozess beenden.
+- Blockieren mit `.Result` oder `.Wait()` hebt den Nutzen auf und kann zu Deadlocks führen.
+
+</Block>

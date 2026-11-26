@@ -1,0 +1,82 @@
+---
+// Alert box as on documentation sites: Note (hinweis), Tip (tipp), Important (version),
+// Caution (fehlannahme) and Warning (warnung). Colours: tokens.css.
+import Icon from '@/components/Icon.astro';
+import type { IconName } from '@/lib/icons';
+
+type Kind = 'hinweis' | 'tipp' | 'fehlannahme' | 'version' | 'warnung';
+interface Props {
+  kind?: Kind;
+  title?: string;
+}
+const LABELS: Record<Kind, string> = {
+  hinweis: 'Hinweis',
+  tipp: 'Tipp',
+  fehlannahme: 'Häufige Fehlannahme',
+  version: 'Versionshinweis',
+  warnung: 'Warnung',
+};
+const ICONS: Record<Kind, IconName> = {
+  hinweis: 'note',
+  tipp: 'tip',
+  version: 'important',
+  fehlannahme: 'caution',
+  warnung: 'warning',
+};
+const { kind = 'hinweis', title } = Astro.props;
+---
+
+<aside class="alert" data-kind={kind} data-pagefind-ignore={kind === 'warnung' ? '' : undefined}>
+  <p class="alert-title">
+    <Icon name={ICONS[kind]} class="alert-icon" />
+    {title ?? LABELS[kind]}
+  </p>
+  <div class="alert-body">
+    <slot />
+  </div>
+</aside>
+
+<style>
+  .alert {
+    --c: var(--note);
+    --c-bg: var(--note-bg);
+    margin: 16px 0 0;
+    padding: 16px;
+    border: 1px solid var(--c);
+    border-radius: var(--radius-lg);
+    background: var(--c-bg);
+  }
+  .alert[data-kind='tipp'] {
+    --c: var(--tip);
+    --c-bg: var(--tip-bg);
+  }
+  .alert[data-kind='version'] {
+    --c: var(--important);
+    --c-bg: var(--important-bg);
+  }
+  .alert[data-kind='fehlannahme'] {
+    --c: var(--caution);
+    --c-bg: var(--caution-bg);
+  }
+  .alert[data-kind='warnung'] {
+    --c: var(--warning);
+    --c-bg: var(--warning-bg);
+  }
+  .alert-title {
+    margin: 0;
+    font-weight: 600;
+    color: var(--c);
+  }
+  .alert-title :global(.alert-icon) {
+    margin-right: 6px;
+  }
+  .alert-body {
+    margin-top: 16px;
+  }
+  .alert-body :global(p) {
+    margin: 16px 0 0;
+  }
+  .alert-body :global(p:first-child) {
+    margin-top: 0;
+  }
+</style>

@@ -1,0 +1,302 @@
+---
+id: bausteine
+title: Die Bausteine von .NET
+summary: Woraus „.NET“ auf deiner Maschine wirklich besteht, was SDK, Host, CoreCLR, JIT, GC und Klassenbibliothek jeweils tun, warum IL und Metadaten der Vertrag zwischen Compiler und Runtime sind und wo die Dateien liegen.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Book of the Runtime: Introduction to the Common Language Runtime'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/intro-to-clr.md
+  - title: 'Book of the Runtime: System.Private.CoreLib and calling into the runtime'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/corelib.md
+  - title: 'dotnet/runtime: Host components'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-components.md
+  - title: 'Verwalteter Code (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/managed-code
+  - title: 'Referenzassemblys (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/assembly/reference-assemblies
+  - title: 'Übersicht über die Veröffentlichung von .NET-Anwendungen (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/deploying/
+  - title: 'Überprüfen, ob .NET bereits installiert ist (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/install/how-to-detect-installed-versions
+  - title: 'Native AOT-Bereitstellung (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/deploying/native-aot/
+  - title: 'ECMA-335 (CLI-Standard)'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './bausteine.steps';
+import forwardScript from './bausteine-forward.steps';
+import deployScript from './bausteine-deploy.steps';
+import { whereCode } from './bausteine-verify';
+
+<Block n={1} title="Das Problem">
+
+„Ich habe .NET installiert“ ist ein Satz, der fast nichts sagt. Gemeint sein kann das SDK, mit dem du baust, eine Runtime, mit der du nur ausführst, ASP.NET Core dazu oder nicht, eine bestimmte Version oder mehrere nebeneinander. Spätestens wenn eine App auf dem Server mit „You must install or update .NET“ abbricht, obwohl `dotnet --version` doch eine Zahl ausgibt, merkst du: „.NET“ ist kein einzelnes Ding.
+
+Das hat einen guten Grund. Zwischen deinem C#-Quelltext und dem Maschinencode, den die CPU ausführt, liegen mehrere Schritte, und jeder davon ist eine eigene Aufgabe mit eigenen Anforderungen. Ein Compiler soll schnell bauen und präzise Fehler melden. Ein Programmstarter soll die richtige Runtime-Version finden. Eine Laufzeitumgebung soll Speicher verwalten, Typen laden und Code so übersetzen, dass er auf genau dieser CPU schnell läuft. Wer alles in ein Programm packt, kann keinen dieser Teile unabhängig aktualisieren.
+
+Der Zielkonflikt dahinter: **Teilen gegen Unabhängigkeit.** Viele Apps sollen sich eine installierte Runtime teilen können, damit nicht jede Anwendung 70 MB Bibliotheken mitschleppt und Sicherheitsupdates an einer Stelle landen. Gleichzeitig soll eine App nicht kaputtgehen, nur weil auf der Maschine eine andere Version installiert wird. .NET löst das mit klar getrennten Bausteinen und einem festen Vertrag zwischen ihnen.
+
+{/* TODO(verify): "70 MB" is a rough illustration for the size of a shared framework folder, measure shared/Microsoft.NETCore.App/<version>/ on one OS or drop the number. */}
+
+Diese Lektion zeigt die Bausteine einzeln: was sie tun, wie sie zusammenspielen und wo du sie auf der Platte findest. Sie ist die Landkarte für das ganze erste Kapitel.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen das Modell:
+
+1. **Das SDK baut, die Runtime führt aus.** Das SDK enthält Compiler, MSBuild und die `dotnet`-Befehle wie `build` und `publish`. Zum Ausführen einer fertigen App wird es nicht gebraucht.
+2. **IL und Metadaten sind der Vertrag.** Der Compiler erzeugt keine Maschinenbefehle, sondern eine Assembly mit IL (Intermediate Language) und Metadaten. Alles, was die Runtime über dein Programm weiß, steht dort.
+3. **Der Host bringt App und Runtime zusammen.** Eine kleine Kette nativer Programme und Bibliotheken findet die passende Runtime-Version, stellt die Liste aller Assemblies zusammen und startet die Runtime.
+4. **CoreCLR ist eine virtuelle Maschine mit Compiler.** Die VM lädt Typen, verwaltet den Heap mit dem GC und übersetzt jede Methode mit dem JIT in Maschinencode, bevor sie das erste Mal läuft.
+5. **Die Klassenbibliothek ist zweigeteilt.** `System.Private.CoreLib` ist fest mit der VM verwoben, der Rest der Base Class Library (BCL) besteht aus gewöhnlichen Assemblies, die auf CoreLib aufbauen.
+
+Ein Shared Framework wie `Microsoft.NETCore.App` ist dabei schlicht ein Ordner, in dem Runtime und Klassenbibliothek einer bestimmten Version zusammen liegen. `Microsoft.AspNetCore.App` ist ein weiteres Shared Framework, das auf `Microsoft.NETCore.App` aufsetzt.
+
+<Callout kind="fehlannahme">
+  „.NET ist ein einziges Programm, und dieses Programm heißt dotnet.“ Nein: `dotnet` ist nur der
+  Einstiegspunkt. Die eigentliche Arbeit erledigen Bibliotheken, die er in seinen eigenen Prozess
+  lädt: zuerst die Host-Bibliotheken, dann die Runtime `coreclr`, der JIT und die Assemblies der
+  Klassenbibliothek. Eine App kann sogar ganz ohne `dotnet` starten.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ist bewusst winzig. Verfolge, welcher Baustein in welchem Schritt arbeitet, und achte in Schritt 3 darauf, in welcher Assembly der Compiler `object` vermutet. Die letzte Ausgabezeile zeigt, wo der Typ zur Laufzeit tatsächlich herkommt.
+
+<StepPlayer script={script} />
+
+Im Tab „IL“ steht vor jedem Typ und jeder Methode in eckigen Klammern die Assembly, aus der sie stammen: `[System.Console]` für `Console.WriteLine`, `[System.Runtime]` für `object` und `Type`. Das ist der Kern des Vertrags. Die Assembly nennt Namen, keine Adressen, und überlässt es der Runtime, diese Namen beim Start aufzulösen. Wie IL selbst funktioniert, zeigt die Lektion „IL und der Evaluation Stack“.
+
+{/* TODO(verify): IL listing in bausteine.steps.ts against SharpLab (Release, classic Main). */}
+
+</Block>
+
+<Block n={4} title="IL und Metadaten als Vertrag">
+
+### Was in einer Assembly steht
+
+Eine Assembly ist eine Datei im PE-Format (Portable Executable), demselben Containerformat wie native Windows-Programme. Darin steckt aber kein Maschinencode für deine Methoden, sondern drei Dinge: **IL** für die Methodenrümpfe, **Metadaten**, die jeden Typ, jedes Feld, jede Methode und jeden Verweis auf andere Assemblies in Tabellen beschreiben, und ein **Manifest** mit Name und Version der Assembly selbst. Das Format ist im Standard ECMA-335 festgelegt. Wie die Datei im Detail aufgebaut ist, zeigt die Lektion „Aufbau einer Assembly“.
+
+Die Trennung hat praktische Folgen. Weil IL nicht an eine CPU gebunden ist, läuft dieselbe `App.dll` auf x64 und Arm64, unter Windows, Linux und macOS. Und weil die Metadaten vollständig sind, kann die Runtime ohne Headerdateien und ohne Quelltext alles ableiten, was sie braucht: Feldlayouts, Methodensignaturen, Vererbung. Auch Reflection liest nichts anderes als diese Tabellen.
+
+### Verwalteter und nativer Code
+
+**Verwalteter Code** ist laut Microsoft Code, dessen Ausführung von der Runtime verwaltet wird. Das heißt nicht, dass er interpretiert wird. Nach dem JIT ist auch verwalteter Code gewöhnlicher Maschinencode. Der Unterschied liegt darin, was die Runtime über ihn weiß: Zu jeder übersetzten Methode legt sie Informationen ab, wo gerade Objektverweise stehen, wie der Stack aufgebaut ist und welche Exception-Handler gelten. Nur deshalb kann der GC Objekte verschieben und Verweise anpassen, nur deshalb können Exceptions den Stack sicher abwickeln.
+
+**Nativer Code** ist alles, was ohne dieses Wissen läuft: die Runtime selbst (geschrieben in C++), der JIT, die Host-Bibliotheken und die Bibliotheken des Betriebssystems. Wenn verwalteter Code native Funktionen aufruft, etwa über P/Invoke, überschreitet er eine Grenze, an der die Runtime Buch führen muss. Wo diese Grenze in der Startkette verläuft, siehst du in der Lektion „Der Host: dotnet, hostfxr, hostpolicy“.
+
+</Block>
+
+<Block n={5} title="Die Runtime und ihre Bibliothek">
+
+### CoreCLR von innen
+
+CoreCLR ist die Runtime-Implementierung, die bei .NET auf Desktop und Server zum Einsatz kommt. Sie ist eine native Bibliothek (`coreclr.dll`, `libcoreclr.so` oder `libcoreclr.dylib`) und besteht aus mehreren großen Teilen:
+
+- **Die VM** (im Quellcode der Ordner `vm`): Sie lädt Assemblies, baut aus Metadaten die internen Typstrukturen wie MethodTable und EEClass, verwaltet Threads, Exceptions und den Übergang zu nativem Code (Interop). Wie das Typladen abläuft, zeigt „Wie ein Typ geladen wird“.
+- **Der JIT** RyuJIT: Er übersetzt IL einer Methode in Maschinencode. Er liegt als eigene Bibliothek (`clrjit`) neben der Runtime und spricht mit der VM über eine definierte Schnittstelle. Seine Phasen zeigt „Die Pipeline von RyuJIT“.
+- **Der GC**: Er reserviert und verwaltet den verwalteten Heap. Standardmäßig ist er in `coreclr` eingebaut, ist intern aber so abgegrenzt, dass er sich auch als eigene Bibliothek laden lässt.
+
+{/* TODO(verify): Native file names per OS, and that a standalone GC library (libclrgc) ships in shared/Microsoft.NETCore.App since .NET 7 and can be selected via GCName. */}
+{/* TODO(verify): Source folders src/coreclr/vm, src/coreclr/jit, src/coreclr/gc in dotnet/runtime main. */}
+
+Dazu kommt ein zweiter Ausführungsweg, den das Modell oft vergisst: **ReadyToRun**. Die Assemblies des Shared Frameworks werden beim Bau von .NET schon vorab in Maschinencode übersetzt, der zusammen mit dem IL in der Datei liegt. Die Runtime kann diesen Code direkt verwenden und spart so beim Start viel JIT-Arbeit. Der JIT bleibt trotzdem nötig, für deinen eigenen Code und für Methoden, die später optimiert neu übersetzt werden. Mehr dazu in „ReadyToRun und Crossgen“ und „Tiered Compilation und OSR“.
+
+### System.Private.CoreLib und der Rest der BCL
+
+Nicht jede Assembly der Klassenbibliothek ist gleich. **`System.Private.CoreLib`** ist besonders: Sie definiert die Grundtypen, ohne die die VM nicht laufen kann, also `Object`, `String`, `Int32`, `Array`, `Exception`, `Thread` und viele mehr. Die VM kennt manche dieser Typen beim Namen und erwartet ein bestimmtes Feldlayout. Umgekehrt ruft CoreLib an vielen Stellen direkt in die VM, über spezielle Aufrufwege, die das Book of the Runtime FCalls und QCalls nennt. Deshalb gehören VM und CoreLib zusammen und werden immer gemeinsam gebaut und ausgeliefert.
+
+Alles andere, etwa `System.Collections.dll`, `System.Console.dll` oder `System.Net.Http.dll`, ist gewöhnlicher verwalteter Code, der auf CoreLib aufbaut. Diese Assemblies liegen im selben Framework-Ordner, haben aber keine Sonderstellung gegenüber der VM.
+
+### Warum du gegen System.Runtime kompilierst
+
+Wenn CoreLib so wichtig ist, warum steht im IL dann `[System.Runtime]System.Object`? Weil deine App gegen eine stabile öffentliche Oberfläche kompiliert werden soll, nicht gegen eine interne Implementierungsassembly, deren Aufteilung sich ändern darf. Der Compiler bekommt dafür **Referenzassemblies**: Dateien, die nur die öffentliche API beschreiben. Zur Laufzeit leitet `System.Runtime.dll` die Typen an ihren echten Ort weiter.
+
+<StepPlayer script={forwardScript} />
+
+Dieses Muster heißt Typweiterleitung (`TypeForwardedToAttribute`). Es erlaubt dem .NET-Team, Typen zwischen Implementierungsassemblies zu verschieben, ohne dass deine kompilierte App davon etwas merkt. Der Vertrag lautet „`System.Object` aus `System.Runtime`“, und dieser Vertrag bleibt gültig, egal wo die Definition gerade liegt.
+
+{/* TODO(verify): That the targeting pack folder is packs/Microsoft.NETCore.App.Ref/<version>/ref/net8.0/ in the dotnet root. */}
+
+</Block>
+
+<Block n={6} title="Wo die Dateien liegen">
+
+Eine typische .NET-Installation ist ein einzelner Ordner, die **dotnet-Wurzel**. Unter Windows ist das standardmäßig `C:\Program Files\dotnet`, unter macOS `/usr/local/share/dotnet`, unter Linux hängt es von der Installationsart ab. Darin findest du:
+
+{/* TODO(verify): Default install locations per OS (Linux distro packages often use /usr/lib/dotnet, Microsoft packages /usr/share/dotnet). */}
+
+| Ordner | Inhalt | Gebraucht für |
+| --- | --- | --- |
+| `dotnet` (Datei) | der Muxer, ein natives Programm | Start von Apps und SDK-Befehlen |
+| `host/fxr/<Version>/` | `hostfxr`, die erste Host-Bibliothek | Version wählen, SDK finden |
+| `shared/Microsoft.NETCore.App/<Version>/` | `hostpolicy`, `coreclr`, `clrjit`, CoreLib und die BCL | jede App |
+| `shared/Microsoft.AspNetCore.App/<Version>/` | die ASP.NET-Core-Bibliotheken | Web-Apps |
+| `sdk/<Version>/` | Compiler, MSBuild, die SDK-Befehle | nur zum Bauen |
+| `packs/` | Referenzassemblies, App-Starter-Vorlagen | nur zum Bauen |
+
+Mehrere Versionen liegen einfach nebeneinander in eigenen Unterordnern. Eine Installation von .NET 9 überschreibt .NET 8 also nicht, sondern legt `shared/Microsoft.NETCore.App/9.0.0/` neben den vorhandenen Ordner. Welche Version eine App bekommt, entscheidet der Host bei jedem Start neu. Wie genau, steht in der Lektion „Der Host: dotnet, hostfxr, hostpolicy“.
+
+Zwei Befehle zeigen dir, was installiert ist:
+
+```bash
+dotnet --list-sdks
+dotnet --list-runtimes
+```
+
+Die zweite Ausgabe hat pro Zeile das Format „Name, Version, Ordner“:
+
+```text
+Microsoft.AspNetCore.App 8.0.11 [/usr/local/share/dotnet/shared/Microsoft.AspNetCore.App]
+Microsoft.NETCore.App 8.0.11 [/usr/local/share/dotnet/shared/Microsoft.NETCore.App]
+Microsoft.NETCore.App 9.0.0 [/usr/local/share/dotnet/shared/Microsoft.NETCore.App]
+```
+
+{/* TODO(verify): Exact output format of dotnet --list-runtimes; versions are examples. */}
+
+`dotnet --info` fasst alles zusammen: die Version des Hosts, alle SDKs und Runtimes, die Architektur und die Umgebungsvariablen, die den Start beeinflussen. SDK und Runtime haben übrigens getrennte Versionsnummern. Ein SDK der Reihe 8.0.4xx bringt eine Runtime 8.0.x mit, die Patchnummern stimmen aber nicht überein.
+
+{/* TODO(verify): SDK feature band numbering (8.0.1xx, 8.0.2xx, ...) and that SDK and runtime patch numbers differ, e.g. SDK 8.0.404 ships runtime 8.0.11. */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Self-contained ist nicht vorkompiliert
+
+Beim Veröffentlichen hast du die Wahl, wo die Bausteine herkommen. **Framework-abhängig** nutzt die installierte Runtime der Maschine. **Self-contained** kopiert Host, Runtime und die gesamte BCL in den App-Ordner. Viele verwechseln das mit **Native AOT**, das ein grundsätzlich anderes Ausführungsmodell ist.
+
+<StepPlayer script={deployScript} />
+
+Die Verwechslung hat Folgen. Wer self-contained veröffentlicht, um Startzeit zu sparen, wird enttäuscht: Es läuft derselbe JIT wie vorher. Und wer Native AOT wählt, um „einfach keine Installation zu brauchen“, bezahlt mit Einschränkungen, die self-contained nicht hat: kein Laden beliebiger Assemblies zur Laufzeit, kein Erzeugen von Code zur Laufzeit, Vorsicht bei Reflection. Die Lektion „Native AOT“ geht darauf ein.
+
+### Das SDK ist nicht die Runtime
+
+`dotnet --version` gibt die Version des **SDK** aus, nicht die einer Runtime. Auf einem Build-Server mit SDK ist immer auch eine passende Runtime dabei, weil das SDK selbst eine braucht. Auf einem Produktionsserver ist oft nur eine Runtime installiert, dann gibt `dotnet --version` womöglich nur eine Fehlermeldung aus, obwohl Apps problemlos laufen. Umgekehrt beweist eine SDK-Version nicht, dass `Microsoft.AspNetCore.App` in der benötigten Version vorhanden ist. Verlässlich ist nur `dotnet --list-runtimes`.
+
+{/* TODO(verify): Behaviour of dotnet --version on a machine with only a runtime installed (error message that no SDK was found). */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Situation | Was dahintersteckt | Was du tust |
+| --- | --- | --- |
+| App startet nicht, Meldung verlangt eine Framework-Version | Host findet keine passende Version von `Microsoft.NETCore.App` oder `Microsoft.AspNetCore.App` | `dotnet --list-runtimes` prüfen, passende Runtime installieren |
+| Container-Image soll klein sein | Framework-abhängig braucht ein Runtime-Image, kein SDK-Image | Mehrstufiger Build: bauen mit SDK, ausführen mit Runtime |
+| Sicherheitsupdate für .NET erschienen | Framework-abhängige Apps nehmen beim nächsten Start den neuesten Patch | Runtime aktualisieren, Apps neu starten |
+| Self-contained App auf vielen Servern | Jede App hat ihre eigene Runtime-Kopie | Bei Sicherheitsupdates jede App neu bauen und verteilen |
+| Eine Bibliothek „braucht .NET 8“ | Sie ist gegen Referenzassemblies von .NET 8 kompiliert | Ziel-Framework der App mindestens so hoch setzen |
+
+Der Unterschied zwischen Bauen und Ausführen zieht sich durch alle Zeilen. Zum Bauen brauchst du SDK, Targeting Packs und Compiler, zum Ausführen nur Host, Runtime und Bibliothek. Wer beides sauber trennt, bekommt kleinere Images, weniger Angriffsfläche und verständlichere Fehlermeldungen.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Bausteine sind nicht in Stein gemeißelt, aber ihre Grenzen sind stabil. Seit .NET Core 3.0 sieht die Startkette aus Muxer oder App-Starter, `hostfxr`, `hostpolicy` und `coreclr` im Kern gleich aus. Innerhalb der Bausteine ändert sich dagegen viel: Der JIT wird mit jeder Version besser, der GC bekam mit Regions ein neues Speicherlayout, und das Zusammenspiel von ReadyToRun-Code und Tiered Compilation sorgt dafür, dass vorkompilierter Framework-Code später durch besser optimierten JIT-Code ersetzt werden kann.
+
+{/* TODO(verify): That the host layering (muxer/apphost, hostfxr, hostpolicy, coreclr) is essentially unchanged since .NET Core 3.0 (host-components.md history). */}
+
+Neben CoreCLR gibt es im selben Repository eine zweite Runtime, **Mono**, die vor allem für mobile Plattformen und WebAssembly genutzt wird. Und **Native AOT** bringt eine eigene, abgespeckte Runtime ohne JIT mit, die zusammen mit der App in eine Programmdatei kompiliert wird. Wenn in dieser Plattform von „der Runtime“ die Rede ist, ist CoreCLR gemeint, sofern nichts anderes dasteht.
+
+<Callout kind="version">
+  Die Beispiele dieser Lektion beziehen sich auf .NET 8 und neuer. Ordnerstruktur und Befehle
+  gelten im Kern seit .NET Core 3.0, Details wie Dateinamen nativer Bibliotheken und die Liste der
+  Assemblies im Shared Framework ändern sich aber von Version zu Version.
+</Callout>
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Das Programm unten fragt die Runtime, wo ihre Bausteine liegen. Lege mit `dotnet new console` ein Projekt an, ersetze `Program.cs` und starte es einmal mit `dotnet run` und einmal nach `dotnet publish --self-contained -r <RID>` über den App-Starter im Publish-Ordner.
+
+<VerifyCard
+  sharplab="Stell die Ausgabe auf „IL“ und such nach den eckigen Klammern: Jeder Verweis nennt System.Runtime oder System.Console, keiner System.Private.CoreLib. Am meisten lernst du aber, wenn du das Programm lokal ausführst."
+  code={whereCode}
+/>
+
+Erwartetes Ergebnis bei einer framework-abhängigen App: Der Pfad von `typeof(object).Assembly` endet auf `shared/Microsoft.NETCore.App/<Version>/System.Private.CoreLib.dll` in der dotnet-Wurzel, `Console` kommt aus `System.Console.dll` im selben Ordner, deine eigene Assembly aus `bin/`. Die Liste der Verweise nennt `System.Runtime` und `System.Console`, nicht `System.Private.CoreLib`. Bei der self-contained Variante zeigen alle drei Pfade in den Publish-Ordner.
+
+{/* TODO(verify): Run the program on .NET 8 and 9 (framework-dependent and self-contained) and record the printed paths and referenced assemblies (System.Runtime version 8.0.0.0?). */}
+
+Für den Überblick über die Installation reicht `dotnet --info`. Sieh dir dort auch den Abschnitt zu den Umgebungsvariablen an: Er zeigt, ob `DOTNET_ROOT` gesetzt ist, was in der nächsten Lektion wichtig wird.
+
+{/* TODO(verify): That dotnet --info lists relevant environment variables (DOTNET_ROOT and others) in .NET 8+. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="bausteine"
+  questions={[
+    {
+      q: 'Was enthält die App.dll nach einem normalen Build für deine Methoden?',
+      options: ['Maschinencode für die aktuelle CPU', 'IL und Metadaten', 'C#-Quelltext in kompakter Form'],
+      correct: 1,
+      explanation:
+        'Der Compiler erzeugt IL und Metadaten. Maschinencode entsteht erst zur Laufzeit durch den JIT (oder vorab mit ReadyToRun oder Native AOT).',
+    },
+    {
+      q: 'Führt CoreCLR IL-Befehle normalerweise einzeln interpretierend aus?',
+      options: ['Ja, das ist die Aufgabe der VM', 'Nein, Methoden werden vor dem ersten Aufruf in Maschinencode übersetzt'],
+      correct: 1,
+      explanation:
+        'CoreCLR übersetzt jede Methode mit dem JIT, bevor sie läuft, oder nutzt vorkompilierten ReadyToRun-Code. Verwaltet heißt nicht interpretiert.',
+    },
+    {
+      q: 'In welcher Assembly ist System.Object zur Laufzeit definiert?',
+      options: ['System.Runtime', 'System.Private.CoreLib', 'mscorlib'],
+      correct: 1,
+      explanation:
+        'Kompiliert wird gegen System.Runtime, das zur Laufzeit per Typweiterleitung auf System.Private.CoreLib verweist.',
+    },
+    {
+      q: 'Du veröffentlichst eine App self-contained. Was stimmt?',
+      options: ['Die App braucht keinen JIT mehr', 'Runtime und BCL liegen als private Kopie im App-Ordner, der JIT übersetzt weiterhin IL', 'Die App ist automatisch eine Native-AOT-App'],
+      correct: 1,
+      explanation:
+        'Self-contained ändert nur, woher die Bausteine kommen. Das Ausführungsmodell mit IL und JIT bleibt. Native AOT ist ein eigenes Modell.',
+    },
+    {
+      q: 'Auf einem Server liefert dotnet --version einen Fehler. Heißt das, dass dort keine .NET-App laufen kann?',
+      options: ['Ja', 'Nein, möglicherweise ist nur kein SDK installiert'],
+      correct: 1,
+      explanation:
+        'dotnet --version zeigt die SDK-Version. Ob Runtimes vorhanden sind, zeigt dotnet --list-runtimes.',
+    },
+    {
+      q: 'Warum werden System.Private.CoreLib und CoreCLR immer gemeinsam ausgeliefert?',
+      options: ['Aus Lizenzgründen', 'Weil die VM Typen und Layouts aus CoreLib direkt kennt und CoreLib direkt in die VM ruft', 'Weil CoreLib in C++ geschrieben ist'],
+      correct: 1,
+      explanation:
+        'VM und CoreLib sind eng gekoppelt: Die VM erwartet bestimmte Typen und Felder, CoreLib nutzt FCalls und QCalls in die VM. Beide müssen exakt zusammenpassen.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- „.NET“ besteht aus getrennten Bausteinen: **SDK** zum Bauen, **Host** zum Starten, **CoreCLR** mit VM, JIT und GC zum Ausführen und der **Klassenbibliothek**.
+- Der Compiler erzeugt **IL und Metadaten**. Sie sind der Vertrag zwischen Compiler und Runtime, Verweise darin sind Namen, keine Adressen.
+- **Verwaltet heißt nicht interpretiert.** CoreCLR übersetzt Methoden vor dem ersten Aufruf in Maschinencode, Framework-Code liegt meist schon als ReadyToRun-Code vor.
+- **System.Private.CoreLib** ist fest mit der VM verbunden. Deine App kompiliert gegen Referenzassemblies wie `System.Runtime`, die zur Laufzeit dorthin weiterleiten.
+- Shared Frameworks wie `Microsoft.NETCore.App` sind **versionierte Ordner** unter `shared/` in der dotnet-Wurzel. Mehrere Versionen liegen nebeneinander.
+- **Self-contained** ändert, woher die Bausteine kommen, nicht wie Code ausgeführt wird. **Native AOT** ist ein eigenes Modell ohne JIT und ohne Host-Bibliotheken.
+- `dotnet --list-runtimes` und `dotnet --info` zeigen, was wirklich installiert ist. `dotnet --version` zeigt nur das SDK.
+
+</Block>

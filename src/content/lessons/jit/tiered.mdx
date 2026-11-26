@@ -1,0 +1,370 @@
+---
+id: tiered
+title: Tiered Compilation und OSR
+summary: Wie der JIT zuerst schnell und später gut übersetzt, warum dein Code dabei nicht wartet und wie On-Stack Replacement Methoden mit langen Schleifen rettet.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Tiered Compilation (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/tiered-compilation.md
+  - title: 'On-Stack Replacement (Design-Dokument im dotnet/runtime-Repo)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/OnStackReplacement.md
+  - title: 'Laufzeitkonfiguration: Kompilierung (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/runtime-config/compilation
+  - title: 'ReadyToRun-Kompilierung (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/deploying/ready-to-run
+  - title: 'Performance Improvements in .NET 7 (.NET Blog, Abschnitt zu OSR)'
+    url: https://devblogs.microsoft.com/dotnet/performance_improvements_in_net_7/
+  - title: 'Performance Improvements in .NET 8 (.NET Blog, Abschnitt „Tiering and Dynamic PGO“)'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './tiered.steps';
+import timelineScript from './tiered-timeline.steps';
+import osrScript from './tiered-osr.steps';
+
+<Block n={1} title="Das Problem">
+
+Ein JIT-Compiler übersetzt IL in Maschinencode, während dein Programm läuft. Jede Millisekunde, die er dafür braucht, fehlt der Anwendung. Gleichzeitig soll der erzeugte Code möglichst schnell sein. Diese beiden Ziele widersprechen sich: Gute Optimierungen wie Inlining, Registerzuteilung über ganze Methoden oder das Herausziehen von Berechnungen aus Schleifen kosten Übersetzungszeit.
+
+Beim Start einer Anwendung ist das besonders spürbar. Ein ASP.NET-Core-Dienst führt in den ersten Sekunden Tausende Methoden aus: Konfiguration lesen, Dependency Injection aufbauen, Routen registrieren. Die meisten davon laufen genau einmal. Würde der JIT jede einzelne voll optimieren, bezahlt die Anwendung viel Übersetzungszeit für Code, der danach nie wieder gebraucht wird.
+
+Umgekehrt gibt es Methoden, die im Dauerbetrieb Millionen Mal laufen, etwa die Logik hinter einem häufig aufgerufenen Endpunkt. Hier ist jede gesparte Instruktion bares Geld. Ein JIT, der nur schnell und schlampig übersetzt, verschenkt genau dort Leistung.
+
+Vor .NET Core 3.0 musste sich die Runtime im Normalfall für eine Seite entscheiden: Der JIT optimierte jede Methode gleich beim ersten Aufruf. Die Startzeit litt, und Vorkompilierung mit ReadyToRun milderte das nur teilweise. **Tiered Compilation** löst den Konflikt, indem es die Entscheidung auf später verschiebt: Erst übersetzen, dann beobachten, dann nur das Heiße gründlich optimieren.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir diese fünf Sätze:
+
+1. **Erst schnell.** Beim ersten Aufruf übersetzt der JIT eine Methode in **Tier 0**: kaum optimiert, aber schnell fertig.
+2. **Dann beobachten.** Nach der Startphase zählt die Runtime, wie oft jede Tier-0-Methode aufgerufen wird.
+3. **Heißes neu übersetzen.** Erreicht eine Methode eine Schwelle, übersetzt der JIT sie in einem **Hintergrund-Thread** ein zweites Mal, voll optimiert, in **Tier 1**.
+4. **Umleiten statt ersetzen.** Ist Tier 1 fertig, stellt die Runtime den Einstiegspunkt der Methode um. Neue Aufrufe landen im optimierten Code, laufende Aufrufe beenden den alten Code ganz normal.
+5. **Schleifen sind ein Sonderfall.** Eine Methode, die nur einmal aufgerufen wird, aber lange in einer Schleife läuft, kann mit **On-Stack Replacement (OSR)** mitten in der Schleife auf optimierten Code wechseln.
+
+Das alles greift für jede Methode, die der JIT übersetzt, also für deinen Code und für Framework-Code ohne vorkompilierte Fassung. Ausgenommen sind Methoden, die du ausdrücklich davon ausnimmst, dazu mehr bei den Stolperfallen.
+
+<Callout kind="fehlannahme">
+  „Tiered Compilation macht Code langsamer, weil er zweimal übersetzt wird.“ Im Dauerbetrieb läuft
+  heißer Code genauso in voll optimierter Form wie ohne Tiering, oft sogar besser, weil der JIT für
+  Tier 1 mehr über das Programm weiß. Die zweite Übersetzung kostet CPU-Zeit im Hintergrund, aber
+  sie betrifft nur die wenigen heißen Methoden, und dafür wird der Start schneller.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ist bewusst ein lange laufender Webdienst. Ein kleines Konsolenprogramm mit einer Schleife wäre fertig, bevor die Aufrufzählung überhaupt beginnt. Achte auf den Unterschied zwischen `LoadConfig`, das einmal läuft, und `Square`, das bei jeder Anfrage läuft. Die Visualisierung zeigt den Ablauf ohne Dynamic PGO (`DOTNET_TieredPGO=0`), damit nur die beiden klassischen Stufen auftauchen.
+
+<StepPlayer script={script} />
+
+Beachte Schritt 2: Die Aufrufzählung beginnt nicht sofort. Die Runtime wartet, bis eine kurze Zeit lang keine neuen Tier-0-Übersetzungen mehr passieren. Das Design-Dokument nennt dafür einen Zeitgeber von 100 ms, der bei jeder neuen Tier-0-Übersetzung neu startet, und eine Schwelle von 30 Aufrufen. Beide Werte sind Implementierungsdetails, die sich ändern können.
+
+{/* TODO(verify): 100 ms delay with reset on Tier 0 activity and threshold of 30 calls in the current runtime (tiered-compilation.md describes them; check clrconfignames.h TC_CallCountThreshold and TC_CallCountingDelayMs). */}
+
+Warum diese Wartezeit? Während des Starts würde das Zählen selbst Zeit kosten, und fast jede Methode wäre kurz „heiß“, weil der Start viel Code in kurzer Zeit ausführt. Erst wenn sich die Anwendung beruhigt hat, sagen die Zahlen etwas über den Dauerbetrieb aus.
+
+</Block>
+
+<Block n={4} title="Wie der Wechsel funktioniert">
+
+### Ein Einstiegspunkt pro Methode
+
+Jede Methode hat in der Runtime einen festen **Einstiegspunkt**: die Adresse, die Aufrufer anspringen. Vor der ersten Übersetzung zeigt er auf einen kleinen Codeschnipsel der Runtime (oft **Precode** oder Prestub genannt), der den JIT anstößt. Danach zeigt er auf den erzeugten Maschinencode. Aufrufer kennen also nicht die Adresse einer bestimmten Codeversion, sondern nur diesen Einstiegspunkt, und genau das macht den späteren Wechsel möglich.
+
+### Zählen und umleiten
+
+Für die Aufrufzählung lässt die Runtime den Einstiegspunkt vorübergehend auf ein Zählstück zeigen, das jeden Aufruf mitzählt und dann in den Tier-0-Code springt. Ist die Schwelle erreicht, kommt die Methode in eine Warteschlange, und ein Hintergrund-Thread übersetzt sie neu. Ist der Tier-1-Code fertig, wird der Einstiegspunkt auf ihn umgestellt, und die Zählung für diese Methode endet.
+
+{/* TODO(verify): Since .NET 5, call counting uses dedicated call counting stubs instead of the prestub (tiered-compilation.md still describes counting in the prestub). Exact mechanics of precode, FixupPrecode and backpatching of vtable slots should be checked in callcounting.cpp / precode.cpp before adding detail. */}
+
+Wichtig ist, was dabei **nicht** passiert: Der Tier-0-Code wird nicht überschrieben und nicht sofort freigegeben. Ein Thread, der gerade darin steckt, rechnet dort in Ruhe weiter. Nur wer die Methode neu aufruft, kommt über den umgestellten Einstiegspunkt im Tier-1-Code an.
+
+<StepPlayer script={timelineScript} />
+
+Die Zeitleiste zeigt den Kern des Modells: Die teure Optimierung läuft auf einem eigenen Thread. Laut Design-Dokument verwendet die Runtime dafür einen Thread aus dem ThreadPool. Die Anfragen werden also nicht langsamer, weil optimiert wird, sie werden schneller, sobald die Optimierung fertig ist.
+
+### Was Tier 1 besser kann
+
+Tier 1 ist der „normale“ optimierende JIT, also derselbe Code, den du ohne Tiering bekommen würdest, nur später. Dazu kommt ein Vorteil, den der späte Zeitpunkt mit sich bringt: Bis Tier 1 übersetzt, sind statische Konstruktoren vieler Klassen bereits gelaufen. Der JIT kann dann `static readonly`-Felder als Konstanten behandeln und Zweige wegfallen lassen, die von ihnen abhängen. In Tier 0 geht das nicht, weil die Werte beim ersten Aufruf oft noch gar nicht feststehen.
+
+{/* TODO(verify): Tier 1 treats initialized static readonly fields as constants (described in the .NET Core 3.0 / .NET 5 performance blog posts); confirm source and wording. */}
+
+</Block>
+
+<Block n={5} title="Schleifen und On-Stack Replacement">
+
+### Das Problem mit einem einzigen Aufruf
+
+Die Aufrufzählung hat einen blinden Fleck. Stell dir eine Methode vor, die einmal beim Start aufgerufen wird und dann Minuten lang eine Datei verarbeitet oder ein großes Array durchläuft. Sie ist eindeutig heiß, wird aber nur einmal aufgerufen. Die Schwelle erreicht sie nie. Und selbst wenn Tier 1 fertig wäre, nützte das dem laufenden Aufruf nichts, denn umgeleitet werden nur neue Aufrufe.
+
+Lange hat die Runtime das umgangen, indem sie Methoden mit Schleifen gar nicht erst in Tier 0 übersetzte, sondern sofort optimiert. Das war sicher, aber teuer für den Start, denn sehr viele Methoden enthalten irgendeine Schleife. Diese Regel steuert die Einstellung **QuickJitForLoops**: Ist sie aus, bekommen Methoden mit Schleifen sofort optimierten Code.
+
+### Patchpoints
+
+**On-Stack Replacement** löst das Problem anders. Der JIT übersetzt auch Methoden mit Schleifen in Tier 0, fügt aber an den Rücksprüngen der Schleifen **Patchpoints** ein. Ein Patchpoint ist eine Stelle im Code, an der ein Wechsel auf eine andere Codeversion möglich ist. Jeder Durchlauf verringert dort einen Zähler im Stack-Frame. Läuft er ab, fragt der Tier-0-Code die Runtime, ob gewechselt werden soll.
+
+<StepPlayer script={osrScript} />
+
+Zwei Unterschiede zu Tier 1 zeigt die Visualisierung. Erstens entsteht die OSR-Version synchron auf dem Thread, der in der Schleife steckt, denn genau dieser Thread soll profitieren. Zweitens ist die OSR-Version eine Sonderanfertigung: Sie beginnt nicht am Anfang der Methode, sondern am Patchpoint, und sie übernimmt den bestehenden Tier-0-Frame mit allen lokalen Variablen. Das Design-Dokument begründet das damit, dass Variablen, deren Adresse genommen wurde, an ihrem Platz bleiben müssen. Am einfachsten geht das, wenn der alte Frame einfach liegen bleibt.
+
+OSR ist nicht überall möglich. Das Design-Dokument nennt zum Beispiel Schleifen in `catch`- oder `finally`-Blöcken und Code, der zum Debuggen übersetzt wurde. Für solche Methoden schaltet der JIT OSR ab.
+
+{/* TODO(verify): What the JIT does for a method with loops when OSR is unavailable for it (jit directly optimized, i.e. switch to FullOpts?). Patchpoint placement in try regions in the current implementation. */}
+
+<Callout kind="version">
+  Laut .NET-Blog hat .NET 7 OSR eingeführt und damit Tiering auch für Methoden mit Schleifen
+  eingeschaltet, auf x64 und Arm64. Davor wurden solche Methoden standardmäßig sofort optimiert. Die
+  Microsoft-Learn-Seite zu `QuickJitForLoops` beschreibt beim Weglassen der Einstellung noch den
+  Wert `false`. Prüfe im Zweifel die Version, die du einsetzt.
+</Callout>
+
+{/* TODO(verify): QuickJitForLoops default: true since .NET 7 on platforms with OSR (x64, Arm64) per Performance Improvements in .NET 7, while Microsoft Learn says omitted = false. Also its default in .NET 5 and 6 and on x86/Arm32. */}
+
+</Block>
+
+<Block n={6} title="Andere Startstufen: ReadyToRun und Dynamic PGO">
+
+### ReadyToRun als Tier 0
+
+Ein großer Teil des Frameworks wird nicht erst zur Laufzeit übersetzt, sondern liegt als **ReadyToRun**-Code (R2R) vorkompiliert in den Assemblies. Für Tiered Compilation zählt dieser Code als Startstufe: Das Design-Dokument sagt ausdrücklich, dass für vorkompilierte Methoden der R2R-Code die Tier-0-Version ist. Die Methode muss also beim ersten Aufruf gar nicht übersetzt werden.
+
+R2R-Code ist zwar optimiert, aber mit Einschränkungen. Er muss mit späteren Versionen abhängiger Assemblies zusammenpassen, deshalb kann der Compiler zum Beispiel nicht beliebig über Assembly-Grenzen hinweg inlinen. Wird eine R2R-Methode heiß, ersetzt die Runtime sie deshalb wie eine Tier-0-Methode durch frisch übersetzten Tier-1-Code. So bekommt dein Prozess beides: schnellen Start durch fertigen Code und im Dauerbetrieb Code, der auf genau diese Maschine und diese Versionen zugeschnitten ist.
+
+{/* TODO(verify): Exact R2R restrictions (cross-version-bubble inlining, hardware intrinsics baseline) per ready-to-run docs. */}
+
+Mit `DOTNET_ReadyToRun=0` kannst du die Nutzung von R2R-Code abschalten. Dann muss der JIT auch das Framework übersetzen, und der Start wird spürbar langsamer. Für Experimente ist das nützlich, um den Anteil von R2R an der Startzeit zu sehen.
+
+### Dynamic PGO: eine Stufe dazwischen
+
+Seit .NET 8 ist **Dynamic PGO** standardmäßig eingeschaltet. Damit kommt eine Zwischenstufe hinzu: eine **instrumentierte** Version, die nebenbei Daten über das tatsächliche Verhalten sammelt. Laut .NET-Blog läuft eine Methode dann typischerweise so:
+
+1. Tier 0 ohne Instrumentierung beim ersten Aufruf.
+2. Nach genügend Aufrufen Tier 0 **mit** Instrumentierung: weiterhin unoptimiert, aber der Code zählt mit.
+3. Nach weiteren Aufrufen Tier 1, optimiert mit den gesammelten Daten.
+
+Methoden mit Schleifen überspringen laut Blog die erste Stufe und starten gleich instrumentiert. Heiße R2R-Methoden werden zuerst optimiert **und** instrumentiert neu übersetzt, damit der instrumentierte Code nicht unnötig langsam ist, und erst danach in die endgültige Tier-1-Fassung.
+
+{/* TODO(verify): Tier sequence with TieredPGO in .NET 8+ (Tier0 -> Tier0 instrumented -> Tier1; loops start instrumented; R2R -> Tier1 instrumented -> Tier1), see Performance Improvements in .NET 8 and dotnet/runtime#70941. Whether each step uses the same call count threshold. */}
+
+Die Instrumentierung zeichnet zum Beispiel auf, welche konkreten Typen an einem virtuellen Aufruf oder Interface-Aufruf ankommen und welche Zweige wie oft genommen werden. Damit kann Tier 1 etwa eine **Guarded Devirtualization** erzeugen: eine schnelle Typprüfung für den häufigsten Typ mit direktem, inlinebarem Aufruf und einem Rückfallweg für alle anderen. Wie das genau aussieht, zeigt die Lektion „Dynamic PGO“.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Messen ohne Aufwärmen
+
+Der häufigste Fehler beim Messen: Du startest eine Stoppuhr, rufst eine Methode ein paar tausend Mal auf und hältst das Ergebnis für die Geschwindigkeit der Methode.
+
+```csharp
+var sw = Stopwatch.StartNew();
+for (int i = 0; i < 10_000; i++) Square(i);
+Console.WriteLine(sw.Elapsed);   // misst vor allem Tier 0 und den JIT
+```
+
+Gemessen hast du hier den ersten JIT-Lauf, die Startverzögerung und Tier-0-Code. Ob `Square` überhaupt Tier 1 erreicht, bevor die Schleife fertig ist, hängt vom Zufall des Zeitgebers ab. Dazu kommt: Die Schleife steht hier im Hauptprogramm, das vielleicht per OSR wechselt, vielleicht nicht. Das Ergebnis sagt über den Dauerbetrieb nichts aus. BenchmarkDotNet führt deshalb vor der eigentlichen Messung Aufwärmrunden aus, bis sich die Zeiten stabilisieren.
+
+### AggressiveOptimization schaltet mehr ab, als man denkt
+
+```csharp
+[MethodImpl(MethodImplOptions.AggressiveOptimization)]
+static int Hot(int[] data) { /* ... */ }
+```
+
+Dieses Attribut sorgt dafür, dass der JIT die Methode sofort voll optimiert übersetzt und Tiering für sie überspringt. Das klingt nach einem Gewinn, hat aber Nebenwirkungen: Die Methode durchläuft keine instrumentierte Stufe und bekommt deshalb **keine Daten von Dynamic PGO**. Außerdem kann der JIT beim ersten Aufruf noch nicht wissen, welche `static readonly`-Werte feststehen. Im Dauerbetrieb kann so eine Methode langsamer sein als ohne Attribut. Gedacht ist es für Sonderfälle, nicht als allgemeiner Turbo.
+
+{/* TODO(verify): AggressiveOptimization opts out of tiering and therefore of Dynamic PGO instrumentation; also whether such methods are excluded from ReadyToRun precompilation. */}
+
+### Kurze Programme erreichen Tier 1 nie
+
+Ein Kommandozeilenwerkzeug, das nach 200 ms fertig ist, verbringt fast seine ganze Laufzeit in Tier 0 und R2R-Code. Das ist meist richtig so, denn hier zählt der Start. Es bedeutet aber auch: Erkenntnisse aus einem Benchmark, der Tier-1-Code misst, gelten für so ein Programm nicht. Wer bei kurzlebigen Prozessen Leistung braucht, schaut eher auf ReadyToRun oder Native AOT.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Für die meisten Anwendungen sind die Standardeinstellungen richtig. Trotzdem lohnt es sich zu wissen, welche Stellschrauben es gibt, vor allem um beim Messen und bei Problemen zu verstehen, was passiert.
+
+| Situation                                    | Effekt von Tiering                                 | Was hilft                                                |
+| -------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------- |
+| Webdienst, Dauerbetrieb                      | schneller Start, nach kurzer Zeit optimierter Code | Standard lassen                                          |
+| Kurzlebiges CLI-Tool                         | läuft fast nur in Tier 0 und R2R                   | ReadyToRun, Native AOT                                   |
+| Erste Anfragen nach dem Deployment langsamer | Tier 0 und JIT-Arbeit laufen noch                  | Aufwärmanfragen, ReadyToRun                              |
+| Microbenchmark mit Stopwatch                 | misst Tier 0 und JIT statt Dauerbetrieb            | BenchmarkDotNet                                          |
+| Methode mit langer Schleife, einmal gerufen  | startet in Tier 0, wechselt per OSR                | nichts tun, OSR erledigt das                             |
+| Latenzkritischer Start ohne jede JIT-Pause   | Tier-1-Übersetzung kostet CPU im Hintergrund       | Native AOT oder bewusst `TieredCompilation` ausprobieren |
+
+### Konfiguration
+
+Alle Schalter lassen sich als Umgebungsvariable setzen, die meisten auch in der Projektdatei oder in `runtimeconfig.json`. Das Präfix `DOTNET_` ersetzt das ältere `COMPlus_`, das weiterhin funktioniert.
+
+| Umgebungsvariable            | MSBuild-Eigenschaft                 | Wirkung                                        | Standard                                |
+| ---------------------------- | ----------------------------------- | ---------------------------------------------- | --------------------------------------- |
+| `DOTNET_TieredCompilation`   | `TieredCompilation`                 | Tiering insgesamt ein oder aus                 | an (seit .NET Core 3.0)                 |
+| `DOTNET_TC_QuickJit`         | `TieredCompilationQuickJit`         | Tier 0 für Methoden ohne R2R-Code              | an (seit .NET Core 3.0)                 |
+| `DOTNET_TC_QuickJitForLoops` | `TieredCompilationQuickJitForLoops` | Tier 0 auch für Methoden mit Schleifen         | versionsabhängig, siehe Hinweis bei OSR |
+| `DOTNET_TieredPGO`           | `TieredPGO`                         | Dynamic PGO mit instrumentierter Zwischenstufe | an (seit .NET 8)                        |
+| `DOTNET_ReadyToRun`          | keine                               | vorkompilierten R2R-Code verwenden             | an                                      |
+
+{/* TODO(verify): COMPlus_ prefix still honored in .NET 8+. TieredPGO default on since .NET 8 (blog says so, Learn page lists no default). DOTNET_ReadyToRun has no MSBuild property per Learn. */}
+
+Ist `TC_QuickJit` aus, aber Tiering an, nimmt laut Microsoft Learn nur noch vorkompilierter Code am Tiering teil. Alle anderen Methoden übersetzt der JIT dann so, als wäre Tiering abgeschaltet.
+
+### Beobachten
+
+Um zu sehen, welche Methode in welcher Stufe übersetzt wird, gibt es mehrere Wege:
+
+- `DOTNET_JitDisasmSummary=1` gibt für jede übersetzte Methode eine Zeile aus, inklusive der Stufe. Mit `DOTNET_JitStdOutFile=pfad.txt` landet die Ausgabe in einer Datei statt in der Konsole.
+- `DOTNET_JitDisasm=Square` zeigt den Assembler-Code einer Methode, und zwar für jede Stufe, in der sie übersetzt wird. So siehst du Tier 0 und Tier 1 direkt untereinander.
+- Die Runtime meldet JIT-Vorgänge auch als Events. Mit `dotnet-trace` oder PerfView kannst du sie aufzeichnen und siehst, wann welche Methode in welcher Stufe übersetzt wurde.
+
+{/* TODO(verify): JitDisasm and JitDisasmSummary work in release builds of the runtime since .NET 7; JitStdOutFile available since .NET 8; exact output format of the summary lines (e.g. "Tier0", "Tier1", "Instrumented Tier0", "Tier1-OSR"). Event names (MethodLoad, MethodJittingStarted, OptimizationTier field) in the runtime event provider. */}
+
+</Block>
+
+<Block n={9} title="Wie sich das entwickelt hat">
+
+Tiered Compilation ist schrittweise gewachsen, und viele Ratschläge im Netz stammen aus älteren Versionen. Grob gilt:
+
+- **.NET Core 2.1 und 2.2:** Tiering vorhanden, aber standardmäßig aus.
+- **.NET Core 3.0:** Tiering und Quick JIT standardmäßig an. Methoden mit Schleifen werden weiter sofort optimiert.
+- **.NET 7:** OSR auf x64 und Arm64, damit auch Tier 0 für Methoden mit Schleifen.
+- **.NET 8:** Dynamic PGO standardmäßig an, mit der instrumentierten Zwischenstufe.
+
+{/* TODO(verify): Version list: 2.1/2.2 off by default and 3.0 on (Microsoft Learn); OSR and QuickJitForLoops default in .NET 7 (.NET 7 blog); TieredPGO default in .NET 8 (.NET 8 blog). Was OSR available opt-in in .NET 6? */}
+
+<Callout kind="version">
+  Wenn du einen alten Tipp liest wie „Methoden mit Schleifen werden immer voll optimiert“ oder
+  „schalte TieredPGO ein“, prüfe, für welche Version er gilt. Ab .NET 8 ist beides überholt.
+</Callout>
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Drei Experimente bestätigen das Modell. Erwartete Ergebnisse sind Richtwerte, die du auf deiner Maschine und Version nachprüfen solltest.
+
+**Stufen sichtbar machen.** Starte ein kleines Programm, das eine Methode einige Sekunden lang wiederholt aufruft, mit `DOTNET_JitDisasmSummary=1`. Du solltest dieselbe Methode mehrfach in der Liste finden: zuerst als Tier 0, mit PGO zusätzlich instrumentiert, und später als Tier 1. Mit `DOTNET_TieredCompilation=0` taucht jede Methode nur einmal auf, direkt optimiert. Eine Methode mit langer Schleife, die nur einmal aufgerufen wird, sollte zusätzlich als OSR-Variante erscheinen.
+
+**Naiv gegen richtig gemessen.** Miss dieselbe Methode einmal mit der Stoppuhr-Schleife aus den Stolperfallen und einmal mit BenchmarkDotNet. Die naive Messung sollte deutlich langsamer ausfallen, besonders bei wenigen Durchläufen, weil sie Tier 0 und JIT-Zeit enthält.
+
+**Startzeit gegen Dauerleistung.** Starte eine Anwendung einmal normal und einmal mit `DOTNET_TieredCompilation=0`. Ohne Tiering sollte der Start länger dauern, während die Leistung im Dauerbetrieb ungefähr gleich bleibt.
+
+{/* TODO(verify): Expected results of all three experiments (summary output lines, ratio naive vs BenchmarkDotNet, startup difference) on .NET 8 or later, x64. Whether SharpLab's JIT Asm view shows Tier 0 or fully optimized code and whether it offers a tiering option. */}
+
+<VerifyCard
+  sharplab="Stelle auf sharplab.io die Ausgabe auf „JIT Asm“. SharpLab zeigt dir dort eine Fassung des Maschinencodes. Welche Stufe das ist, verrät die Ausgabe selbst. Für den direkten Vergleich von Tier 0 und Tier 1 ist DOTNET_JitDisasm lokal zuverlässiger."
+  code={`static int Sum(int[] data)
+{
+    int sum = 0;
+    for (int i = 0; i < data.Length; i++)
+        sum += data[i];
+    return sum;
+}`}
+  benchmark={`public class TieringBench
+{
+    readonly int[] _data = Enumerable.Range(0, 1_000).ToArray();
+
+    // BenchmarkDotNet wärmt auf, bis die Zeiten stabil sind:
+    // gemessen wird der Code im Dauerbetrieb.
+    [Benchmark] public int Sum()
+    {
+        int sum = 0;
+        foreach (var x in _data) sum += x;
+        return sum;
+    }
+}
+
+// Zum Vergleich ohne Tiering starten:
+// DOTNET_TieredCompilation=0 dotnet run -c Release
+// Stufen anzeigen:
+// DOTNET_JitDisasmSummary=1 dotnet run -c Release`}
+note="Umgebungsvariablen gelten nur für den gestarteten Prozess. Im Dauerbetrieb sollten die Zeiten mit und ohne Tiering ähnlich sein, der Unterschied liegt im Start."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="tiered"
+  questions={[
+    {
+      q: 'Was passiert mit Aufrufen, während der Tier-1-Code einer Methode entsteht?',
+      options: ['Sie warten, bis Tier 1 fertig ist', 'Sie laufen weiter im Tier-0-Code'],
+      correct: 1,
+      explanation:
+        'Die Neuübersetzung läuft auf einem Hintergrund-Thread. Bis der Einstiegspunkt umgestellt ist, nutzen alle Aufrufe den bisherigen Code.',
+    },
+    {
+      q: 'Ein Konsolenprogramm ruft eine Methode 10.000 Mal in einer engen Schleife auf und endet nach 50 ms. Läuft die Methode am Ende sicher in Tier 1?',
+      options: ['Ja, die Schwelle ist ja längst überschritten', 'Nein, das ist nicht sicher'],
+      correct: 1,
+      explanation:
+        'Gezählt wird erst nach der Startverzögerung, und Tier 1 entsteht danach im Hintergrund. Ein so kurzes Programm ist oft fertig, bevor das passiert.',
+    },
+    {
+      q: 'Eine Methode wird einmal aufgerufen und läuft dann Minuten lang in einer Schleife. Wie kommt sie zu optimiertem Code?',
+      options: [
+        'Über die Aufrufzählung und Tier 1',
+        'Über On-Stack Replacement an einem Patchpoint in der Schleife',
+      ],
+      correct: 1,
+      explanation:
+        'Die Aufrufzählung erreicht bei einem Aufruf nie die Schwelle, und Tier 1 hilft nur neuen Aufrufen. OSR wechselt mitten im laufenden Aufruf in eine optimierte Version.',
+    },
+    {
+      q: 'Was passiert mit dem Tier-0-Code, wenn der Einstiegspunkt auf Tier 1 umgestellt wird, während ein Thread noch darin rechnet?',
+      options: [
+        'Der Thread wird angehalten und in Tier 1 fortgesetzt',
+        'Der Thread rechnet im Tier-0-Code zu Ende',
+      ],
+      correct: 1,
+      explanation:
+        'Umgeleitet werden nur neue Aufrufe. Laufender Code wird nicht ersetzt. Einen Wechsel mitten in der Ausführung gibt es nur bei OSR an Patchpoints.',
+    },
+    {
+      q: 'Du markierst eine heiße Methode mit AggressiveOptimization. Was verlierst du dabei?',
+      options: [
+        'Nichts, sie wird nur früher optimiert',
+        'Die Daten von Dynamic PGO und das Wissen über bereits initialisierte statische Felder',
+      ],
+      correct: 1,
+      explanation:
+        'Die Methode überspringt Tiering und damit auch die instrumentierte Stufe. Sie wird beim ersten Aufruf optimiert, wenn der JIT über das laufende Programm noch wenig weiß.',
+    },
+    {
+      q: 'Welche Rolle spielt ReadyToRun-Code für Tiered Compilation?',
+      options: [
+        'Er ersetzt Tier 1 und wird nie neu übersetzt',
+        'Er dient als Startstufe und wird bei heißen Methoden durch Tier-1-Code ersetzt',
+      ],
+      correct: 1,
+      explanation:
+        'Für vorkompilierte Methoden ist der R2R-Code die Tier-0-Version. Wird eine solche Methode heiß, übersetzt der JIT sie neu, ohne die Einschränkungen der Vorkompilierung.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Tiered Compilation löst den Zielkonflikt zwischen Startzeit und Codequalität: erst schnell in **Tier 0**, später nur heiße Methoden voll optimiert in **Tier 1**.
+- Die Aufrufzählung beginnt erst nach der Startphase. Heiße Methoden werden auf einem **Hintergrund-Thread** neu übersetzt, die Anwendung wartet nicht.
+- Der Wechsel geschieht über den **Einstiegspunkt** der Methode. Neue Aufrufe landen in Tier 1, laufende Aufrufe beenden den alten Code.
+- **On-Stack Replacement** rettet Methoden, die einmal aufgerufen werden und lange in einer Schleife laufen: An einem **Patchpoint** wechselt der Thread synchron in eine optimierte OSR-Version.
+- **ReadyToRun**-Code ist die Startstufe für vorkompilierte Methoden und wird bei Bedarf durch Tier 1 ersetzt.
+- Seit .NET 8 sammelt **Dynamic PGO** in einer instrumentierten Zwischenstufe Daten, die Tier 1 für Optimierungen wie Guarded Devirtualization nutzt.
+- Messungen ohne Aufwärmen messen Tier 0, und `AggressiveOptimization` schaltet mit dem Tiering auch PGO ab.
+
+</Block>

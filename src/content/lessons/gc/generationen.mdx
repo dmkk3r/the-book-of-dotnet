@@ -1,0 +1,352 @@
+---
+id: generationen
+title: Generationen
+summary: Warum der GC junge und alte Objekte getrennt behandelt, wie er Verweise von alt nach jung trotzdem findet und weshalb Objekte mittleren Alters am meisten kosten.
+status: draft
+dotnetVersion: '7+'
+sources:
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Grundlagen der Garbage Collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/fundamentals
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'GC.CollectionCount (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.collectioncount
+  - title: 'dotnet-counters (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/diagnostics/dotnet-counters
+  - title: 'Quellcode des GC in dotnet/runtime (gc.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gc.cpp
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './generationen.steps';
+import cardScript from './generationen-cardtable.steps';
+import midlifeScript from './generationen-midlife.steps';
+
+<Block n={1} title="Das Problem">
+
+Ein Garbage Collector muss herausfinden, welche Objekte noch gebraucht werden. Die naheliegende Antwort: bei jeder Collection den gesamten Heap durchgehen, alles Erreichbare markieren und den Rest freigeben. Das ist korrekt, aber teuer. Ein Serverprozess hat schnell einige Gigabyte an Objekten, und die meisten davon sind Caches, Konfiguration, Verbindungen und Datenstrukturen, die seit Minuten oder Stunden leben. Sie bei jeder Collection erneut zu durchlaufen, wäre fast immer verschwendete Arbeit, denn sie leben beim nächsten Mal mit großer Wahrscheinlichkeit immer noch.
+
+Gleichzeitig entsteht ständig neuer Müll. Ein String für eine Logzeile, ein Enumerator für ein `foreach`, ein Puffer für eine HTTP-Anfrage, ein Zwischenergebnis in einer LINQ-Kette: Solche Objekte werden angelegt, einmal benutzt und sind Mikrosekunden später unerreichbar. Wer viel alloziert, braucht häufige Collections, damit der Speicher nicht vollläuft.
+
+Der Zielkonflikt ist also: Häufig aufräumen, weil ständig Müll entsteht, aber dabei nicht jedes Mal den ganzen Heap anfassen. Die Lösung beruht auf einer Beobachtung über reale Programme, der **Generationenhypothese**:
+
+- Die meisten Objekte sterben jung.
+- Objekte, die schon eine Weile leben, leben meist noch viel länger.
+
+Wenn das stimmt, lohnt es sich, junge Objekte getrennt von alten zu verwalten und vor allem die jungen häufig zu untersuchen. Genau das tut der .NET-GC mit seinen **Generationen**.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Der verwaltete Heap ist in drei Generationen eingeteilt. Fünf Sätze tragen den Rest der Lektion:
+
+1. **Neue Objekte kommen nach Gen0.** Ausnahme sind große Objekte, die direkt im Large Object Heap landen (dazu später mehr).
+2. **Eine Collection von Generation N sammelt auch alle jüngeren Generationen ein.** Eine Gen1-Collection räumt Gen0 und Gen1 auf, eine Gen2-Collection den ganzen Heap. Deshalb heißt sie auch **volle Collection**.
+3. **Der GC sucht Lebendes, nicht Müll.** Er beginnt bei den **Roots** und markiert alles, was er von dort erreicht. Roots sind lokale Variablen und Register in laufenden Methoden, statische Felder und GC-Handles. Alles Unmarkierte ist tot, ohne dass der GC es einzeln anfasst.
+4. **Wer überlebt, wird promotet.** Aus Gen0 wird Gen1, aus Gen1 wird Gen2. Gen2 ist die letzte Stufe, Überlebende einer Gen2-Collection bleiben in Gen2.
+5. **Die Kosten hängen an den Überlebenden.** Eine Collection, in der fast alles tot ist, ist billig. Teuer sind Objekte, die markiert, verschoben und deren Verweise angepasst werden müssen.
+
+Gen0 und Gen1 heißen zusammen die **ephemeren** Generationen, also die kurzlebigen. Gen1 hat dabei eine besondere Rolle: Sie ist ein Puffer zwischen jung und alt. Ein Objekt, das zufällig gerade lebt, wenn eine Gen0-Collection läuft, soll nicht sofort als langlebig gelten. Es bekommt in Gen1 noch eine Chance zu sterben, bevor es in Gen2 landet, wo es nur noch von den seltenen vollen Collections erfasst wird.
+
+### Wann eine Collection passiert
+
+Microsoft Learn nennt drei Auslöser:
+
+- **Das Allokationsbudget ist erschöpft.** Jede Generation hat ein Budget, also eine Menge an Speicher, die zwischen zwei Collections alloziert oder hineinpromotet werden darf. Ist das Gen0-Budget aufgebraucht, löst die nächste Allokation eine Collection aus. Das ist mit Abstand der häufigste Fall.
+- **Der Code ruft `GC.Collect` auf.**
+- **Das Betriebssystem meldet knappen physischen Speicher.**
+
+Welche Generation dann eingesammelt wird, entscheidet der GC selbst. Er beginnt bei Gen0 und nimmt ältere Generationen hinzu, wenn auch deren Budget erschöpft ist oder andere Gründe dafür sprechen. Eine Gen2-Collection ist deshalb kein eigener Zeitplan, sondern die Folge davon, dass genug Objekte nach Gen2 promotet wurden.
+
+{/* TODO(verify): Exact list of reasons the GC escalates to an older generation (budget, card marking efficiency, low memory, provisional mode) in gc.cpp generation_to_condemn. */}
+
+<Callout kind="fehlannahme">
+  „Generationen sind Zeitstempel: Ein Objekt wird nach einer gewissen Zeit alt.“ Nein, das Alter
+  zählt in überlebten Collections, nicht in Sekunden. Ein Objekt, das eine Stunde lebt, in einem
+  Programm ohne Allokationen aber nie eine Collection erlebt, bleibt in Gen0. Umgekehrt kann ein
+  Objekt nach wenigen Millisekunden in Gen2 landen, wenn in dieser Zeit genug alloziert wurde.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel legt eine Liste an, die überlebt, und pro Schleifendurchlauf ein Array, das sofort Müll ist. Achte in Schritt 4 darauf, welche Objekte der GC überhaupt besucht, und in Schritt 5 darauf, dass er für die toten Arrays keine Arbeit leistet.
+
+<StepPlayer script={script} />
+
+Der wichtigste Moment ist der Übergang von „markiert“ zu „tot“: Der GC hat die drei `byte[100]` nie gefunden, also gibt es für sie nichts zu tun. Hätte die Schleife drei Millionen solcher Arrays erzeugt, wäre die Markierphase genauso schnell gewesen. Wie die Überlebenden danach verschoben werden und wie aus „lebt“ physisch „Gen1“ wird, ist Thema der nächsten Abschnitte.
+
+</Block>
+
+<Block n={4} title="Verweise von alt nach jung">
+
+Das Modell hat eine Lücke. Eine Gen0-Collection soll Gen2 nicht durchsuchen, das ist ja der ganze Sinn. Aber was, wenn ein altes Objekt auf ein junges zeigt? Ein langlebiger Cache, in den gerade ein neuer Eintrag geschrieben wurde, ist genau so ein Fall:
+
+```csharp
+s_cache.Last = new Order(42);   // Gen2-Objekt zeigt auf ein neues Gen0-Objekt
+```
+
+Kein lokaler Verweis und keine statische Variable zeigt direkt auf das neue `Order`. Erreichbar ist es nur über `s_cache`, und `s_cache` liegt in Gen2. Folgt der GC nur den Roots in die jungen Generationen, sieht er das `Order` nicht und würde ein lebendes Objekt einsammeln. Das wäre ein katastrophaler Fehler.
+
+### Write Barrier und Card Table
+
+Die Runtime löst das, indem sie sich solche Verweise schon beim Schreiben merkt. Wenn dein Code einen Objektverweis in ein Feld eines Heap-Objekts speichert, fügt der JIT nicht nur einen simplen Speicherbefehl ein, sondern ruft eine kleine Hilfsroutine auf, die **Write Barrier**. Sie prüft, ob der gespeicherte Verweis in den ephemeren Bereich zeigt, und markiert in diesem Fall einen Eintrag in der **Card Table**.
+
+Die Card Table ist eine kompakte Tabelle, in der jeder Eintrag (eine „Karte“) für einen kleinen, festen Speicherbereich des Heaps steht. Eine markierte Karte bedeutet: „In diesem Bereich steht möglicherweise ein Verweis auf ein junges Objekt.“ Bei einer Gen0- oder Gen1-Collection durchsucht der GC die Objekte in markierten Karten der älteren Generationen und behandelt ihre Verweise in die jungen Generationen wie zusätzliche Roots. Der Rest von Gen2 bleibt unberührt.
+
+{/* TODO(verify): Card size in bytes on 64-bit (card_size in gc.cpp), and which write barrier variants (precise vs. non-precise, regions) .NET 7+ uses by default. */}
+
+<StepPlayer script={cardScript} />
+
+Damit verteilen sich die Kosten der Generationen auf zwei Stellen: einen kleinen Aufschlag bei jeder Verweis-Zuweisung in ein Heap-Objekt und das Durchsuchen markierter Karten bei jeder ephemeren Collection. Viele Verweise von alten auf junge Objekte machen ephemere Collections spürbar teurer. Wie die Barrier genau aussieht, welche Varianten es gibt und wann der JIT sie weglassen darf, zeigt die Lektion „Write Barriers und Card Tables“.
+
+</Block>
+
+<Block n={5} title="Was bei einer Collection passiert">
+
+### Markieren, Planen, dann Verschieben oder Freigeben
+
+Eine Collection läuft in Phasen ab, die das Book of the Runtime beschreibt. Zuerst die **Markierphase**: Ausgehend von den Roots (und bei ephemeren Collections den markierten Karten) wird alles Erreichbare in den betroffenen Generationen markiert. Danach folgt die **Planphase**: Der GC berechnet, wohin die Überlebenden verschoben würden und wie viel Platz das gewinnt.
+
+Auf dieser Grundlage entscheidet er, ob er **kompaktiert** oder nur **freigibt**. Beim Kompaktieren rücken die Überlebenden zusammen, alle Verweise auf sie werden angepasst, und hinter ihnen entsteht ein zusammenhängender freier Bereich, in dem neue Allokationen wieder einfach einen Zeiger weiterschieben können. Beim Freigeben (Sweep) bleiben die Überlebenden, wo sie sind, und die Lücken dazwischen kommen in eine Freiliste. Das ist billiger, hinterlässt aber Fragmentierung.
+
+In beiden Fällen bezahlt der GC pro Überlebendem: markieren, eventuell kopieren, Verweise auf ihn umschreiben. Die Details der Phasen zeigt die Lektion „Mark, Plan, Relocate, Compact“.
+
+### Was Promotion physisch bedeutet
+
+„Ein Objekt wird nach Gen1 promotet“ heißt nicht, dass ein Statusbit im Objekt umgeschaltet wird. Die Generation ergibt sich daraus, **wo** ein Objekt im Speicher liegt. Promotion bedeutet also entweder, dass das Objekt in den Bereich der älteren Generation kopiert wird, oder dass der Bereich, in dem es liegt, als Ganzes der älteren Generation zugeschlagen wird. Welcher Weg gewählt wird, hängt von der Heap-Organisation und der Entscheidung der Planphase ab.
+
+In Sonderfällen weicht der GC von der einfachen Regel „Überlebende rücken eine Generation auf“ ab, etwa wenn fixierte (gepinnte) Objekte im Weg liegen. Für das mentale Modell reicht die einfache Regel.
+
+{/* TODO(verify): Demotion conditions (pinning, card marking efficiency) and how regions promote whole regions vs. copying survivors. */}
+
+### Segmente und Regions
+
+Wie die Generationen im Adressraum liegen, hat sich mit .NET 7 grundlegend geändert. Früher reservierte der GC wenige große **Segmente**. Gen0 und Gen1 lagen gemeinsam am Ende eines „ephemeren Segments“, Gen2 belegte den Rest und weitere Segmente. Promotion hieß dort oft nur, die Grenze zwischen den Generationen innerhalb eines Segments zu verschieben.
+
+Seit .NET 7 verwendet der GC auf 64-Bit-Systemen standardmäßig **Regions**: viele kleinere, gleich große Speicherblöcke, von denen jede Generation eine Liste besitzt. Eine Region kann nach einer Collection als Ganzes einer anderen Generation zugeordnet oder freigegeben und neu verwendet werden. Das macht den GC flexibler, etwa beim Zurückgeben von Speicher an das Betriebssystem.
+
+<Callout kind="version">
+  Regions sind seit .NET 7 der Standard. Am Modell der drei Generationen ändert das nichts, wohl
+  aber daran, wie Promotion technisch umgesetzt wird und wie Speicher reserviert wird. Details
+  stehen in der Lektion „Segments und Regions“.
+</Callout>
+
+{/* TODO(verify): Regions default only on 64-bit since .NET 7, default region sizes (basic and large), and whether segments can still be enabled via config (clrgc.dll / GCRegionSize). */}
+
+### Und der Large Object Heap?
+
+Objekte ab einer bestimmten Größe kommen nicht nach Gen0, sondern in den **Large Object Heap** (LOH), weil das Kopieren großer Objekte teuer ist. Der LOH hat keine eigenen Collections: Er wird logisch zusammen mit Gen2 eingesammelt. `GC.GetGeneration` liefert für ein Objekt im LOH deshalb 2. Ein großes, kurzlebiges Array kostet damit unverhältnismäßig viel, denn sein Speicher wird erst bei einer vollen Collection frei. Mehr dazu in „LOH, POH und Non-GC-Heap“.
+
+{/* TODO(verify): LOH threshold (85000 bytes) and GC.GetGeneration returning 2 for LOH and POH objects. */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Die Midlife Crisis
+
+Die Generationenhypothese ist eine Wette, und manche Programme verlieren sie systematisch. Gefährlich sind Objekte, die **mittel lang** leben: lange genug, um ein, zwei ephemere Collections zu überleben und in Gen2 zu landen, aber kurz genug, um dort bald zu sterben. Im .NET-Umfeld heißt dieses Muster „Midlife Crisis“.
+
+<StepPlayer script={midlifeScript} />
+
+Das Problem steckt in zwei Effekten. Erstens kosten diese Objekte auf dem Weg nach Gen2 bei jeder ephemeren Collection Arbeit, weil sie überleben und kopiert werden. Zweitens füllen sie Gen2, ohne dort lange gebraucht zu werden. Dadurch ist das Gen2-Budget früher erschöpft, und es kommt häufiger zu vollen Collections, die den ganzen Heap markieren. Background GC mildert die Pausen, weil ein Großteil der Gen2-Arbeit parallel zum Programm läuft, die CPU-Kosten bleiben aber (siehe „Background GC“).
+
+Typische Verursacher: Sitzungs- und Anfrageobjekte mit Timeouts im Sekundenbereich, Caches mit kurzer Ablaufzeit, Objekte, die in asynchronen Abläufen lange auf eine Antwort warten, und Puffer, die über mehrere Schritte einer Pipeline weitergereicht werden. Abhilfe schafft, was die Lebensdauer klar macht: wirklich kurzlebige Objekte (nur so lange halten wie nötig), wirklich langlebige Objekte (wiederverwenden statt neu anlegen, etwa per Pooling) oder weniger Allokationen pro Anfrage, damit weniger Collections in die Lebenszeit eines Objekts fallen.
+
+### GC.Collect von Hand
+
+`GC.Collect()` ohne Argumente erzwingt eine blockierende volle Collection. Das wirkt aufgeräumt, schadet aber oft. Jedes Objekt, das in diesem Moment zufällig noch lebt, wird eine Generation weiter promotet, auch wenn es Millisekunden später gestorben wäre. Du erzeugst also künstlich eine Midlife Crisis. Außerdem bringt ein erzwungener GC die dynamische Abstimmung der Budgets durcheinander, die der GC aus dem tatsächlichen Verhalten deines Programms ableitet. Microsoft rät, `GC.Collect` nur in Ausnahmefällen zu verwenden, etwa nach einem einmaligen Ereignis, das sehr viele langlebige Objekte freigegeben hat, oder in Tests und Messungen.
+
+### Debug-Builds verlängern Lebensdauern
+
+Im Durchspielen war `temp` nach der Schleife keine Root mehr. Das gilt nur für optimierten Code: Der JIT protokolliert dort genau, ab wann eine lokale Variable nicht mehr gebraucht wird, und der GC respektiert das. In Debug-Builds oder unter einem Debugger verlängert der JIT die Lebensdauer lokaler Variablen meist bis zum Ende der Methode, damit du sie im Debugger noch ansehen kannst. Experimente zur Lebensdauer liefern dann andere Ergebnisse. Miss deshalb immer im Release-Build ohne angehängten Debugger, und halte Objekte in Tests bei Bedarf mit `GC.KeepAlive` bewusst am Leben.
+
+{/* TODO(verify): Exact conditions under which the JIT extends local lifetimes (debuggable code, Tier0, attached debugger). */}
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Beobachten
+
+Drei einfache Werkzeuge reichen für einen ersten Blick:
+
+- `GC.CollectionCount(n)` liefert, wie viele Collections von Generation `n` seit dem Prozessstart gelaufen sind. Eine Collection einer älteren Generation zählt dabei auch für die jüngeren mit, weil sie diese ja einschließt.
+- `GC.GetGeneration(obj)` liefert die aktuelle Generation eines Objekts. Gut für Experimente, nicht für Produktionslogik.
+- `dotnet-counters monitor` zeigt laufend die Zahl der Collections pro Generation, die Größe der Generationen und die Allokationsrate eines laufenden Prozesses.
+
+{/* TODO(verify): That CollectionCount(0) includes gen1 and gen2 collections (docs remark), and the exact counter names in System.Runtime for .NET 8 vs .NET 9+ (EventCounters vs. Meter "dotnet.gc.collections"). */}
+
+Ein gesundes Bild sieht meist so aus: viele Gen0-Collections, deutlich weniger Gen1- und sehr wenige Gen2-Collections. Kommen Gen2-Collections fast so oft wie Gen1-Collections, überleben zu viele Objekte die ephemeren Generationen. Für die Ursachensuche brauchst du dann einen Trace mit GC-Ereignissen (siehe „dotnet-counters, -trace, -dump, -gcdump“).
+
+### Muster und ihre Wirkung
+
+| Muster                                     | Wirkung auf die Generationen                                  | Warum                                        | Ausweg                                                      |
+| ------------------------------------------ | ------------------------------------------------------------- | -------------------------------------------- | ----------------------------------------------------------- |
+| Viele kleine, kurzlebige Allokationen      | Häufige, aber billige Gen0-Collections                        | Fast alles ist beim GC schon tot             | Meist unkritisch, bei heißem Code Allokationen reduzieren   |
+| Hohe Allokationsrate                       | Mehr Collections, mehr Objekte sind „zufällig“ noch am Leben  | Gen0-Budget ist schneller erschöpft          | Allokationen vermeiden, `Span<T>`, Wiederverwendung         |
+| Cache mit kurzer Ablaufzeit                | Einträge erreichen Gen2 und sterben dort                      | Midlife Crisis                               | Längere oder viel kürzere Lebensdauer, Größe begrenzen      |
+| Langlebiger Cache mit ständig neuen Werten | Viele markierte Karten, teurere ephemere Collections          | Verweise von Gen2 auf junge Objekte          | Seltener ersetzen, Werte als verweisfreie Structs speichern |
+| Pooling (`ArrayPool<T>`, `ObjectPool<T>`)  | Wenige Allokationen, die Pool-Objekte leben dauerhaft in Gen2 | Wiederverwendung statt neuer Objekte         | Gut für große oder häufige Puffer, Rückgabe nicht vergessen |
+| Großes temporäres Array                    | Speicher wird erst bei einer vollen Collection frei           | Liegt im LOH, der mit Gen2 eingesammelt wird | Pooling oder kleinere Puffer                                |
+| `GC.Collect()` im Code                     | Volle Collection, unnötige Promotion                          | Erzwingt Gen2 und promotet zufällig Lebendes | Entfernen, dem GC vertrauen                                 |
+
+Pooling ist dabei ein schönes Beispiel dafür, dass es nicht um „wenig Objekte in Gen2“ geht. Ein Pool lebt bewusst lange: Seine Puffer liegen dauerhaft in Gen2 und werden nie wieder kopiert. Das passt perfekt zur Hypothese. Schlecht ist nur das Mittelfeld.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die Budgets der Generationen sind keine festen Konstanten. Der GC passt sie laufend an das Verhalten deines Programms an. Überlebt bei Gen0-Collections viel, lohnt sich ein größeres Gen0-Budget, damit mehr Objekte Zeit haben zu sterben. Ist die Überlebensrate niedrig, kann das Budget kleiner bleiben. Das Gen0-Budget orientiert sich zudem an der Hardware, etwa an der Größe des Prozessorcaches, damit frisch allozierte Objekte möglichst noch im Cache liegen.
+
+{/* TODO(verify): How the gen0 budget is derived (L3 cache size, gen0size config), and survival-rate based budget tuning in gc.cpp (desired_new_allocation). */}
+
+Der JIT trägt zwei Dinge bei. Er liefert dem GC für jede Methode Informationen darüber, welche Register und Stack-Slots an welcher Stelle lebende Verweise enthalten. Nur dadurch kann der GC lokale Variablen so präzise als Roots behandeln, wie du es im Durchspielen gesehen hast. Und er fügt die Write Barriers ein, lässt sie aber weg, wo sie nachweislich unnötig sind, etwa beim Schreiben in eine lokale Struct-Variable auf dem Stack.
+
+{/* TODO(verify): Cases where the JIT elides write barriers (stores to stack locations, storing null, known non-heap targets). */}
+
+Wie viele Heaps es gibt und wie aggressiv die Budgets ausfallen, hängt außerdem vom GC-Modus ab. Workstation GC arbeitet mit einem Heap, Server GC mit einem Heap pro Kern und deutlich größeren Budgets, und DATAS passt die Zahl der Heaps dynamisch an die Last an. Die Unterschiede behandelt „Workstation, Server und DATAS“, die Einstellmöglichkeiten „GC-Konfiguration und Container“.
+
+<Callout kind="version">
+  Seit .NET 7 sind Regions der Standard für die Heap-Organisation. DATAS gibt es seit .NET 8 und ist
+  ab .NET 9 bei Server GC standardmäßig aktiv. Das Modell der drei Generationen gilt in allen
+  Versionen.
+</Callout>
+
+{/* TODO(verify): DATAS introduced in .NET 8 (opt-in) and enabled by default for Server GC in .NET 9. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das erste Experiment zeigt Promotion und Zählweise. Ein Objekt überlebt zwei erzwungene Collections, dazu werden die Zähler aller Generationen ausgegeben.
+
+{/* TODO(verify): Expected output in a Release build without debugger (generations 0, 1, 2, 2; counts increasing by one per generation per GC.Collect()). */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ohne Debugger ausführen (dotnet run -c Release). Erwartet: Die Generation steigt mit jeder überlebten Collection bis 2 und bleibt dann dort. Jedes GC.Collect() erhöht alle drei Zähler, weil eine volle Collection auch Gen0 und Gen1 einschließt."
+  code={`static void Print(string label, object o) =>
+    Console.WriteLine($"{label}: Generation {GC.GetGeneration(o)}, " +
+        $"Gen0={GC.CollectionCount(0)} Gen1={GC.CollectionCount(1)} Gen2={GC.CollectionCount(2)}");
+
+var survivor = new object();
+Print("neu", survivor); // Generation 0
+GC.Collect();
+Print("1. GC", survivor); // Generation 1
+GC.Collect();
+Print("2. GC", survivor); // Generation 2
+GC.Collect();
+Print("3. GC", survivor); // Generation 2, höher geht es nicht
+GC.KeepAlive(survivor);
+
+var sink = new object[1]; // verhindert, dass der JIT die Allokation wegoptimiert
+for (int i = 0; i < 10_000_000; i++) sink[0] = new byte[100];
+Print("nach Allokationen", survivor); // viele zusätzliche Gen0-Collections`}
+/>
+
+Die Schleife am Ende zeigt die Generationenhypothese in Aktion: Zehn Millionen kurzlebige Arrays erzeugen viele Gen0-Collections, aber kaum Gen1- oder Gen2-Collections. Die genauen Zahlen hängen von Budget, GC-Modus und Hardware ab.
+
+{/* TODO(verify): Observed gen0/gen1/gen2 count deltas for the allocation loop on a typical machine (Workstation and Server GC). */}
+
+Für einen laufenden Prozess nimmst du `dotnet-counters` (Installation per `dotnet tool install --global dotnet-counters`):
+
+```bash
+dotnet-counters ps
+dotnet-counters monitor --process-id <pid> --counters System.Runtime
+```
+
+In der Ausgabe stehen die Zahl der Collections pro Generation, die Größen von Gen0, Gen1, Gen2 und LOH sowie die Allokationsrate. Lass die Schleife von oben in einer Endlosvariante laufen und beobachte, wie der Gen0-Zähler rasch steigt, während Gen2 fast stillsteht.
+
+{/* TODO(verify): Counter display names in dotnet-counters output for .NET 8 and .NET 9+. */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="generationen"
+  questions={[
+    {
+      q: 'Wovon hängt die Dauer einer Gen0-Collection vor allem ab?',
+      options: [
+        'Von der Menge an Müll in Gen0',
+        'Von der Zahl der überlebenden Objekte',
+        'Von der Größe von Gen2',
+      ],
+      correct: 1,
+      explanation:
+        'Der GC markiert und verschiebt nur Erreichbares. Tote Objekte findet er gar nicht erst, ihr Platz wird als Ganzes wiederverwendet. Gen2 wird bei einer Gen0-Collection nur über markierte Karten berührt.',
+    },
+    {
+      q: 'Welche Generationen räumt eine Gen1-Collection auf?',
+      options: ['Nur Gen1', 'Gen0 und Gen1', 'Gen1 und Gen2'],
+      correct: 1,
+      explanation:
+        'Eine Collection von Generation N schließt immer alle jüngeren Generationen ein. Erst eine Gen2-Collection umfasst den ganzen Heap.',
+    },
+    {
+      q: 'Ein Gen2-Objekt bekommt einen Verweis auf ein neues Objekt. Wie findet eine Gen0-Collection dieses neue Objekt?',
+      options: [
+        'Sie durchsucht zur Sicherheit ganz Gen2',
+        'Über die Card Table, die die Write Barrier bei der Zuweisung markiert hat',
+        'Gar nicht, das neue Objekt wird eingesammelt',
+      ],
+      correct: 1,
+      explanation:
+        'Die Write Barrier markiert bei der Zuweisung die Karte, in der das alte Objekt liegt. Der GC durchsucht nur markierte Karten und behandelt die gefundenen Verweise wie Roots.',
+    },
+    {
+      q: 'Ein Objekt lebt seit einer Stunde, in dieser Zeit lief keine einzige Collection. In welcher Generation liegt es?',
+      options: ['Gen0', 'Gen2', 'Im LOH'],
+      correct: 0,
+      explanation:
+        'Das Alter zählt in überlebten Collections, nicht in Zeit. Ohne Collection gibt es keine Promotion.',
+    },
+    {
+      q: 'Warum sind Objekte, die rund 30 Sekunden leben, oft teurer als solche, die nur Mikrosekunden oder dauerhaft leben?',
+      options: [
+        'Weil sie mehr Speicher belegen',
+        'Weil sie nach Gen2 promotet werden und dort sterben, was volle Collections häufiger macht',
+        'Weil sie die Write Barrier umgehen',
+      ],
+      correct: 1,
+      explanation:
+        'Das ist die Midlife Crisis: Sie überleben die ephemeren Collections, füllen Gen2 und werden erst bei einer vollen Collection freigegeben.',
+    },
+    {
+      q: 'Was ist ein typischer Nebeneffekt von GC.Collect() im Anwendungscode?',
+      options: [
+        'Gar keiner, es werden nur tote Objekte entfernt',
+        'Zufällig noch lebende Objekte werden promotet und die Budget-Abstimmung gestört',
+        'Gen2 wird übersprungen',
+      ],
+      correct: 1,
+      explanation:
+        'Eine erzwungene volle Collection promotet alles, was gerade lebt, auch wenn es kurz danach gestorben wäre, und verzerrt die dynamischen Budgets.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Der GC teilt den Heap in **Gen0, Gen1 und Gen2**, weil die meisten Objekte jung sterben und alte Objekte meist lange leben.
+- Eine Collection von Generation N sammelt **alle jüngeren Generationen mit** ein. Gen2-Collections sind volle Collections, der LOH wird mit Gen2 eingesammelt.
+- Der GC **markiert Lebendes ab den Roots**. Die Kosten hängen an den Überlebenden, nicht an der Menge Müll.
+- Überlebende werden **promotet**. Das Alter zählt in überlebten Collections, nicht in Zeit.
+- Verweise von alt nach jung findet eine ephemere Collection über **Write Barrier und Card Table**, ohne Gen2 komplett zu durchsuchen.
+- **Mittel lang lebende Objekte** sind am teuersten: Sie erreichen Gen2, sterben dort und machen volle Collections häufiger. `GC.Collect()` verschlimmert das.
+- Beobachten lässt sich das mit `GC.CollectionCount`, `GC.GetGeneration` und `dotnet-counters`, immer im Release-Build.
+
+</Block>

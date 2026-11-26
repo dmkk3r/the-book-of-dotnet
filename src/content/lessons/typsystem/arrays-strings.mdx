@@ -1,0 +1,256 @@
+---
+id: arrays-strings
+title: Layout von Arrays und Strings
+summary: Wie Arrays und Strings im Speicher aufgebaut sind, wie Indexzugriff und Bounds-Check funktionieren und welche Eigenheiten wie Kovarianz und Interning daraus folgen.
+status: draft
+sources:
+  - title: 'Arrays (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/language-reference/builtin-types/arrays
+  - title: 'Zeichenfolgen und Zeichenfolgenliterale (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/csharp/programming-guide/strings/
+  - title: 'String.Intern (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.string.intern
+  - title: 'object.h im dotnet/runtime-Repo (ArrayBase, StringObject)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/vm/object.h
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './arrays-strings.steps';
+import covarianceScript from './arrays-strings-covariance.steps';
+import interningScript from './arrays-strings-interning.steps';
+
+<Block n={1} title="Das Problem">
+
+Die meisten Objekte haben eine feste Größe: Ein `Dog` belegt immer gleich viel Speicher, egal wie er heißt. Arrays und Strings sind anders. Ihre Größe steht erst fest, wenn sie erzeugt werden, und sie können winzig oder riesig sein.
+
+Gleichzeitig sollen sie extrem schnell sein. Ein Zugriff auf `arr[i]` darf nicht mehr kosten als eine Rechnung und ein Speicherzugriff, sonst wäre jede Schleife über ein Array langsam. Und er muss sicher sein: Ein Index außerhalb des Arrays darf niemals fremden Speicher lesen oder überschreiben, wie es in C passieren kann.
+
+.NET löst das, indem Arrays und Strings ihre **Länge und ihre Daten direkt im Objekt** speichern. Daraus folgen schnelle Indexzugriffe, sichere Grenzprüfungen und ein paar Eigenheiten, die man kennen sollte.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+1. **Ein Array ist ein Objekt mit variabler Länge:** Object Header, MethodTable-Zeiger, Länge, dann alle Elemente lückenlos hintereinander.
+2. **Arrays von Werttypen enthalten die Werte, Arrays von Referenztypen nur Verweise.** Die Objekte, auf die verwiesen wird, liegen woanders auf dem Heap.
+3. **Ein Indexzugriff ist eine Rechnung:** Startadresse der Elemente plus Index mal Elementgröße, vorher eine Prüfung gegen die Länge.
+4. **Ein `string` ist ebenso aufgebaut:** Länge und Zeichen als UTF-16 direkt im Objekt, dazu ein abschließendes Nullzeichen. Strings sind unveränderlich.
+
+<Callout kind="fehlannahme">
+  „`new object[10]` legt zehn Objekte an.“ Es legt ein einziges Objekt an, ein Array mit zehn
+  Verweisen, die alle `null` sind.
+</Callout>
+
+<Callout kind="hinweis">
+  Alle Größen gelten für 64-Bit-Prozesse. Arrays ab 85.000 Byte landen auf dem Large Object Heap.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Drei Objekte, Byte für Byte: ein `int[]`, ein `string` und ein `object[]`. Achte darauf, was jeweils hinter der Länge steht.
+
+<StepPlayer script={script} />
+
+Die Länge liegt bei allen dreien an derselben Stelle direkt hinter dem MethodTable-Zeiger. Deshalb ist `arr.Length` oder `str.Length` ein einfaches Lesen eines Felds, keine Zählung.
+
+</Block>
+
+<Block n={4} title="Indexzugriff und Bounds-Check">
+
+Was passiert genau bei `int x = numbers[i];`? Der JIT erzeugt Maschinencode, der zwei Dinge tut:
+
+1. **Prüfen:** Ist `i` kleiner als die Länge? Dafür vergleicht er `i` als vorzeichenlose Zahl mit der Länge. Ein negatives `i` wird dabei zu einer riesigen positiven Zahl und fällt durch dieselbe Prüfung. So deckt ein einziger Vergleich beide Fehlerfälle ab. Schlägt die Prüfung fehl, gibt es eine `IndexOutOfRangeException`.
+2. **Rechnen und lesen:** Adresse des Arrays plus Abstand zum ersten Element plus `i` mal 4 Byte. Von dort wird gelesen.
+
+```csharp
+int Sum(int[] a)
+{
+    int s = 0;
+    for (int i = 0; i < a.Length; i++)
+        s += a[i];          // hier kann der JIT die Prüfung weglassen
+    return s;
+}
+```
+
+In einer Schleife wie dieser kann der JIT beweisen, dass `i` nie außerhalb liegt, denn die Schleifenbedingung prüft es bereits. Dann entfällt die Grenzprüfung im Schleifenrumpf. Wie das genau funktioniert und wann es nicht klappt, zeigt die Lektion „Bounds-Check-Elimination“.
+
+{/* TODO(verify): Unsigned compare pattern in x64 JIT asm for array bounds checks (cmp, jae). */}
+
+### Mehrdimensional oder verschachtelt?
+
+`int[,]` ist ein echtes mehrdimensionales Array: ein Objekt, das zusätzlich die Länge jeder Dimension speichert. `int[][]` ist ein Array von Arrays, also ein äußeres Array mit Verweisen auf viele innere. Beide haben ihre Berechtigung, aber auf eindimensionale Arrays mit Untergrenze 0 ist die Runtime besonders optimiert. Verschachtelte Arrays sind deshalb im Zugriff oft schneller als mehrdimensionale, obwohl sie mehr Objekte erzeugen.
+
+{/* TODO(verify): Layout of multidimensional arrays (lengths and lower bounds after the element count) and relative access performance in current .NET. */}
+
+</Block>
+
+<Block n={5} title="Array-Kovarianz">
+
+Aus historischen Gründen sind Arrays von Referenztypen in .NET **kovariant**: Ein `string[]` ist auch ein `object[]`. Das klingt praktisch, hat aber einen Haken.
+
+<StepPlayer script={covarianceScript} />
+
+Weil jedes Array von Referenztypen vielleicht „in Wirklichkeit“ einen spezielleren Elementtyp hat, muss die Runtime **jeden** Schreibzugriff darauf prüfen. Im IL ist das die Instruktion `stelem.ref`, die diese Typprüfung enthält. Der JIT kann sie weglassen, wenn er beweisen kann, dass sie nicht scheitern kann, zum Beispiel wenn der Elementtyp `sealed` ist und der Wert genau diesen Typ hat. Generische Collections wie `List<T>` haben dieses Problem nicht, weil Generics in .NET nicht auf diese Weise kovariant sind.
+
+{/* TODO(verify): Conditions under which the JIT omits the covariant store check (sealed element types, exact types). */}
+
+</Block>
+
+<Block n={6} title="Strings im Detail">
+
+Ein `string` ist ein Array von Zeichen mit Sonderstatus. Drei Eigenschaften sind wichtig:
+
+- **Unveränderlich.** Ein String ändert sich nie. `s.ToUpper()` oder `s + "x"` erzeugen neue Strings. Deshalb können Strings bedenkenlos geteilt werden, und deshalb ist wiederholtes Verketten in Schleifen teuer, wofür es `StringBuilder` gibt.
+- **UTF-16 mit Nullzeichen.** Jedes Zeichen belegt 2 Byte. Am Ende steht ein zusätzliches Nullzeichen, damit Strings ohne Kopie an native Funktionen übergeben werden können, die nullterminierte Strings erwarten.
+- **Literale werden interniert.** Jedes String-Literal gibt es im Prozess nur einmal.
+
+<StepPlayer script={interningScript} />
+
+Der leere String ist ebenfalls ein einziges, gemeinsames Objekt: `string.Empty` und `""` verweisen darauf. Mit `string.Intern(s)` kannst du auch zur Laufzeit erzeugte Strings in die Tabelle aufnehmen. Das lohnt sich nur selten, denn internierte Strings leben dann für den Rest des Prozesses.
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Verweisvergleich bei object
+
+Wie die Visualisierung gezeigt hat, vergleicht `==` bei Variablen vom Typ `object` die Verweise, bei `string`-Variablen den Inhalt. Dieselbe Falle tritt in generischem Code auf: In einer Methode `Compare<T>(T a, T b) where T : class` vergleicht `a == b` immer Verweise, auch wenn `T` später `string` ist. Für Inhaltsvergleiche gehört `Equals` oder ein `EqualityComparer<T>` dorthin.
+
+### Große Arrays
+
+Ein `int[]` mit 21.250 Elementen belegt schon gut 85.000 Byte und landet damit auf dem Large Object Heap. Der wird nur zusammen mit Gen2 eingesammelt und standardmäßig nicht kompaktiert. Wer häufig große Puffer anlegt und wegwirft, sollte sie wiederverwenden, zum Beispiel mit `ArrayPool<T>`. Mehr dazu in „LOH, POH und Non-GC-Heap“ und „ArrayPool und Pooling“.
+
+{/* TODO(verify): Element count at which int[] crosses the 85,000 byte LOH threshold on x64 (header and length included). */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Situation                            | Effekt                                            | Besser                                                       |
+| ------------------------------------ | ------------------------------------------------- | ------------------------------------------------------------ |
+| `s += x` in einer Schleife           | jedes Mal ein neuer String, quadratischer Aufwand | `StringBuilder` oder `string.Join`                           |
+| `s.Substring(…)` für kurze Prüfungen | neuer String pro Aufruf                           | `s.AsSpan(…)` ohne Kopie                                     |
+| häufige große Puffer                 | LOH-Allokationen, Gen2-Collections                | `ArrayPool<T>.Shared`                                        |
+| `object[]` mit Werttypen             | Boxing jedes Elements                             | typisierte Arrays oder `List<T>`                             |
+| `int[,]` in heißen Schleifen         | langsamerer Zugriff                               | `int[][]` oder ein flaches `int[]` mit eigener Indexrechnung |
+| Schreiben in `object[]`              | Typprüfung bei jedem Speichern                    | typisierte Arrays oder generische Collections                |
+
+`Span<T>` und `ReadOnlySpan<T>` passen besonders gut zu Arrays und Strings: Sie zeigen auf einen Ausschnitt der Daten, ohne etwas zu kopieren. Das zeigt die Lektion „Span&lt;T&gt; und Memory&lt;T&gt;“.
+
+</Block>
+
+<Block n={9} title="Was die Runtime dazu tut">
+
+Neben der Bounds-Check-Elimination gibt es zwei Optimierungen, die du kennen solltest:
+
+- **Literale außerhalb des GC-Heaps.** Neuere .NET-Versionen legen String-Literale und andere unveränderliche Objekte in einem Bereich ab, den der GC nicht durchsuchen und nicht verschieben muss. Das spart dem GC Arbeit und erlaubt dem JIT, die Adresse direkt in den Code zu schreiben.
+- **Vektorisierte Operationen.** Viele String- und Array-Methoden wie `IndexOf`, `SequenceEqual` oder `Contains` verarbeiten intern mehrere Elemente auf einmal mit SIMD-Befehlen. Ein handgeschriebener Vergleich Zeichen für Zeichen ist deshalb oft langsamer als die eingebaute Methode.
+
+<Callout kind="version">
+  Die Ablage von String-Literalen in einem nicht vom GC verwalteten Bereich ist mit .NET 8
+  hinzugekommen. Ältere Versionen legen sie auf dem normalen Heap ab.
+</Callout>
+
+{/* TODO(verify): .NET 8 frozen/non-GC heap for string literals and RuntimeType objects. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Der MemoryDiagnoser zeigt die Größe jeder Allokation. Rechne vorher mit dem Modell: Kopf, Länge, Elemente, aufgerundet auf 8 Byte. Im IL siehst du `ldelem` für Lesezugriffe und `stelem.ref` für Schreibzugriffe mit Typprüfung.
+
+{/* TODO(verify): Expected allocations for the three benchmarks on x64 and the .NET version. */}
+
+<VerifyCard
+  sharplab="Stelle in SharpLab die Ausgabe auf „IL“. Beim Schreiben in das object[] steht stelem.ref, beim Lesen aus dem int[] ldelem.i4. Unter „JIT Asm“ siehst du den Vergleich mit der Länge vor dem Zugriff."
+  code={`int[] numbers = { 1, 2, 3 };
+int x = numbers[1];
+
+object[] objs = new string[2];
+objs[0] = "a";
+
+string a = "hallo";
+string b = "hallo";
+Console.WriteLine(ReferenceEquals(a, b));`}
+  benchmark={`[MemoryDiagnoser]
+public class LayoutBench
+{
+    [Benchmark] public int[] IntArray() => new int[3];
+    [Benchmark] public object[] ObjectArray() => new object[2];
+    [Benchmark] public string Text() => new string('x', 2);
+}`}
+expected={[
+{ method: 'IntArray', allocated: '40 B' },
+{ method: 'ObjectArray', allocated: '40 B' },
+{ method: 'Text', allocated: '32 B' },
+]}
+note="Werte für 64-Bit-Prozesse."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="arrays-strings"
+  questions={[
+    {
+      q: 'Wie viele Objekte legt new string[3] an?',
+      options: ['Eins', 'Vier'],
+      correct: 0,
+      explanation: 'Nur das Array. Seine drei Elemente sind Verweise mit dem Wert null.',
+    },
+    {
+      q: 'Warum ist arr.Length so schnell?',
+      options: ['Die Länge steht direkt im Array-Objekt', 'Der JIT zählt die Elemente'],
+      correct: 0,
+      explanation: 'Die Länge liegt direkt hinter dem MethodTable-Zeiger und wird einfach gelesen.',
+    },
+    {
+      q: 'object[] objs = new string[1]; objs[0] = 42; Was passiert?',
+      options: ['Es funktioniert, weil objs ein object[] ist', 'ArrayTypeMismatchException'],
+      correct: 1,
+      explanation: 'Das Array bleibt ein string[]. Die Runtime prüft jeden Schreibzugriff.',
+    },
+    {
+      q: 'string a = "x"; string b = "x"; Was ergibt ReferenceEquals(a, b)?',
+      options: ['True', 'False'],
+      correct: 0,
+      explanation: 'Literale werden interniert. Beide Variablen verweisen auf dasselbe Objekt.',
+    },
+    {
+      q: 'object a = "hallo"; object b = new string("hallo".AsSpan()); Was ergibt a == b?',
+      options: ['True', 'False'],
+      correct: 1,
+      explanation: 'Bei object vergleicht == die Verweise. Es sind zwei verschiedene Objekte.',
+    },
+    {
+      q: 'Warum kann der JIT in for (int i = 0; i < a.Length; i++) den Bounds-Check oft weglassen?',
+      options: [
+        'Weil die Schleifenbedingung i bereits gegen die Länge prüft',
+        'Weil Arrays nie zu kurz sind',
+      ],
+      correct: 0,
+      explanation:
+        'Der JIT erkennt, dass i im Rumpf immer gültig ist, und spart die zweite Prüfung.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Arrays und Strings speichern Länge und Daten direkt im Objekt, nach Header und MethodTable-Zeiger.
+- Arrays von Werttypen enthalten Werte, Arrays von Referenztypen Verweise.
+- Ein Indexzugriff ist eine Rechnung mit vorheriger Grenzprüfung, die der JIT in einfachen Schleifen entfernen kann.
+- Arrays von Referenztypen sind kovariant, deshalb wird jeder Schreibzugriff typgeprüft.
+- Strings sind unveränderlich, UTF-16 mit Nullzeichen, Literale werden interniert.
+- `==` vergleicht bei `string` den Inhalt, bei `object` den Verweis.
+
+</Block>

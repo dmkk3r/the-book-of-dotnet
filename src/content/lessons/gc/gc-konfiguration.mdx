@@ -1,0 +1,402 @@
+---
+id: gc-konfiguration
+title: GC-Konfiguration und Container
+summary: Woher der GC seine Einstellungen nimmt, welche gewinnt, wie er Container-Limits erkennt und welche Stellschrauben es für Speicher, CPU und Latenz wirklich gibt.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Runtime configuration options for garbage collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/runtime-config/garbage-collector
+  - title: '.NET Runtime config options (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/runtime-config/
+  - title: 'Breaking Change in .NET 9: Umgebungsvariablen haben Vorrang (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/compatibility/deployment/9.0/envvar-precedence
+  - title: 'Latenzmodi (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/latency
+  - title: 'GC.RefreshMemoryLimit (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.refreshmemorylimit
+  - title: 'GCMemoryInfo.TotalAvailableMemoryBytes (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gcmemoryinfo.totalavailablememorybytes
+  - title: 'Environment.ProcessorCount (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.environment.processorcount
+  - title: 'GC.GetConfigurationVariables (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.getconfigurationvariables
+  - title: 'GC.TryStartNoGCRegion (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gc.trystartnogcregion
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './gc-konfiguration.steps';
+import limitScript from './gc-konfiguration-limit.steps';
+import oomScript from './gc-konfiguration-oom.steps';
+import { probeCode } from './gc-konfiguration-verify';
+
+<Block n={1} title="Das Problem">
+
+Der GC trifft beim Start eine ganze Reihe von Entscheidungen, ohne dich zu fragen: wie viele Heaps er anlegt, wie viele GC-Threads er startet, wie groß die Budgets der Generationen ausfallen, ab wann er Speicher als knapp betrachtet. Grundlage dafür ist die Maschine, die er sieht: die Zahl der Prozessoren und die Menge an physischem Speicher. Auf einem Entwicklerrechner mit 16 Kernen und 32 GB passt das. Die Standardwerte sind laut Microsoft für die meisten Anwendungen die beste Wahl.
+
+In einem Container sieht die Welt anders aus. Der Host hat vielleicht 64 Kerne und 256 GB, dein Container darf aber nur zwei CPUs und 512 MiB benutzen. Die Grenzen setzt der Linux-Kernel über **cgroups** durch, also Kontrollgruppen, die einer Gruppe von Prozessen Speicher und Rechenzeit zuteilen. Würde der GC die Hostmaschine als Maßstab nehmen, plante er mit Speicher, den er nie bekommt. Der Kernel beendet den Prozess dann einfach, wenn er seine Grenze überschreitet.
+
+Dazu kommt ein zweiter Zielkonflikt, der nichts mit Containern zu tun hat. Ein GC kann auf **Durchsatz** optimieren (möglichst wenig CPU-Zeit insgesamt), auf **Latenz** (möglichst kurze Pausen) oder auf **Speicherbedarf** (möglichst kleiner Heap). Alle drei zugleich geht nicht. Ein Batch-Job will Durchsatz, ein Handelssystem kurze Pausen, ein Microservice, von dem hundert Instanzen auf einem Knoten laufen, wenig Speicher.
+
+Die Runtime bietet deshalb zwei Dinge: Sie erkennt Container-Limits selbst und passt ihre Standards an. Und sie hat Stellschrauben, mit denen du den Zielkonflikt bewusst anders entscheiden kannst. Diese Lektion zeigt, wo diese Schrauben sitzen, welche Einstellung bei Widersprüchen gewinnt und was jede davon kostet.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen den Rest der Lektion:
+
+1. **GC-Einstellungen werden einmal gelesen, beim Initialisieren des GC.** Das passiert beim Prozessstart. Spätere Änderungen an Umgebungsvariablen wirken auf den laufenden Prozess nicht.
+2. **Es gibt drei Quellen.** Die Projektdatei (MSBuild-Eigenschaften), aus der der Build die Datei `<app>.runtimeconfig.json` erzeugt, und Umgebungsvariablen mit dem Präfix `DOTNET_`. Seit .NET 9 gewinnt bei Widersprüchen die Umgebungsvariable.
+3. **In `runtimeconfig.json` stehen Zahlen dezimal, in Umgebungsvariablen hexadezimal.** `DOTNET_GCHeapCount=10` bedeutet 16 Heaps.
+4. **Der GC behandelt ein Container-Limit wie den physischen Speicher der Maschine.** Ohne weitere Angaben setzt er sich im Container ein **Heap Hard Limit** von 75 Prozent dieses Limits, mindestens 20 MB.
+5. **Fast jede Stellschraube tauscht ein Ziel gegen ein anderes.** Weniger Speicher kostet mehr Collections, kürzere Pausen kosten mehr Speicher oder CPU. Ohne Messung weißt du nicht, ob der Tausch sich lohnt.
+
+### Die Stellschrauben nach Ziel
+
+Microsoft Learn gruppiert die Einstellungen danach, was du erreichen willst. Die Namen in der Tabelle sind die Kurzform, die auch in der Umgebungsvariable nach `DOTNET_` steht. In `runtimeconfig.json` heißen sie `System.GC.…`, also etwa `System.GC.HeapHardLimit`.
+
+| Ziel | Einstellung | Werte | Gilt für |
+| --- | --- | --- | --- |
+| Modus | `gcServer` (MSBuild `ServerGarbageCollection`) | 0 Workstation (Standard), 1 Server | alle |
+| Modus | `gcConcurrent` (MSBuild `ConcurrentGarbageCollection`) | 1 Background GC (Standard), 0 aus | alle |
+| Speichergrenze | `GCHeapHardLimit` | Bytes | nur 64-Bit |
+| Speichergrenze | `GCHeapHardLimitPercent` | Prozent des physischen Speichers bzw. Container-Limits | nur 64-Bit |
+| Speichergrenze | `GCHeapHardLimitSOH`, `…LOH`, `…POH` und die `…Percent`-Varianten | pro Objekt-Heap | nur 64-Bit |
+| CPU | `GCHeapCount` | Zahl der Heaps | nur Server GC |
+| CPU | `GCNoAffinitize` | 1: GC-Threads nicht an Kerne binden | nur Server GC |
+| CPU | `GCHeapAffinitizeMask` | Bitmaske der erlaubten Prozessoren | nur Server GC |
+| Speicherverhalten | `GCConserveMemory` | 0 (Standard) bis 9, höher heißt sparsamer | alle |
+| Speicherverhalten | `GCRetainVM` (MSBuild `RetainVMGarbageCollection`) | 1: freien Speicher vorhalten statt zurückgeben | alle |
+| Speicherverhalten | `GCHighMemPercent` | Speicherlast, ab der der GC aggressiv kompaktiert | alle |
+| Großobjekte | `GCLOHThreshold` | Bytes, Standard 85.000, nur größere Werte erlaubt | alle |
+| Server-Anpassung | `GCDynamicAdaptationMode` (DATAS) | 1 an, 0 aus, seit .NET 9 Standard | Server GC |
+
+Nur ein Teil davon hat eine eigene MSBuild-Eigenschaft. Für die übrigen trägst du in der Projektdatei ein `RuntimeHostConfigurationOption`-Element mit dem `runtimeconfig.json`-Namen ein:
+
+```xml
+<ItemGroup>
+  <RuntimeHostConfigurationOption Include="System.GC.HeapHardLimitPercent" Value="60" />
+</ItemGroup>
+```
+
+Was Server GC, Background GC und DATAS jeweils tun, erklären „Workstation, Server und DATAS“ und „Background GC“. Hier geht es nur darum, wie du sie einstellst.
+
+<Callout kind="fehlannahme">
+  „Mehr Konfiguration macht den GC schneller.“ Die Standardwerte sind für die meisten Anwendungen
+  bereits die beste Wahl, und der GC passt Budgets ohnehin laufend an das Verhalten des Programms
+  an. Jede Einstellung zwingt ihn, eine dieser Anpassungen zu unterlassen. Das lohnt sich nur, wenn
+  du ein konkretes, gemessenes Problem hast und die Wirkung danach erneut misst.
+</Callout>
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel setzt dieselbe Einstellung an drei Stellen mit widersprüchlichen Werten. Achte in Schritt 4 darauf, wie die Runtime-Version das Ergebnis ändert, und in Schritt 5 darauf, was eine Änderung zur Laufzeit bewirkt.
+
+<StepPlayer script={script} />
+
+Der wichtigste Moment ist Schritt 4. Bis .NET 8 hatte `runtimeconfig.json` Vorrang vor der Umgebungsvariable, seit .NET 9 ist es umgekehrt. Microsoft hat das als Breaking Change dokumentiert und begründet es damit, dass Umgebungsvariablen in fast allen anderen Konfigurationssystemen ebenfalls gewinnen. Für dich heißt das: Ein Container-Image, das seit Jahren `DOTNET_gcServer=0` mitschleppt, verhält sich nach dem Wechsel auf .NET 9 plötzlich anders, obwohl niemand die Projektdatei angefasst hat.
+
+{/* TODO(verify): That the .NET 9 precedence change applies uniformly to all GC settings read via GCConfig (the breaking change article only shows System.GC.Server as an example). */}
+
+Und noch etwas zeigt der Ablauf: Die MSBuild-Eigenschaft und der Eintrag in `runtimeconfig.json` sind keine zwei unabhängigen Quellen, sondern derselbe Wert in zwei Formen. Der Build übersetzt das eine ins andere. Wer die erzeugte Datei im Ausgabeordner von Hand ändert, verliert die Änderung beim nächsten Build. Für Werte, die du selbst pflegst, ist deshalb die Projektdatei oder eine `runtimeconfig.template.json` der richtige Ort.
+
+</Block>
+
+<Block n={4} title="Container: Speicher und CPU">
+
+### Wie der GC sein Speicherlimit findet
+
+Beim Start fragt die Runtime das Betriebssystem nach dem verfügbaren Speicher. Läuft der Prozess unter einem cgroup-Speicherlimit, zählt dieses Limit als physischer Speicher. Daraus leitet der GC sein **Heap Hard Limit** ab: die Obergrenze für den committeten Speicher des GC-Heaps samt der Verwaltungsdaten des GC. „Committet“ heißt, dass das Betriebssystem diesen Speicher tatsächlich bereitstellen muss, im Unterschied zu bloß reserviertem Adressraum.
+
+{/* TODO(verify): Whether cgroup v1 and cgroup v2 are both supported for memory and CPU limits in .NET 8+, and since which version. */}
+
+Welcher Wert gilt, folgt einer festen Rangfolge. Im Schrittablauf siehst du sie an drei Läufen desselben Containers.
+
+<StepPlayer script={limitScript} />
+
+Die Rangfolge lässt sich als Regel merken: **Je spezifischer, desto stärker.** Limits pro Objekt-Heap schlagen eine absolute Grenze, die absolute Grenze schlägt den Prozentwert, und der Prozentwert schlägt den Standard. Bei den Limits pro Objekt-Heap gibt es eine Falle: Setzt du eines davon, musst du mindestens SOH und LOH angeben, sonst startet die Runtime gar nicht. Bei den Prozentvarianten muss außerdem jeder Wert zwischen 0 und 100 liegen und die Summe unter 100 bleiben.
+
+Die 75 Prozent sind kein Zufallswert. Der Rest des Container-Limits ist Platz für alles, was der GC nicht verwaltet: die Runtime selbst, JIT-Code, Thread-Stacks, native Bibliotheken, Puffer von `NativeMemory` oder Sockets. Bei einer Anwendung, die viel nativen Speicher nutzt, kann ein Viertel zu wenig sein. Bei einer reinen Rechenanwendung mit großem Heap kann es zu viel Reserve sein.
+
+{/* TODO(verify): The docs page only states the 75 % / 20 MB default for "memory-constrained environments (for example, a container)". Check in gc.cpp whether the default also applies to non-container job objects on Windows. */}
+
+### Was am Limit passiert
+
+Das Heap Hard Limit ist eine Grenze, die der GC **kennt**. Nähert sich der Heap ihr, reagiert er: häufigere und gründlichere Collections, auch volle, kompaktierende. Reicht das nicht, scheitert die Allokation mit einer `OutOfMemoryException`. Das ist eine gewöhnliche .NET-Ausnahme auf dem Thread, der alloziert hat. Der Prozess lebt weiter und kann sie protokollieren.
+
+Das Container-Limit dagegen ist eine Grenze, die der **Kernel durchsetzt**. Er zählt den gesamten Speicher des Prozesses, verwaltet und nativ. Wird sie überschritten, beendet er den Prozess hart, ohne Ausnahme und ohne `finally`-Blöcke. In Kubernetes erscheint das als Status `OOMKilled`. Wie unterschiedlich beide Fälle aussehen, zeigt die Stolperfalle weiter unten.
+
+{/* TODO(verify): GC behaviour when approaching the hard limit (provisional mode, more aggressive full compacting GCs) in gc.cpp. */}
+
+### CPU-Limits und die Zahl der Heaps
+
+Für die CPU gilt etwas Ähnliches. `Environment.ProcessorCount` liefert laut Dokumentation das Minimum aus logischen Prozessoren, Prozessoren aus der CPU-Affinität und dem CPU-Limit, aufgerundet auf eine ganze Zahl. Ein Container mit `--cpus=1.5` sieht also zwei Prozessoren. Der Wert steht ab dem Start fest.
+
+Workstation GC ist davon kaum betroffen, er hat ohnehin einen Heap. Server GC legt dagegen standardmäßig einen Heap und einen GC-Thread pro Prozessor an. Wie viele das in einem Container sind, folgt derselben Logik: Die Runtime berücksichtigt das CPU-Limit. Mit `GCHeapCount` kannst du die Zahl selbst begrenzen, mit `GCNoAffinitize` verhindern, dass die GC-Threads fest an bestimmte Kerne gebunden werden. Seit .NET 9 ist bei Server GC außerdem DATAS aktiv, das mit einem Heap beginnt und die Zahl nach Bedarf erhöht (siehe „Workstation, Server und DATAS“).
+
+{/* TODO(verify): That the Server GC heap count honours the cgroup CPU limit (rounded up) and not only affinity; check GCToOSInterface::GetCurrentProcessCpuCount in dotnet/runtime. */}
+
+<Callout kind="hinweis">
+  `GetConfigurationVariables` zeigt, dass der GC Angaben auch korrigiert. Laut Dokumentation wird
+  ein `GCHeapCount`, der größer ist als die Zahl der Prozessoren, auf die Zahl der Prozessoren
+  begrenzt.
+</Callout>
+
+</Block>
+
+<Block n={5} title="Zur Laufzeit steuern: Latenzmodi und Sonderfälle">
+
+Alles bisher wird beim Start festgelegt. Einige Stellschrauben bedient dein Code aber selbst, während das Programm läuft. Sie gelten für den ganzen Prozess, nicht für einen Thread.
+
+### GCSettings.LatencyMode
+
+`GCSettings.LatencyMode` bestimmt, wie aufdringlich der GC sein darf. Die Werte aus `GCLatencyMode`:
+
+| Modus | Wirkung | Einschränkung |
+| --- | --- | --- |
+| `Interactive` | Standard, wenn Background GC aktiv ist | keine |
+| `Batch` | Keine Background- oder Concurrent-Collections, Standard ohne Background GC | höhere Pausen bei Gen2 |
+| `LowLatency` | Unterdrückt Gen2-Collections, nur Gen0 und Gen1 | nur Workstation GC, nur für kurze Zeit |
+| `SustainedLowLatency` | Unterdrückt blockierende Gen2-Collections, Background-Gen2 läuft weiter | braucht Background GC, größerer Heap |
+
+Auch in den Low-Latency-Modi gibt es Gen2-Collections, wenn das Betriebssystem knappen Speicher meldet oder der Code `GC.Collect` mit Generation 2 aufruft. `LowLatency` ist für Sekunden gedacht, etwa eine Animation oder eine Messdatenerfassung. Microsoft rät, in dieser Zeit möglichst wenig zu allozieren, denn weil weniger aufgeräumt wird, kann eine `OutOfMemoryException` auf jedem allozierenden Thread auftreten.
+
+```csharp
+var old = GCSettings.LatencyMode;
+try
+{
+    GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+    RunTradingSession();
+}
+finally
+{
+    GCSettings.LatencyMode = old;
+}
+```
+
+### No GC Region
+
+Noch weiter geht `GC.TryStartNoGCRegion(totalSize)`. Die Methode versucht, vorab genug Speicher für `totalSize` Bytes bereitzustellen, notfalls mit einer Collection, und sagt dann für einen Abschnitt zu, dass keine Collection stattfindet, solange du nicht mehr allozierst. `GC.EndNoGCRegion()` beendet den Abschnitt. Hast du mehr alloziert als angekündigt, gab es zwischendurch doch eine Collection, und `EndNoGCRegion` meldet das mit einer `InvalidOperationException`. Das Werkzeug passt nur für kurze, genau bekannte Abschnitte.
+
+{/* TODO(verify): Upper bound for totalSize (ephemeral segment size with segments, behaviour with regions in .NET 7+) and the exact exceptions of TryStartNoGCRegion and EndNoGCRegion. */}
+
+### Speicher, den der GC nicht sieht
+
+`GC.AddMemoryPressure(bytes)` teilt dem GC mit, dass ein kleines verwaltetes Objekt viel nativen Speicher festhält, etwa ein Wrapper um ein Bild aus einer nativen Bibliothek. Der GC berücksichtigt das bei der Entscheidung, wann er sammelt, sodass solche Wrapper früher finalisiert werden. Zu jedem Aufruf gehört ein passendes `GC.RemoveMemoryPressure`, wenn der native Speicher freigegeben wird. Am Heap Hard Limit ändert das nichts.
+
+### Limits zur Laufzeit neu lesen
+
+`GC.RefreshMemoryLimit()` gibt es seit .NET 8. Die Methode lässt den GC die Speicherlimits neu ermitteln, etwa wenn ein Orchestrator das Container-Limit eines laufenden Containers ändert. Neue Werte für die `GCHeapHardLimit`-Einstellungen kommen dabei aus `AppContext`, nicht aus Umgebungsvariablen:
+
+```csharp
+AppContext.SetData("GCHeapHardLimit", (ulong)100 * 1024 * 1024);
+GC.RefreshMemoryLimit();   // InvalidOperationException, wenn schon mehr committet ist
+```
+
+Liegt das neue Limit unter dem, was bereits committet ist, wirft die Methode eine `InvalidOperationException`. Den GC-Modus, die Zahl der Heaps oder andere Starteinstellungen ändert sie nicht.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Hard Limit und Container-Limit verwechseln
+
+Das Heap Hard Limit schützt den GC-Heap, nicht den Prozess. Der Schrittablauf zeigt zwei Wege, an eine Grenze zu stoßen, und wie verschieden sie enden.
+
+<StepPlayer script={oomScript} />
+
+Wer den OOM-Kill erlebt, setzt oft reflexartig ein kleineres `GCHeapHardLimitPercent`. Das hilft nur, wenn der GC-Heap das Problem ist. Wächst der native Speicher, verschiebt es die Grenze bloß dorthin, wo der GC ohnehin nicht hinkommt. Miss erst, welcher Teil wächst: GC-Heap (`GC.GetGCMemoryInfo`, `dotnet-counters`) oder Gesamtspeicher des Prozesses (Working Set, Container-Metriken).
+
+### Weitere Klassiker
+
+- **Server GC in kleinen Containern.** Server GC ist auf viele Kerne und viel Speicher ausgelegt, mit großen Budgets pro Heap. In einem Container mit einer CPU und wenig Speicher bringt er kaum Durchsatz, kann aber deutlich mehr Speicher belegen als Workstation GC. Vor .NET 9 war das ein häufiger Grund für unerwartet große Container. Mit DATAS ist es entschärft, aber nicht jede Anwendung nutzt .NET 9 oder lässt DATAS eingeschaltet.
+- **Hexadezimal vergessen.** `DOTNET_GCHeapHardLimit=209715200` sieht nach 200 MiB aus, wird aber als hexadezimale Zahl gelesen und ergibt rund 8 GiB. Im Container mit 512 MiB ist das wirkungslos, denn ein Limit über dem Speicher hilft nicht. Richtig ist `0xC800000`.
+- **Zwei Stellen, zwei Werte.** Eine Einstellung in der Projektdatei und eine andere im Kubernetes-Manifest: Welche gilt, hängt seit .NET 9 von der Runtime-Version ab. Lege jede Einstellung an genau einer Stelle fest und prüfe den wirksamen Wert zur Laufzeit.
+- **`GC.Collect` statt Konfiguration.** Ein `GC.Collect()` im Timer, damit der Speicher unten bleibt, erzwingt blockierende volle Collections und promotet alles, was gerade lebt (siehe „Generationen“). Wer einen kleineren Heap will, nimmt `GCConserveMemory` oder ein Hard Limit und lässt den GC entscheiden, wann er sammelt.
+- **Einstellungen ohne Messung.** Jede Schraube hat einen Preis. `GCConserveMemory` kostet häufigere Collections, `SustainedLowLatency` kostet Speicher, ein kleines `GCHeapCount` kostet Durchsatz. Ohne Vorher-nachher-Vergleich weißt du nicht, ob du gewonnen hast.
+
+{/* TODO(verify): 209715200 interpreted as hex is 0x209715200 = 8748356096 bytes (about 8.1 GiB); check how the GC treats a hard limit above the container limit. */}
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Welche Schraube für welches Ziel
+
+| Ziel | Einstellung | Wirkung | Risiko |
+| --- | --- | --- | --- |
+| Hoher Durchsatz auf vielen Kernen | `ServerGarbageCollection` = true | Ein Heap und GC-Thread pro Kern, große Budgets | Mehr Speicher, in kleinen Containern kaum Gewinn |
+| Kurze Pausen bei Gen2 | Background GC an lassen, `SustainedLowLatency` für kritische Phasen | Gen2 läuft überwiegend parallel zum Programm | Größerer Heap, mehr Fragmentierung |
+| Kleinerer Heap | `GCConserveMemory` 5 bis 7 als Startpunkt | GC hält den Heap kleiner, kompaktiert den LOH bei Fragmentierung | Mehr Collections, eventuell längere Pausen |
+| Mehr Platz für nativen Speicher | `GCHeapHardLimitPercent` kleiner als 75 | Mehr Reserve bis zum Container-Limit | Frühere `OutOfMemoryException` im Heap |
+| Mehrere Prozesse teilen sich Kerne | `GCHeapCount`, `GCNoAffinitize` | Weniger GC-Threads, keine feste Bindung an Kerne | Längere Server-GC-Pausen |
+| Weniger Kosten bei schwankendem Heap | `GCRetainVM` = true | Freigewordener Speicher wird vorgehalten statt zurückgegeben | Prozess wirkt größer, als er ist |
+| Große Puffer seltener im LOH | `GCLOHThreshold` größer als 85.000 | Mehr Objekte bleiben in den Generationen | Große Objekte werden beim Kompaktieren kopiert |
+
+Microsoft empfiehlt für `GCConserveMemory`, mit Werten zwischen 5 und 7 zu experimentieren. Für `GCLOHThreshold` gilt: Kleinere Werte als der Standard sind nicht erlaubt, und die Runtime kann zu große Werte kappen. Was der LOH genau ist, steht in „LOH, POH und Non-GC-Heap“.
+
+### Den wirksamen Wert prüfen
+
+Weil Einstellungen aus mehreren Quellen kommen und korrigiert werden können, gilt: Prüfe, was der Prozess tatsächlich verwendet, nicht, was du eingetragen hast.
+
+- `GCSettings.IsServerGC` und `GCSettings.LatencyMode` zeigen Modus und Latenzmodus.
+- `GC.GetGCMemoryInfo().TotalAvailableMemoryBytes` zeigt, mit wie viel Speicher der GC rechnet. Ist ein Hard Limit gesetzt, ist es dieser Wert. Im Container ist es laut Dokumentation ein implementierungsabhängiger Anteil des Container-Limits.
+- `GC.GetConfigurationVariables()` (seit .NET 7) liefert die Konfiguration, mit der der GC arbeitet, nach seinen eigenen Korrekturen.
+- `AppContext.GetData("System.GC.Server")` zeigt nur, was in `runtimeconfig.json` steht. Eine Umgebungsvariable taucht dort nicht auf. Für den wirksamen Wert ist das also die falsche Frage.
+
+{/* TODO(verify): That AppContext.GetData does not reflect DOTNET_ environment variables for GC settings. */}
+
+Im laufenden Betrieb zeigt `dotnet-counters monitor` die Heap-Größe, die Zahl der Collections pro Generation, die Zeit im GC und den committeten Speicher. Liegt der committete Speicher dauerhaft knapp unter dem Hard Limit, und steigt zugleich der Anteil der Zeit im GC, arbeitet der GC an seiner Grenze. Werkzeuge und Counter beschreibt „dotnet-counters, -trace, -dump, -gcdump“.
+
+{/* TODO(verify): Counter names for committed memory and % time in GC in dotnet-counters for .NET 8 and .NET 9+ (System.Runtime EventCounters vs. System.Runtime meter). */}
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die Container-Unterstützung ist über mehrere Versionen gewachsen. Seit .NET Core 3.0 gibt es die Einstellungen für das Heap Hard Limit und den Standard für Container. .NET 5 brachte die Limits pro Objekt-Heap, .NET 6 die Umgebungsvariablen mit dem Präfix `DOTNET_` (`COMPlus_` funktioniert weiterhin) und `GCConserveMemory`. Mit .NET 7 kamen Regions als Heap-Organisation auf 64-Bit (siehe „Segments und Regions“) und `GC.GetConfigurationVariables`, mit .NET 8 `GC.RefreshMemoryLimit` und DATAS als Option, mit .NET 9 DATAS als Standard für Server GC und der Vorrang der Umgebungsvariablen.
+
+<Callout kind="version">
+  .NET 9 ändert zwei Dinge, die bei einem Upgrade auffallen können: Umgebungsvariablen schlagen
+  jetzt `runtimeconfig.json`, und Server GC verwendet standardmäßig DATAS. Ein Container, der
+  vorher mit vielen Heaps lief, kann danach mit deutlich weniger Speicher und anderen Pausenzeiten
+  laufen.
+</Callout>
+
+{/* TODO(verify): Version list: HeapHardLimit and container default since .NET Core 3.0, per-object-heap limits since .NET 5, GCConserveMemory since .NET 6, DATAS opt-in in .NET 8 and default in .NET 9 (all according to the version columns on the Microsoft Learn GC config page). */}
+
+Mit Regions reserviert der GC beim Start einen Bereich virtuellen Adressraums. Ist ein Hard Limit gesetzt, richtet sich dessen Größe danach, laut Dokumentation das Fünffache eines einzelnen Hard Limits. Das ist nur reservierter, nicht committeter Speicher und zählt nicht gegen das Container-Limit. Bei Prozessen mit begrenztem virtuellem Speicher kann die Reservierung aber scheitern, dann hilft die Einstellung `GCRegionRange`.
+
+Der JIT ist an der Konfiguration nicht beteiligt. Er erzeugt denselben Code, egal ob Workstation oder Server GC läuft, denn Allokation und Write Barrier rufen Hilfsroutinen der Runtime auf, die zum gewählten GC passen.
+
+{/* TODO(verify): That JIT-generated code is identical for Workstation and Server GC (allocation helpers and write barrier are runtime helpers patched or selected at startup). */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das Programm gibt aus, wie der GC sich selbst sieht. Lege es als Konsolenanwendung an, baue ein Container-Image daraus (`dotnet publish` mit einem der offiziellen Basis-Images) und starte es in vier Varianten.
+
+<VerifyCard
+  sharplab="Kein SharpLab-Experiment: als Konsolenanwendung im Release-Modus ausführen, einmal direkt und dreimal im Container (Befehle unter dieser Karte). Erwartet: Direkt auf dem Rechner entspricht TotalAvailableMemory ungefähr dem physischen Speicher und IsServerGC ist False. Mit --memory=512m sinkt der Wert auf einen Anteil von 512 MiB, ProcessorCount zeigt 2. Mit DOTNET_GCHeapHardLimit=0xC800000 erscheinen 200 MiB. Mit DOTNET_gcServer=1 ist IsServerGC True."
+  code={probeCode}
+/>
+
+{/* TODO(verify): Actual output of all four runs (.NET 8 and .NET 9), in particular TotalAvailableMemoryBytes in the container without explicit limit (384 MiB expected from the 75 % rule, docs only say "implementation-defined fraction"), and the key names returned by GC.GetConfigurationVariables (ServerGC, GCHeapHardLimit, GCHeapCount). */}
+
+```bash
+# 1. Direkt auf dem Rechner
+dotnet run -c Release
+
+# 2. Im Container mit 512 MiB und 2 CPUs
+docker run --rm --memory=512m --cpus=2 gcprobe
+
+# 3. Zusätzlich feste Grenze 200 MiB (hexadezimal)
+docker run --rm --memory=512m --cpus=2 -e DOTNET_GCHeapHardLimit=0xC800000 gcprobe
+
+# 4. Server GC im selben Container
+docker run --rm --memory=512m --cpus=2 -e DOTNET_gcServer=1 gcprobe
+```
+
+Ein zweites Experiment zeigt die Hex-Falle: Starte Variante 3 mit `DOTNET_GCHeapHardLimit=209715200` statt `0xC800000`. Der ausgegebene Wert ist dann nicht 200 MiB. Und ein drittes zeigt die Rangfolge: Trage `ServerGarbageCollection` mit `true` in die Projektdatei ein und starte mit `DOTNET_gcServer=0`. Unter .NET 8 meldet `IsServerGC` dann True, unter .NET 9 False.
+
+{/* TODO(verify): Observed results of the hex experiment and of the precedence experiment on .NET 8 vs .NET 9. */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="gc-konfiguration"
+  questions={[
+    {
+      q: 'Eine App läuft unter .NET 9. In der Projektdatei steht ServerGarbageCollection = true, der Container setzt DOTNET_gcServer=0. Welcher GC läuft?',
+      options: [
+        'Server GC, weil die Projektdatei Vorrang hat',
+        'Workstation GC, weil seit .NET 9 die Umgebungsvariable gewinnt',
+        'Die App startet nicht, weil die Angaben sich widersprechen',
+      ],
+      correct: 1,
+      explanation:
+        'Seit .NET 9 haben Umgebungsvariablen Vorrang vor runtimeconfig.json und MSBuild-Eigenschaften. Bis .NET 8 war es umgekehrt.',
+    },
+    {
+      q: 'Was bewirkt DOTNET_GCHeapCount=10?',
+      options: [
+        '10 Heaps',
+        '16 Heaps, sofern Server GC aktiv ist und genug Prozessoren da sind',
+        '10 Prozent der Prozessoren als Heaps',
+      ],
+      correct: 1,
+      explanation:
+        'Zahlen in Umgebungsvariablen werden hexadezimal gelesen, auch ohne 0x. GCHeapCount wirkt nur bei Server GC, und Werte über der Prozessorzahl werden auf diese begrenzt.',
+    },
+    {
+      q: 'Ein Container hat 1 GiB Limit, keine GC-Einstellung ist gesetzt. Wie groß ist das Heap Hard Limit?',
+      options: [
+        'Es gibt keins, der GC nutzt den Speicher des Hosts',
+        '75 Prozent des Container-Limits, also 768 MiB',
+        'Genau 1 GiB',
+      ],
+      correct: 1,
+      explanation:
+        'Im Container setzt der GC standardmäßig ein Hard Limit von 75 Prozent des Container-Limits, mindestens 20 MB. Der Rest bleibt für nicht verwalteten Speicher.',
+    },
+    {
+      q: 'Der Prozess wird vom Kernel mit OOMKilled beendet, obwohl der GC-Heap weit unter seinem Hard Limit liegt. Was ist die wahrscheinlichste Ursache?',
+      options: [
+        'Das Hard Limit ist zu hoch',
+        'Nativer Speicher außerhalb des GC-Heaps ist gewachsen',
+        'Der GC hat zu selten gesammelt',
+      ],
+      correct: 1,
+      explanation:
+        'Das Hard Limit begrenzt nur den GC-Heap. Der Kernel zählt den gesamten Speicher des Prozesses. Wächst nativer Speicher, hilft ein kleineres Hard Limit nicht.',
+    },
+    {
+      q: 'Du änderst zur Laufzeit per Environment.SetEnvironmentVariable den Wert von DOTNET_GCHeapHardLimit. Was passiert?',
+      options: [
+        'Der GC übernimmt das neue Limit bei der nächsten Collection',
+        'Nichts, GC-Einstellungen werden nur beim Start gelesen',
+        'Das neue Limit gilt nach GC.RefreshMemoryLimit',
+      ],
+      correct: 1,
+      explanation:
+        'Umgebungsvariablen liest der GC nur beim Initialisieren. GC.RefreshMemoryLimit liest neue Limits aus AppContext (AppContext.SetData), nicht aus der Umgebung.',
+    },
+    {
+      q: 'Wann ist GCLatencyMode.LowLatency eine schlechte Wahl?',
+      options: [
+        'Für eine zwei Sekunden lange Animation in einer Desktop-App',
+        'Dauerhaft in einem Webserver mit Server GC',
+        'Für eine kurze Messdatenerfassung',
+      ],
+      correct: 1,
+      explanation:
+        'LowLatency unterdrückt Gen2-Collections, ist nur für kurze Zeit gedacht und nur mit Workstation GC verfügbar. Für längere Phasen gibt es SustainedLowLatency.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- GC-Einstellungen werden **einmal beim Start** gelesen. Quellen sind Projektdatei bzw. `runtimeconfig.json` und `DOTNET_`-Umgebungsvariablen, seit .NET 9 gewinnt die Umgebungsvariable.
+- In `runtimeconfig.json` stehen Zahlen **dezimal**, in Umgebungsvariablen **hexadezimal**, auch ohne `0x`.
+- Im Container behandelt der GC das Speicherlimit als physischen Speicher und setzt sich ohne weitere Angaben ein **Hard Limit von 75 Prozent**, mindestens 20 MB.
+- Rangfolge der Limits: **pro Objekt-Heap, dann absolut, dann Prozent, dann Standard**.
+- Das Hard Limit führt zu einer `OutOfMemoryException`, das Container-Limit zum **OOM-Kill**. Nativer Speicher zählt nur zum zweiten.
+- `GCSettings.LatencyMode`, No GC Regions und `GC.RefreshMemoryLimit` steuern den GC zur Laufzeit, jeweils mit klaren Einschränkungen.
+- Den wirksamen Wert prüfst du mit `GCSettings`, `GC.GetGCMemoryInfo` und `GC.GetConfigurationVariables`, nicht in der Projektdatei. Jede Änderung nur mit Messung davor und danach.
+
+</Block>

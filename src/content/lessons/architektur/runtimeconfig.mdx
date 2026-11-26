@@ -1,0 +1,380 @@
+---
+id: runtimeconfig
+title: 'runtimeconfig.json und deps.json'
+summary: Welche zwei Dateien der Build neben deine App legt, was genau darin steht, wie der Host daraus Framework-Wahl, TPA-Liste und Laufzeiteinstellungen macht und wer gewinnt, wenn Projektdatei, JSON und Umgebungsvariable sich widersprechen.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: '.NET Runtime config options (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/runtime-config/
+  - title: 'Runtime configuration options for garbage collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector
+  - title: 'Breaking change: Environment variables take precedence in app runtime configuration settings (.NET 9, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/compatibility/deployment/9.0/envvar-precedence
+  - title: 'Breaking change: runtimeconfig.dev.json file not generated (.NET 6 SDK, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/compatibility/sdk/6.0/runtimeconfigdev-file
+  - title: 'Breaking change: configProperties in .runtimeconfig.dev.json override .runtimeconfig.json (.NET 11, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/compatibility/deployment/11/runtimeconfigdev-configproperties-precedence
+  - title: 'Default probing (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/dependency-loading/default-probing
+  - title: '.NET Runtime Identifier (RID) catalog (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/rid-catalog
+  - title: 'dotnet/runtime: Runtime properties the host passes to the runtime'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-runtime-information.md
+  - title: 'dotnet/runtime: Host probing'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-probing.md
+  - title: 'dotnet/runtime: Framework version resolution'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/framework-version-resolution.md
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './runtimeconfig.steps';
+import depsScript from './runtimeconfig-deps.steps';
+import precedenceScript from './runtimeconfig-precedence.steps';
+import { configCode, switchCode } from './runtimeconfig-verify';
+
+<Block n={1} title="Das Problem">
+
+Auf deinem Rechner weiß die Projektdatei alles über die App: gegen welches Framework sie gebaut wird, welche NuGet-Pakete sie braucht, ob der GC im Server-Modus laufen soll. Auf dem Server, im Container oder beim Kunden gibt es diese Projektdatei aber nicht. Dort liegt nur der Ausgabeordner mit `App.dll` und ein paar weiteren Dateien. Und trotzdem muss beim Start jemand diese Fragen beantworten, und zwar bevor auch nur eine Zeile verwalteten Codes läuft.
+
+Die Assembly selbst taugt dafür nur begrenzt. Ihre Metadaten nennen zwar die Assemblies, gegen die kompiliert wurde, aber nicht, wo sie liegen, aus welchem Paket sie kommen oder welche native Bibliothek für Linux und welche für Windows gilt. Und Einstellungen wie der GC-Modus gehören nicht in den Code, weil man sie ohne Neubau ändern können will.
+
+Der Build löst das mit zwei kleinen JSON-Dateien neben der App. `App.runtimeconfig.json` beschreibt, **womit** die App laufen will: Framework, Version, Regeln für Roll Forward und Einstellungen für die Runtime. `App.deps.json` beschreibt, **woraus** die App besteht: jede Bibliothek, jede Datei, die sie zur Laufzeit beisteuert, getrennt nach Plattform. Die Lektion „Der Host: dotnet, hostfxr, hostpolicy“ hat gezeigt, wer diese Dateien liest. Hier geht es darum, was drinsteht, wie es hineinkommt und was daraus wird.
+
+Der Zielkonflikt dahinter: Die Dateien sollen vom Build zuverlässig erzeugt werden, damit niemand sie von Hand pflegen muss. Gleichzeitig sollen Betrieb und Entwicklung einzelne Werte übersteuern können, ohne neu zu bauen. Genau an dieser Stelle entstehen die meisten Überraschungen.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Fünf Sätze tragen das Modell:
+
+1. **Die Projektdatei ist zur Laufzeit unsichtbar.** Der Build übersetzt MSBuild-Eigenschaften in `App.runtimeconfig.json` und Paketverweise in `App.deps.json`. Nur diese Dateien kommen beim Host an.
+2. **runtimeconfig.json hat zwei Leser.** `hostfxr` liest Framework, Version und `rollForward`. Alles unter `configProperties` reicht `hostpolicy` ungelesen als Name-Wert-Paar an die Runtime weiter.
+3. **deps.json bestimmt, was ladbar ist.** `hostpolicy` baut daraus die TPA-Liste und die Suchpfade für native Bibliotheken und Ressourcen. Was dort fehlt, findet der Standard-Ladekontext nicht.
+4. **Jede Einstellung landet im AppContext.** `AppContext.GetData` zeigt, was übergeben wurde, nicht zwingend, was die Runtime verwendet.
+5. **Es gibt eine Rangfolge.** MSBuild-Eigenschaft vor `runtimeconfig.template.json`, und seit .NET 9 Umgebungsvariable vor der Datei.
+
+<Callout kind="fehlannahme">
+  „Die `runtimeconfig.json` ist nur Deko, die Runtime liest ohnehin die `.csproj`.“ Die Runtime hat
+  die Projektdatei nie gesehen. Löschst du die `runtimeconfig.json` einer framework-abhängigen App,
+  startet sie nicht mehr, und änderst du dort einen Wert, gilt er beim nächsten Start.
+</Callout>
+
+{/* TODO(verify): Exact error when App.runtimeconfig.json is missing for a framework-dependent app started via dotnet App.dll (hostfxr treats the app as self-contained and fails to find hostpolicy). */}
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Verfolge eine einzige Einstellung, den Server-GC, von der Projektdatei bis zur Abfrage in der App. Achte darauf, an welcher Stelle die Projektdatei aus dem Spiel ist und wer den Wert tatsächlich auswertet.
+
+<StepPlayer script={script} />
+
+Der Code-Tab zeigt neben der Projektdatei ein eigenes Element `RuntimeHostConfigurationOption`. Damit lässt sich jeder beliebige Schlüssel in `configProperties` bringen, auch einer, den nur deine eigene Bibliothek kennt. Für die Runtime ist das kein Unterschied: Sie reicht alles in den `AppContext` durch und wertet nur die Schlüssel aus, die sie selbst kennt.
+
+</Block>
+
+<Block n={4} title="Was in der runtimeconfig.json steht">
+
+### Der Aufbau
+
+Für eine Konsolen-App mit `net8.0` und den Einstellungen aus dem Durchspielen erzeugt der Build ungefähr diese Datei:
+
+```json
+{
+  "runtimeOptions": {
+    "tfm": "net8.0",
+    "framework": {
+      "name": "Microsoft.NETCore.App",
+      "version": "8.0.0"
+    },
+    "configProperties": {
+      "System.GC.Server": true,
+      "System.Globalization.Invariant": true,
+      "MyApp.UseNewParser": true
+    }
+  }
+}
+```
+
+{/* TODO(verify): Exact generated file (property order, additional default properties such as System.Reflection.Metadata.MetadataUpdater.IsSupported or System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization that the SDK adds by default). */}
+
+Alles hängt unter `runtimeOptions`. Die Felder im Einzelnen:
+
+| Feld | Bedeutung | Leser |
+| --- | --- | --- |
+| `tfm` | Zielframework des Builds, informativ | `hostfxr` |
+| `framework` | ein gefordertes Framework mit Mindestversion | `hostfxr` |
+| `frameworks` | Liste, wenn die App mehrere Frameworks direkt fordert | `hostfxr` |
+| `includedFrameworks` | bei self-contained: welche Frameworks mitgeliefert sind | `hostfxr` |
+| `rollForward` | Regel für die Versionswahl | `hostfxr` |
+| `additionalProbingPaths` | weitere Ordner, in denen Bibliotheken aus der `deps.json` gesucht werden | `hostpolicy` |
+| `configProperties` | beliebige Name-Wert-Paare für Runtime und Bibliotheken | Runtime, App |
+
+{/* TODO(verify): That "frameworks" (array) is used when an app references more than one shared framework directly, and "includedFrameworks" in self-contained apps (framework-version-resolution.md, host-components.md). */}
+
+Die Versionsauswahl mit `framework` und `rollForward` hat die Lektion „Der Host: dotnet, hostfxr, hostpolicy“ ausführlich behandelt. Wichtig für diese Lektion ist die Arbeitsteilung: `hostfxr` braucht nur den oberen Teil, um die Frameworks zu wählen. `configProperties` ist für den Host eine schwarze Kiste.
+
+### Woher die Werte kommen
+
+Du schreibst diese Datei normalerweise nicht selbst. Das SDK erzeugt sie bei jedem Build aus drei Quellen: festen Angaben wie Zielframework und Framework-Verweis, einer optionalen Datei `runtimeconfig.template.json` neben der Projektdatei und MSBuild-Eigenschaften. Die Vorlage hat dieselbe Form wie die Ausgabedatei, nur ohne die äußere Ebene `runtimeOptions`. Definieren Vorlage und MSBuild-Eigenschaft denselben Schlüssel, gewinnt die MSBuild-Eigenschaft.
+
+Einige häufige Zuordnungen:
+
+| MSBuild-Eigenschaft | Schlüssel in `configProperties` | Umgebungsvariable |
+| --- | --- | --- |
+| `ServerGarbageCollection` | `System.GC.Server` | `DOTNET_gcServer` |
+| `ConcurrentGarbageCollection` | `System.GC.Concurrent` | `DOTNET_gcConcurrent` |
+| `InvariantGlobalization` | `System.Globalization.Invariant` | `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT` |
+| `TieredCompilation` | `System.Runtime.TieredCompilation` | `DOTNET_TieredCompilation` |
+| `TieredPGO` | `System.Runtime.TieredPGO` | `DOTNET_TieredPGO` |
+| `RuntimeHostConfigurationOption` | frei wählbar | keine |
+
+{/* TODO(verify): Each row against the Microsoft Learn runtime-config pages (garbage-collector, globalization, compilation); in particular the environment variable names DOTNET_gcConcurrent, DOTNET_SYSTEM_GLOBALIZATION_INVARIANT and DOTNET_TieredPGO. */}
+
+Achte auf die letzte Spalte: Die Namen der Umgebungsvariablen folgen keiner einheitlichen Regel aus den Schlüsseln. Viele stammen aus der Zeit, als die Runtime-Schalter noch `COMPlus_` hießen. Seit .NET 5 ist `DOTNET_` das bevorzugte Präfix, `COMPlus_` wird weiterhin akzeptiert. Nicht jede Einstellung hat alle drei Eingänge, die Dokumentation jeder Einstellung nennt, welche es gibt.
+
+{/* TODO(verify): That COMPlus_ is still accepted by CoreCLR as a fallback prefix in .NET 8 and later, and that DOTNET_ was introduced in .NET 5. */}
+
+### Eine Datei, die du ändern darfst
+
+Weil die Datei nur JSON im Ausgabeordner ist, kann der Betrieb sie direkt bearbeiten. Das ist ausdrücklich vorgesehen: Microsoft empfiehlt, als Entwickler die Vorlage zu pflegen und als Betreiber einer fertigen App direkt die `App.runtimeconfig.json` zu ändern. Die Kehrseite ist ebenso dokumentiert: Der nächste Build überschreibt die Datei.
+
+### runtimeconfig.dev.json und zusätzliche Suchpfade
+
+Bis zum .NET 5 SDK legte der Build zusätzlich eine `App.runtimeconfig.dev.json` an. Sie enthielt vor allem `additionalProbingPaths` mit dem NuGet-Paketordner deines Benutzers, damit eine App direkt aus dem Build-Ordner laufen konnte, ohne alle Paketdateien dorthin zu kopieren. Seit dem .NET 6 SDK entsteht die Datei standardmäßig nicht mehr, weil die Paketdateien ohnehin in den Ausgabeordner kopiert werden und das Suchen nach der Datei Startzeit kostete. Mit `GenerateRuntimeConfigDevFile` lässt sie sich wieder einschalten.
+
+{/* TODO(verify): That the dev file mainly contained additionalProbingPaths pointing to the user's NuGet package folder. */}
+
+Ganz verschwunden ist die Datei nicht. Liest der Host sie, werden ihre `additionalProbingPaths` mit denen der Hauptdatei zusammengeführt. Seit .NET 11 gilt außerdem: Definieren beide Dateien denselben Schlüssel in `configProperties`, gewinnt die `.dev.json`. Microsoft begründet das mit Überschreibungen während der Entwicklung, ohne die Produktionsdatei anzufassen. Für den Betrieb heißt das: Eine liegengebliebene `.dev.json` im Ausgabeordner kann ab .NET 11 Einstellungen übersteuern.
+
+{/* TODO(verify): That hostpolicy/hostfxr merges additionalProbingPaths from runtimeconfig.dev.json, and whether dotnet publish ever copies a runtimeconfig.dev.json into the publish folder. */}
+
+</Block>
+
+<Block n={5} title="Was in der deps.json steht">
+
+### Ziele, Bibliotheken, Assets
+
+Die `deps.json` ist länger und technischer. Sie beantwortet für jede beteiligte Bibliothek drei Fragen: Was ist sie (Paket, Projekt, Referenz)? Welche Dateien steuert sie zur Laufzeit bei? Für welche Plattform gilt welche Datei? Im folgenden Beispiel bringt ein frei erfundenes Paket eine verwaltete Assembly, eine native Bibliothek für Linux und Windows und eine deutsche Ressourcen-Assembly mit.
+
+<StepPlayer script={depsScript} />
+
+Unter `targets` steht für jedes Ziel (Zielframework, bei RID-spezifischen Builds mit RID im Namen) die Liste der Bibliotheken mit ihren **Assets**. Die wichtigsten Asset-Arten:
+
+| Abschnitt | Inhalt | wird zu |
+| --- | --- | --- |
+| `runtime` | verwaltete Assemblies | Einträgen der TPA-Liste |
+| `native` | native Bibliotheken für alle Plattformen des Ziels | nativen Suchpfaden |
+| `runtimeTargets` | plattformspezifische Dateien mit `rid` und `assetType` | TPA oder nativem Suchpfad, nur für die passende RID |
+| `resources` | Satelliten-Assemblies mit `locale` | Suchpfaden für Ressourcen |
+
+Unter `libraries` steht für jede Bibliothek der Typ, bei Paketen ein Hash und der relative Pfad, unter dem das Paket in einem Paketordner liegt. Diesen Pfad braucht `hostpolicy`, wenn es eine Datei nicht im App-Ordner, sondern in einem der `additionalProbingPaths` sucht.
+
+{/* TODO(verify): Field names in "libraries" (type, serviceable, sha512, path, hashPath) and that path is used for probing in additionalProbingPaths (host-probing.md). */}
+
+### Die RID-Auswahl
+
+Ein portabler Build soll überall laufen. Deshalb stehen alle plattformspezifischen Dateien eines Pakets in der `deps.json`, und erst `hostpolicy` entscheidet beim Start, welche gilt. Bis .NET 7 nutzte es dafür einen großen RID-Graphen, in dem zum Beispiel `ubuntu.22.04-x64` auf `linux-x64` und weiter auf `unix` zurückfiel. Seit .NET 8 kennt die Runtime für diese Auswahl nur noch eine feste Menge portabler RIDs wie `linux-x64`, `linux`, `unix` und `any`. Pakete mit Dateien für eine bestimmte Distribution werden dann nicht mehr automatisch bedient, das SDK warnt beim Build davor.
+
+{/* TODO(verify): That the old RID graph came from Microsoft.NETCore.App.deps.json and can be re-enabled via the runtimeconfig property System.Runtime.Loader.UseRidGraph; warning code NETSDK1206. */}
+
+### Wenn die deps.json fehlt
+
+Die Datei ist nicht zwingend. Fehlt sie, nimmt `hostpolicy` an, dass der App-Ordner alle Abhängigkeiten enthält, und baut die Listen aus seinem Inhalt: jede Assembly im Ordner kommt auf die TPA-Liste, der Ordner selbst wird nativer Suchpfad. Für eine kleine App ohne Pakete merkst du keinen Unterschied. Bei Paketen mit `runtimes/<rid>/`-Unterordnern geht dagegen die Information verloren, welche Datei für welche Plattform gilt. Die Dateien liegen dann im Ordner, aber niemand wählt sie aus.
+
+{/* TODO(verify): That without deps.json hostpolicy does not descend into runtimes/<rid>/ subfolders. */}
+
+Umgekehrt ist eine vorhandene, aber veraltete `deps.json` gefährlicher als gar keine. Kopierst du eine zusätzliche Assembly von Hand in den Ordner, steht sie nicht in der Datei und damit nicht auf der TPA-Liste. Ergänzen lässt sich die Liste auch ohne Neubau: Die Umgebungsvariable `DOTNET_ADDITIONAL_DEPS` und die Muxer-Option `--additional-deps` nennen weitere `deps.json`-Dateien, allerdings nur für framework-abhängige Apps.
+
+### Wer sonst noch liest
+
+Der Host ist nicht der einzige Leser. Die Bibliothek `Microsoft.Extensions.DependencyModel` liest dieselbe Datei zur Laufzeit, um etwa Plugins oder Razor-Kompilierung mit Informationen über Pakete zu versorgen. Den Pfad bekommt sie aus der Laufzeiteigenschaft `APP_CONTEXT_DEPS_FILES`, die Datei des Frameworks aus `FX_DEPS_FILE`.
+
+{/* TODO(verify): Concrete consumers of Microsoft.Extensions.DependencyModel at runtime (Razor runtime compilation, plugin loaders) in current ASP.NET Core versions. */}
+ Wie eigene Ladekontexte Assemblies außerhalb der TPA-Liste laden, zeigt die Lektion „AssemblyLoadContext und Isolierung“.
+
+</Block>
+
+<Block n={6} title="AppContext: Schalter und Daten">
+
+### Der Topf, in dem alles landet
+
+Beim Start ruft die Runtime eine verwaltete Methode in `System.Private.CoreLib` auf und übergibt ihr alle Eigenschaften, die vom Host gekommen sind: die eigenen des Hosts wie `TRUSTED_PLATFORM_ASSEMBLIES` und alle Einträge aus `configProperties`. Ab da liegen sie im `AppContext`, einem einfachen Wörterbuch aus Name und Wert für den ganzen Prozess.
+
+{/* TODO(verify): That CorHost2::CreateAppDomainWithManager calls the managed AppContext.Setup with all property names and values (src/coreclr/vm/corhost.cpp). */}
+
+Lesen kannst du auf zwei Arten. `AppContext.GetData(name)` liefert den rohen Wert, bei Werten aus JSON als Zeichenkette, auch wenn in der Datei ein JSON-Boolean stand. `AppContext.TryGetSwitch(name, out bool)` ist für Schalter gedacht und deutet einen solchen Text als Wahrheitswert. Schreiben kannst du mit `AppContext.SetSwitch` und `AppDomain.CurrentDomain.SetData`.
+
+{/* TODO(verify): That TryGetSwitch falls back to GetData and parses the string with bool.TryParse when the switch was not set via SetSwitch. */}
+
+### Schalter für Bibliotheken
+
+Das macht den `AppContext` zum vorgesehenen Ort für Kompatibilitätsschalter: Eine Bibliothek ändert ein Verhalten und bietet einen Schalter an, mit dem Anwendungen das alte Verhalten zurückbekommen. Die Anwendung setzt ihn über `RuntimeHostConfigurationOption` in der Projektdatei, über die Vorlage oder direkt im Code, bevor die Bibliothek ihn zum ersten Mal abfragt.
+
+<VerifyCard
+  sharplab="Dieses Muster ist für eigene Bibliotheken gedacht. Der Schalter wird einmal gelesen und dann zwischengespeichert, deshalb muss die App ihn vor der ersten Verwendung setzen."
+  code={switchCode}
+/>
+
+Einige Schalter der Klassenbibliothek sind zusätzlich **Feature-Switches** für das Trimming: Der Trimmer kann einen fest gesetzten Wert als Konstante behandeln und den abgeschalteten Code ganz entfernen. Mehr dazu in „Trimming und Reflection“.
+
+### Übergeben ist nicht verwendet
+
+Der Topf hat eine Eigenschaft, die man kennen muss: Er weiß nichts davon, ob ein Wert wirkt. `GetData("System.GC.Server")` zeigt, was in der Datei stand. Ob der GC aber tatsächlich im Server-Modus läuft, hat der GC beim Start selbst entschieden, und dabei kann er weitere Quellen berücksichtigt haben. Für die Frage „was gilt?“ fragst du deshalb die Komponente selbst, beim GC über `GCSettings.IsServerGC`.
+
+</Block>
+
+<Block n={7} title="Stolperfalle: Wer gewinnt?">
+
+Für viele Einstellungen gibt es drei Eingänge: MSBuild-Eigenschaft, `runtimeconfig.json` und Umgebungsvariable. Die ersten beiden sind keine echten Konkurrenten, denn die MSBuild-Eigenschaft wird beim Build zum Eintrag in der Datei. Spannend wird es zwischen Datei und Umgebungsvariable, und genau hier hat sich das Verhalten mit .NET 9 umgedreht.
+
+<StepPlayer script={precedenceScript} />
+
+Die Begründung des .NET-Teams für die Änderung: Umgebungsvariablen haben in fast allen Konfigurationssystemen Vorrang, auch in `Microsoft.Extensions.Configuration`. Die alte Reihenfolge war die Ausnahme. Für dich heißt das zweierlei. Prüfe beim Umstieg auf .NET 9, ob in deinen Container-Images, CI-Pipelines oder Startskripten `DOTNET_`-Variablen stehen, die bisher still ignoriert wurden. Und miss bei Zweifeln, was gilt, statt nur nachzulesen, was konfiguriert ist.
+
+Die vollständige Rangfolge für eine Runtime-Einstellung, von stark nach schwach:
+
+1. Umgebungsvariable `DOTNET_…` (seit .NET 9, vorher hinter der Datei)
+2. `configProperties` in `App.runtimeconfig.dev.json`, falls vorhanden (seit .NET 11, vorher hinter der Hauptdatei)
+3. `configProperties` in `App.runtimeconfig.json`, dort hinein beim Build: MSBuild-Eigenschaft vor `runtimeconfig.template.json`
+4. Standardwert der Runtime
+
+`AppContext.SetSwitch` taucht in dieser Liste nicht auf. Es wirkt nur auf Code, der den Schalter nach dem Setzen abfragt, und nie auf Entscheidungen, die die Runtime vor `Main` getroffen hat.
+
+{/* TODO(verify): Whether the .NET 9 precedence change applies to all CLRConfig knobs or only to settings read through the shared config lookup (GC, tiering), and whether the .NET 11 dev.json rule depends on the runtime or the host version. */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+| Situation | Was passiert | Ausweg |
+| --- | --- | --- |
+| Einstellung in der `.csproj` geändert, aber nur `App.dll` deployt | alte `runtimeconfig.json` bleibt auf dem Server | immer den ganzen Ausgabeordner deployen |
+| Wert direkt in `App.runtimeconfig.json` geändert | wirkt beim nächsten Start, bis zum nächsten Build | dauerhafte Werte in die Projektdatei oder Vorlage |
+| `FileNotFoundException`, obwohl die DLL im Ordner liegt | Datei fehlt in der `deps.json`, also nicht auf der TPA-Liste | Paket oder Projekt referenzieren statt Dateien kopieren |
+| `DllNotFoundException` nur auf einer Linux-Distribution | Paket liefert nur distributionsspezifische RIDs, die seit .NET 8 nicht mehr gewählt werden | Paket mit portablen RIDs verwenden oder Bibliothek selbst laden |
+| Nach Update auf .NET 9 plötzlich Workstation-GC | alte `DOTNET_gcServer`-Variable gewinnt jetzt | Variable entfernen oder bewusst setzen |
+| `AppContext.GetData` zeigt einen Wert, die App verhält sich anders | Umgebungsvariable übersteuert, `GetData` zeigt nur die Datei | die Komponente selbst fragen |
+
+{/* TODO(verify): That DllNotFoundException is the observed exception when a native runtimeTargets asset for a distro-specific RID is skipped. */}
+
+Ein Muster zieht sich durch: Wer verstehen will, wie eine App startet, schaut zuerst in den Ausgabeordner, nicht in die Projektdatei. Die beiden JSON-Dateien dort sind die Wahrheit, die der Host sieht.
+
+</Block>
+
+<Block n={9} title="Was Runtime und Host dazu tun">
+
+Der Host behandelt die beiden Dateien unterschiedlich streng. `runtimeconfig.json` ist für framework-abhängige Apps Pflicht, `deps.json` optional. Beide liest der Host bei jedem Start neu, es gibt keinen Zwischenspeicher. Das ist ein Grund, warum der Wegfall der `.dev.json` messbar Startzeit gespart hat: Jede zusätzliche Datei ist ein Dateizugriff auf dem kritischen Pfad, bevor die Runtime überhaupt läuft.
+
+Auch die Übergabe der TPA-Liste ändert sich. Bisher ist sie eine einzige lange Zeichenkette, die die Runtime beim Start zerlegt. Nach dem Design-Dokument zu den Laufzeiteigenschaften liefert der Host die Liste ab .NET 12 standardmäßig über Rückruffunktionen, mit denen die Runtime nur die Pfade erfragt, die sie braucht. Die Zeichenkette lässt sich weiterhin abrufen.
+
+{/* TODO(verify): The .NET 12 change (get_assembly_names and resolve_assembly_to_path callbacks in host_runtime_contract) and whether AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") still returns the full list. */}
+
+<Callout kind="version">
+  .NET 6 SDK: keine `runtimeconfig.dev.json` mehr per Standard. .NET 8: RID-spezifische Dateien
+  werden nur noch über portable RIDs gewählt. .NET 9: Umgebungsvariablen haben Vorrang vor
+  `runtimeconfig.json`. .NET 11: `configProperties` aus der `.dev.json` übersteuern die Hauptdatei.
+  Die Beispiele dieser Lektion verwenden .NET 8 und 9.
+</Callout>
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+### Die Dateien ansehen
+
+Lege mit `dotnet new console` ein Projekt an, setze `ServerGarbageCollection` und `InvariantGlobalization` auf `true`, füge ein beliebiges NuGet-Paket hinzu und baue. Öffne dann `bin/Debug/net8.0/App.runtimeconfig.json` und `App.deps.json`.
+
+Erwartetes Ergebnis: In der `runtimeconfig.json` stehen beide Schlüssel unter `configProperties`. In der `deps.json` erscheint das Paket zweimal, unter `targets` mit seinen Dateien und unter `libraries` mit Typ `package` und Pfad.
+
+{/* TODO(verify): Run with .NET 8 SDK and compare the generated files with the examples in this lesson. */}
+
+### Übergabe gegen Wirkung
+
+Ersetze `Program.cs` durch den folgenden Code und starte die App einmal normal und einmal mit `DOTNET_gcServer=0`.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht, SharpLab startet Code über eine eigene Umgebung. Lege mit dotnet new console ein Projekt an und starte es mit dotnet run."
+  code={configCode}
+/>
+
+Erwartetes Ergebnis: Ohne Variable zeigt `GetData` für `System.GC.Server` den Wert `true`, und `IsServerGC` ist `True`. Mit `DOTNET_gcServer=0` bleibt `GetData` bei `true`, aber `IsServerGC` wird unter .NET 9 `False`, unter .NET 8 bleibt es `True`. `APP_CONTEXT_DEPS_FILES` zeigt den Pfad zu deiner `App.deps.json`.
+
+{/* TODO(verify): Run on .NET 8 and .NET 9 and confirm the expected output, especially GetData staying "true". */}
+
+### Den Host beim Lesen beobachten
+
+Mit `DOTNET_HOST_TRACE=1` (ältere Schreibweise `COREHOST_TRACE=1`) protokolliert der Host, welche `runtimeconfig.json` und `deps.json` er liest, welche RID er für `runtimeTargets` verwendet und welche Eigenschaften er an die Runtime übergibt. Benenne testweise die `App.deps.json` um und vergleiche die TPA-Liste im Protokoll.
+
+{/* TODO(verify): That DOTNET_HOST_TRACE is accepted alongside COREHOST_TRACE in .NET 8 and later (default-probing doc lists DOTNET_HOST_TRACE). */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="runtimeconfig"
+  questions={[
+    {
+      q: 'Du änderst in der .csproj ServerGarbageCollection auf false und kopierst nur die neue App.dll auf den Server. Welcher GC-Modus gilt dort?',
+      options: ['Workstation-GC, die DLL enthält die Einstellung', 'Weiterhin Server-GC, die alte runtimeconfig.json gilt'],
+      correct: 1,
+      explanation:
+        'Die Einstellung steht nicht in der Assembly, sondern in App.runtimeconfig.json. Die Runtime sieht die Projektdatei nie.',
+    },
+    {
+      q: 'Wer interpretiert die Einträge unter configProperties?',
+      options: ['hostfxr', 'hostpolicy', 'Runtime und Bibliotheken, der Host reicht sie nur durch'],
+      correct: 2,
+      explanation:
+        'hostfxr nutzt Framework und rollForward. hostpolicy übergibt configProperties als Name-Wert-Paare an coreclr_initialize, ausgewertet werden sie von der Runtime oder später über den AppContext.',
+    },
+    {
+      q: 'Eine DLL liegt im App-Ordner, fehlt aber in der vorhandenen App.deps.json. Was passiert beim Laden über den Standard-Ladekontext?',
+      options: ['Sie wird gefunden, weil sie im Ordner liegt', 'Sie wird nicht gefunden, weil sie nicht auf der TPA-Liste steht'],
+      correct: 1,
+      explanation:
+        'Mit vorhandener deps.json baut hostpolicy die TPA-Liste aus dieser Datei. Nur ohne deps.json wird der ganze App-Ordner aufgenommen.',
+    },
+    {
+      q: 'runtimeconfig.json setzt System.GC.Server auf true, die Umgebung DOTNET_gcServer=0. Welcher GC läuft unter .NET 9?',
+      options: ['Server-GC', 'Workstation-GC'],
+      correct: 1,
+      explanation:
+        'Seit .NET 9 haben Umgebungsvariablen Vorrang vor runtimeconfig.json. Unter .NET 8 hätte die Datei gewonnen.',
+    },
+    {
+      q: 'Was zeigt AppContext.GetData("System.GC.Server") in diesem Fall?',
+      options: ['Den Wert, den der GC tatsächlich verwendet', 'Den Wert, den der Host aus der Datei übergeben hat'],
+      correct: 1,
+      explanation:
+        'Der AppContext enthält die übergebenen Eigenschaften. Was gilt, verrät die Komponente selbst, hier GCSettings.IsServerGC.',
+    },
+    {
+      q: 'Eine portable App nutzt ein Paket mit nativen Dateien unter runtimes/linux-x64/native und runtimes/win-x64/native. Wann wird entschieden, welche Datei gilt?',
+      options: ['Beim Build', 'Beim Start durch hostpolicy anhand der RID der Maschine', 'Erst beim ersten DllImport durch den JIT'],
+      correct: 1,
+      explanation:
+        'Beide Varianten stehen unter runtimeTargets in der deps.json. hostpolicy wählt beim Start die passende RID und nimmt nur deren Ordner in die nativen Suchpfade auf.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Zur Laufzeit gibt es keine Projektdatei. Der Build übersetzt sie in **App.runtimeconfig.json** (womit die App läuft) und **App.deps.json** (woraus sie besteht).
+- `hostfxr` liest aus der `runtimeconfig.json` nur Framework, Version und `rollForward`. **configProperties** reicht `hostpolicy` ungelesen an die Runtime weiter.
+- MSBuild-Eigenschaften wie `ServerGarbageCollection` werden zu Schlüsseln wie `System.GC.Server`. Eigene Schlüssel kommen über `RuntimeHostConfigurationOption` oder `runtimeconfig.template.json` hinein.
+- Die **deps.json** bestimmt TPA-Liste, native Suchpfade und Ressourcenpfade. Plattformspezifische Dateien wählt `hostpolicy` beim Start nach RID, seit .NET 8 nur über portable RIDs.
+- Ohne deps.json wird der ganze App-Ordner aufgenommen. Mit deps.json ist nur ladbar, was darin steht.
+- Alle Eigenschaften landen im **AppContext**. `GetData` zeigt, was übergeben wurde, nicht, was gilt.
+- Seit .NET 9 gewinnt eine `DOTNET_`-**Umgebungsvariable** gegen `runtimeconfig.json`. `AppContext.SetSwitch` in `Main` ändert keine Entscheidung, die vor `Main` gefallen ist.
+
+</Block>

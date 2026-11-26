@@ -1,0 +1,366 @@
+---
+id: metadaten-tabellen
+title: Metadatentabellen und Tokens
+summary: Wie eine Assembly ihre Typen, Methoden und Verweise als Tabellen speichert, was ein Metadaten-Token ist und wie aus einer Zahl im IL zur Laufzeit eine echte Methode in einer anderen Assembly wird.
+status: draft
+sources:
+  - title: 'ECMA-335 (CLI-Standard), Partition II, Kapitel 22 bis 24: Metadatentabellen, Signaturen, Streams'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'ECMA-335 Augments (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/specs/Ecma-335-Augments.md
+  - title: 'Book of the Runtime: Type Loader Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-loader.md
+  - title: 'corhdr.h (CorTokenType und Metadatenkonstanten, dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/inc/corhdr.h
+  - title: 'MetadataReader (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.reflection.metadata.metadatareader
+  - title: 'Module.ResolveMethod (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.reflection.module.resolvemethod
+  - title: 'MemberInfo.MetadataToken (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.reflection.memberinfo.metadatatoken
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './metadaten-tabellen.steps';
+import encodingScript from './metadaten-tabellen-encoding.steps';
+import genericsScript from './metadaten-tabellen-generics.steps';
+import { tokenCode } from './metadaten-tabellen-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine Assembly muss alles über ihren Inhalt beschreiben: jeden Typ mit Basisklasse und Interfaces, jedes Feld mit seinem Typ, jede Methode mit Parametern, Rückgabetyp und Attributen. Und sie muss beschreiben, was sie von anderen Assemblies benutzt. Ein Aufruf von `Console.WriteLine` in deinem Code ist ein Verweis auf eine Methode, die in einer ganz anderen Datei steht, die beim Kompilieren vielleicht nur als Referenzassembly vorlag und zur Laufzeit in einer anderen Version vorliegt.
+
+Die naheliegende Lösung wäre, alles als Text abzulegen, etwa so, wie ildasm es anzeigt: `call void [System.Console]System.Console::WriteLine(string)`. Das wäre lesbar, aber für eine Runtime denkbar ungeeignet. Jeder Aufruf müsste beim Übersetzen einen langen String zerlegen und vergleichen. Derselbe Name stünde hundertfach in der Datei. Und ein Methodenrumpf mit vielen Aufrufen wäre um ein Vielfaches größer als sein eigentlicher Code.
+
+Gesucht ist also ein Format, das drei Dinge gleichzeitig kann: kompakt sein, schnellen Zugriff auf ein bestimmtes Element erlauben und trotzdem Verweise über Assembly-Grenzen hinweg ausdrücken, die erst zur Laufzeit an ein konkretes Ziel gebunden werden. Die Antwort von ECMA-335 ist eine kleine **relationale Datenbank** in jeder Assembly, und die Zahlen, mit denen der Code auf ihre Einträge zeigt, heißen **Metadaten-Tokens**.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Wie die Metadaten in der Datei liegen, zeigt „Aufbau einer Assembly“: ein Stream `#~` mit Tabellen und daneben die Heaps `#Strings`, `#US`, `#Blob` und `#GUID`. Fünf Sätze beschreiben, wie dieser Inhalt organisiert ist:
+
+1. **Metadaten sind Tabellen mit Zeilen fester Größe.** Es gibt eine Tabelle für Typdefinitionen, eine für Methoden, eine für Felder, eine für Verweise auf fremde Typen und so weiter. Jede Tabelle hat eine feste Nummer, die Zeilen sind ab 1 nummeriert.
+2. **Alles Variable steht in Heaps.** Namen, String-Literale, Signaturen und Attributwerte haben keine feste Länge. Die Tabellenzeile enthält nur einen Index in den passenden Heap.
+3. **Ein Token ist die Adresse einer Zeile.** Das oberste Byte nennt die Tabelle, die unteren drei Byte die Zeile. Der IL-Code enthält keine Namen, sondern Tokens.
+4. **Def und Ref sind zwei Welten.** Was in diesem Modul definiert ist, steht in Def-Tabellen (TypeDef, MethodDef, Field). Was anderswo definiert ist, wird in Ref-Tabellen nur beschrieben (TypeRef, MemberRef, AssemblyRef), mit Name und Signatur.
+5. **Refs werden zur Laufzeit per Name gebunden.** Die Runtime folgt der Kette bis zur AssemblyRef, lädt die Assembly und sucht dort Typ und Member per Name und Signatur.
+
+Daraus folgt auch: Ein Token ist nur innerhalb seines Moduls eindeutig. `0x06000002` ist in deiner Assembly die Methode `Helper`, in jeder anderen Assembly etwas völlig anderes.
+
+<Callout kind="fehlannahme">
+  „Ein Methodenaufruf im IL enthält den Methodennamen.“ Er enthält einen Opcode und ein vier Byte
+  langes Token. Den Namen, den ildasm oder ILSpy daneben anzeigen, haben die Werkzeuge selbst aus den
+  Tabellen zusammengesucht. Gebunden wird der Name trotzdem, aber erst zur Laufzeit und über den
+  Umweg einer MemberRef-Zeile.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel ruft eine fremde Methode (`Console.WriteLine`) und eine eigene (`Helper`) auf. Verfolge, wie viele Tabellen die Runtime für den ersten Aufruf durchläuft und wie wenige für den zweiten.
+
+<StepPlayer script={script} />
+
+Im Tab „IL“ stehen hinter jeder Instruktion als Kommentar Opcode und Token, so wie sie in der Datei stehen. Die Zeilennummern 12, 5 und 2 sind Beispiele: Welche Zeile ein Eintrag bekommt, hängt davon ab, in welcher Reihenfolge der Compiler die Verweise anlegt. Fest ist dagegen das Prinzip. `0x70000001` für das erste String-Literal und `0x06` für Methoden dieses Moduls wirst du in fast jeder Assembly wiederfinden.
+
+{/* TODO(verify): Row numbers in the walkthrough are examples; check actual tokens of this program with the verify sample or ILSpy (Release build, net8.0). */}
+
+</Block>
+
+<Block n={4} title="Die Tabellen im Detail">
+
+### Die wichtigsten Tabellen
+
+ECMA-335 definiert in Partition II, Kapitel 22, rund 40 Tabellen. Für das Verständnis reichen wenige:
+
+| Nr.    | Tabelle        | Eine Zeile beschreibt                                                    | Wichtige Spalten                                       |
+| ------ | -------------- | ------------------------------------------------------------------------ | ------------------------------------------------------ |
+| `0x00` | Module         | dieses Modul                                                             | Name, Mvid (Index in `#GUID`)                          |
+| `0x01` | TypeRef        | einen Typ, der anderswo definiert ist                                    | ResolutionScope, TypeName, TypeNamespace               |
+| `0x02` | TypeDef        | einen Typ, der hier definiert ist                                        | Flags, TypeName, TypeNamespace, Extends, FieldList, MethodList |
+| `0x04` | Field          | ein Feld eines hier definierten Typs                                     | Flags, Name, Signature                                 |
+| `0x06` | MethodDef      | eine hier definierte Methode                                             | RVA, Flags, Name, Signature, ParamList                 |
+| `0x08` | Param          | einen Parameter (Name, Position, Attribute)                              | Flags, Sequence, Name                                  |
+| `0x0A` | MemberRef      | ein Feld oder eine Methode, auf die der Code verweist                     | Class, Name, Signature                                 |
+| `0x0C` | CustomAttribute| ein angewendetes Attribut                                                | Parent, Type (Konstruktor), Value (Blob)               |
+| `0x11` | StandAloneSig  | eine Signatur ohne Member, etwa die lokalen Variablen einer Methode       | Signature                                              |
+| `0x1B` | TypeSpec       | einen zusammengesetzten Typ wie `List<int>` oder `int[]`                  | Signature                                              |
+| `0x20` | Assembly       | das Manifest dieser Assembly (höchstens eine Zeile)                      | Version, Flags, PublicKey, Name, Culture               |
+| `0x23` | AssemblyRef    | eine referenzierte Assembly                                              | Version, PublicKeyOrToken, Name, Culture               |
+| `0x27` | ExportedType   | einen Typ, der an eine andere Assembly weitergeleitet wird               | TypeName, TypeNamespace, Implementation                |
+| `0x2B` | MethodSpec     | eine Instanz einer generischen Methode                                   | Method, Instantiation                                  |
+
+{/* TODO(verify): Table numbers and column lists against ECMA-335 II.22 (Module 0x00, TypeRef 0x01, TypeDef 0x02, Field 0x04, MethodDef 0x06, Param 0x08, MemberRef 0x0A, CustomAttribute 0x0C, StandAloneSig 0x11, TypeSpec 0x1B, Assembly 0x20, AssemblyRef 0x23, ExportedType 0x27, MethodSpec 0x2B) and the CorTokenType values in corhdr.h. */}
+
+Die erste Zeile der Tabelle TypeDef ist immer der Pseudotyp `<Module>`. Er nimmt globale Funktionen und Felder auf, die es in C# nicht gibt, in anderen Sprachen aber schon. Deshalb beginnen die Typen aus deinem Quelltext frühestens bei `0x02000002`. Neuere Compiler legen zusätzlich eigene Hilfstypen an, etwa eingebettete Attribute, die ebenfalls Zeilen belegen.
+
+{/* TODO(verify): Which types Roslyn embeds for net8.0 (e.g. Microsoft.CodeAnalysis.EmbeddedAttribute, RefSafetyRulesAttribute) and whether they come before or after the source types in TypeDef. */}
+
+### Spalten: Konstanten, Indizes und Listen
+
+Jede Spalte hat eine von wenigen Arten:
+
+- **Konstanten** wie Flags oder Versionsnummern, mit fester Breite von 1, 2 oder 4 Byte.
+- **Heap-Indizes** in `#Strings`, `#Blob` oder `#GUID`. Sie sind 2 Byte breit, bei großen Heaps 4 Byte. Ein Bit im Header des Streams `#~` legt das pro Heap fest.
+- **Einfache Indizes** auf eine bestimmte Tabelle. Sie sind 2 Byte breit, solange die Zieltabelle weniger als 2 hoch 16 Zeilen hat, sonst 4 Byte.
+- **Kodierte Indizes** für Spalten, die auf eine von mehreren Tabellen zeigen können.
+
+Weil die Breiten von der Größe der Tabellen abhängen, ist jede Zeile innerhalb einer Assembly gleich lang, zwischen Assemblies aber nicht unbedingt. Der Header von `#~` enthält dafür eine Bitmaske der vorhandenen Tabellen und für jede deren Zeilenzahl. Daraus berechnet ein Leser alle Spaltenbreiten und damit die Position jeder Zeile.
+
+Besonders platzsparend sind die **Listen**. Eine TypeDef-Zeile speichert in `FieldList` und `MethodList` nur den Index des ersten Felds und der ersten Methode. Die Felder eines Typs reichen bis zum Beginn der Liste des nächsten Typs. Deshalb müssen alle Methoden eines Typs in der Tabelle MethodDef direkt hintereinander stehen. Dasselbe Muster gilt für die Parameter einer Methode in `ParamList`.
+
+### Kodierte Indizes
+
+Die Spalte `Extends` einer TypeDef-Zeile zeigt auf die Basisklasse. Die kann im selben Modul definiert sein (TypeDef), in einer anderen Assembly (TypeRef) oder ein generischer Typ wie `List<int>` sein (TypeSpec). Statt drei Spalten gibt es einen **kodierten Index**: Die unteren Bits sind ein Tag, der die Tabelle auswählt, der Rest ist die Zeile.
+
+| Kodierter Index   | Tag-Bits | Mögliche Tabellen (Tag)                                           | Verwendet in                            |
+| ----------------- | -------- | ----------------------------------------------------------------- | --------------------------------------- |
+| TypeDefOrRef      | 2        | TypeDef (0), TypeRef (1), TypeSpec (2)                            | TypeDef.Extends, InterfaceImpl          |
+| ResolutionScope   | 2        | Module (0), ModuleRef (1), AssemblyRef (2), TypeRef (3)           | TypeRef.ResolutionScope                 |
+| MemberRefParent   | 3        | TypeDef (0), TypeRef (1), ModuleRef (2), MethodDef (3), TypeSpec (4) | MemberRef.Class                      |
+| HasCustomAttribute| 5        | 22 Tabellen, von MethodDef bis MethodSpec                         | CustomAttribute.Parent                  |
+
+{/* TODO(verify): Tag assignments and bit counts in ECMA-335 II.24.2.6 (TypeDefOrRef, ResolutionScope, MemberRefParent, HasCustomAttribute with 22 tables). */}
+
+Ein TypeRef in Zeile 5 wird als TypeDefOrRef also zu `(5 << 2) | 1 = 21`. Auch hier hängt die Breite von den Tabellen ab: 2 Byte genügen, solange die größte beteiligte Tabelle weniger als 2 hoch (16 minus Tag-Bits) Zeilen hat.
+
+Manche Tabellen sind nach einer Spalte sortiert, etwa CustomAttribute nach `Parent`. Wer alle Attribute einer Methode sucht, kann deshalb binär suchen, statt die ganze Tabelle zu durchlaufen.
+
+</Block>
+
+<Block n={5} title="Tokens, Heaps und Signaturen">
+
+### Tokens im IL-Strom
+
+Ein Token ist eine 32-Bit-Zahl. Das oberste Byte ist die Tabellennummer aus der Tabelle oben, die unteren drei Byte sind die Zeile. Damit passen bis zu 2 hoch 24 Zeilen in jede Tabelle. Im IL steht das Token direkt hinter dem Opcode, in Little Endian:
+
+<StepPlayer script={encodingScript} />
+
+Welche Tokens eine Instruktion annimmt, legt Partition III für jede Instruktion fest:
+
+| Instruktionen                                   | Erlaubte Tokens                                                   |
+| ----------------------------------------------- | ----------------------------------------------------------------- |
+| `call`, `callvirt`, `newobj`, `ldftn`           | MethodDef, MemberRef, MethodSpec                                  |
+| `ldfld`, `stfld`, `ldsfld`, `ldflda`            | Field, MemberRef                                                  |
+| `box`, `castclass`, `isinst`, `newarr`, `initobj` | TypeDef, TypeRef, TypeSpec                                      |
+| `ldtoken`                                       | Typ-, Methoden- und Feld-Tokens                                   |
+| `ldstr`                                         | User String (`0x70`)                                              |
+| `calli`                                         | StandAloneSig (die Signatur des Aufrufs)                          |
+
+{/* TODO(verify): Allowed token kinds per instruction in ECMA-335 Partition III (call, callvirt, newobj, ldftn, ldfld family, box family, ldtoken, ldstr, calli). */}
+
+`0x70` fällt aus der Reihe: Es gibt keine Tabelle für String-Literale. Die unteren drei Byte sind der Byte-Offset des Literals im Heap `#US`. Ganz ähnlich wird `typeof(T)` zu `ldtoken` mit einem Typ-Token, und erst ein anschließender Aufruf von `Type.GetTypeFromHandle` macht daraus ein `Type`-Objekt.
+
+### Die Heaps
+
+Die vier Heaps unterscheiden sich in Inhalt und Kodierung:
+
+- **`#Strings`** enthält Bezeichner als nullterminiertes UTF-8. Offset 0 ist der leere String. Gleiche Namen werden in der Regel nur einmal abgelegt.
+- **`#US`** enthält die Literale aus deinem Code als UTF-16, jeweils mit vorangestellter Länge und einem abschließenden Zusatzbyte. Offset 0 ist leer, deshalb beginnt das erste Literal bei Offset 1 und hat das Token `0x70000001`.
+- **`#Blob`** enthält Binärdaten mit vorangestellter Länge: Signaturen, Konstanten, Attributwerte, öffentliche Schlüssel.
+- **`#GUID`** ist eine Folge von 16-Byte-GUIDs, mit einem Index, der bei 1 beginnt.
+
+{/* TODO(verify): Heap encodings in ECMA-335 II.24.2.2 to II.24.2.5 (#US terminal byte, #GUID 1-based index, offset 0 empty in #Strings, #US and #Blob). */}
+
+Dass Literale einen eigenen Heap haben, hat einen praktischen Grund: Die Runtime interniert sie. Jedes `ldstr` mit demselben Token liefert dasselbe String-Objekt, und gleiche Literale aus verschiedenen Assemblies landen im selben Objekt. Mehr dazu in „Strings und Interning“.
+
+{/* TODO(verify): Literal interning across assemblies in CoreCLR (global string literal map). */}
+
+### Signaturen im Blob
+
+Signaturen beschreiben Typen in einer kompakten Bytefolge. Ganzzahlen sind **komprimiert**: Werte bis 127 brauchen ein Byte, größere zwei oder vier. Jeder eingebaute Typ hat einen eigenen Code, etwa `0x01` für `void`, `0x08` für `int32` und `0x0E` für `string`. Andere Typen werden mit `0x12` (Klasse) oder `0x11` (Werttyp) eingeleitet, gefolgt von einem kodierten TypeDefOrRef-Index.
+
+Die Signatur von `Console.WriteLine(string)` ist damit vier Byte lang:
+
+```text
+00   Aufrufkonvention: DEFAULT (statisch, 0x20 wäre HASTHIS für Instanzmethoden)
+01   Anzahl der Parameter
+01   Rückgabetyp: void
+0E   Parameter 1: string
+```
+
+{/* TODO(verify): Signature bytes 00 01 01 0E for static void WriteLine(string); element type codes VOID 0x01, I4 0x08, STRING 0x0E, VALUETYPE 0x11, CLASS 0x12 and HASTHIS 0x20 in ECMA-335 II.23.2 and II.23.1.16. */}
+
+Wichtig ist, was die Signatur **nicht** enthält: Parameternamen und Standardwerte. Namen stehen in der Tabelle Param, Standardwerte als Konstante, beide nur bei der definierenden Methode. Für die Bindung eines Aufrufs zählen nur Name, Aufrufkonvention, Rückgabetyp und Parametertypen.
+
+### Generische Typen und Methoden
+
+Bei Generics kommen zwei Tabellen hinzu. Ein konkreter Typ wie `List<int>` ist kein TypeRef, sondern eine Typsignatur im Blob, auf die eine TypeSpec-Zeile zeigt. Eine konkrete Instanz einer generischen Methode wie `Array.Empty<int>()` bekommt eine MethodSpec-Zeile.
+
+<StepPlayer script={genericsScript} />
+
+Die Signatur im MemberRef für `List<int>.Add` enthält den Parameter als `!0`, also als „ersten Typparameter des Typs“. Die Metadaten beschreiben damit die generische Definition und die Instanz getrennt. Erst die Runtime setzt beide zusammen, wie sie das tut und wann Code geteilt wird, zeigt „Generics zur Laufzeit“.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Ein optionaler Parameter bricht Aufrufer
+
+Weil fremde Methoden per Name und vollständiger Signatur gebunden werden, ist jede Änderung der Signatur ein **binärer Bruch**. Das gilt auch für Änderungen, die im Quelltext harmlos aussehen:
+
+```csharp
+// Bibliothek, Version 1
+public static void Log(string message) { }
+
+// Bibliothek, Version 2: für den Compiler kompatibel
+public static void Log(string message, int level = 0) { }
+```
+
+Neu kompilierter Code funktioniert mit beiden Versionen, denn der Compiler setzt den Standardwert beim Aufrufer ein. Eine Anwendung, die gegen Version 1 kompiliert wurde, enthält aber eine MemberRef mit der Signatur „ein Parameter, string“. Gegen Version 2 findet die Runtime keine Methode mit dieser Signatur und wirft eine `MissingMethodException`, sobald sie den Aufruf auflöst. Dasselbe passiert, wenn sich nur der Rückgabetyp ändert. Wer eine öffentliche API weiterentwickelt, fügt deshalb eine Überladung hinzu, statt eine Signatur zu verändern.
+
+{/* TODO(verify): When exactly the MissingMethodException surfaces (at JIT time of the calling method, which in practice means on its first call). */}
+
+### Tokens gelten nur in ihrem Modul
+
+`MemberInfo.MetadataToken` liefert das Token eines Members. Es ist verlockend, es als eindeutige ID zu benutzen, etwa als Schlüssel in einem Cache. Das funktioniert nur zusammen mit dem Modul, denn zwei Assemblies haben fast sicher beide eine Methode mit dem Token `0x06000001`. Auch zwischen zwei Builds derselben Assembly können sich Tokens verschieben, sobald jemand einen Typ oder eine Methode hinzufügt. Für einen stabilen Vergleich innerhalb eines Prozesses eignet sich die Kombination aus `Module` und `MetadataToken` oder die Methode `HasSameMetadataDefinitionAs`.
+
+{/* TODO(verify): MemberInfo.HasSameMetadataDefinitionAs availability (.NET Core 2.2 or later?) and that it compares module plus token. */}
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Tokens und Tabellen sind kein reines Implementierungsdetail. Sie tauchen an vielen Stellen auf:
+
+| Wo                                       | Was du siehst                                                    | Was es bedeutet                                                     |
+| ---------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------- |
+| ILSpy, ildasm mit Token-Anzeige           | Zahlen wie `0A00000C` neben Instruktionen                        | Das, was wirklich in der Datei steht                                |
+| `MemberInfo.MetadataToken`               | Token eines Typs, Felds oder einer Methode                        | Eindeutig nur zusammen mit `Module`                                 |
+| `Module.ResolveMethod(token)`            | Ein `MethodBase` zu einem Token aus dem IL                        | Die Runtime löst Def- und Ref-Tokens für dich auf                   |
+| `MissingMethodException`, `TypeLoadException` | Name und Signatur, die nicht gefunden wurden                 | Eine Ref-Zeile passt nicht zur geladenen Assembly                   |
+| Profiler, Diagnoseereignisse             | Methoden-Token und Modul statt Namen                             | Kompakte Kennung, Namen werden bei Bedarf nachgeschlagen            |
+| `System.Reflection.Metadata`             | Handles wie `MethodDefinitionHandle`                             | Typsichere Verpackung einer Zeilennummer                            |
+
+`Module` bietet neben `ResolveMethod` auch `ResolveType`, `ResolveField`, `ResolveMember`, `ResolveString` und `ResolveSignature`. Damit kannst du IL, das du mit `MethodBody.GetILAsByteArray` bekommst, selbst dekodieren. Das ist die Grundlage von IL-Disassemblern, die mit Reflection arbeiten. Bei generischem Code musst du dabei die Typargumente des Kontexts mitgeben, sonst lassen sich Tokens, die auf `!0` verweisen, nicht auflösen.
+
+Wer Metadaten nur lesen will, ohne Typen zu laden, nimmt `MetadataReader`. Seine Handles sind dünne Hüllen um eine Tabellennummer und eine Zeile. `MetadataTokens.GetToken(handle)` macht daraus das bekannte 32-Bit-Token, `MetadataTokens.EntityHandle(token)` den umgekehrten Weg.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die Runtime löst Tokens nicht beim Laden einer Assembly auf, sondern bei Bedarf. Typischer Auslöser ist der JIT: Wenn er eine Methode übersetzt und auf `call` mit einem MemberRef-Token trifft, fragt er die Runtime nach dem Ziel. Für ein TypeRef folgt die Runtime dem ResolutionScope zur AssemblyRef, lässt den Binder die passende Assembly laden und sucht dort einen TypeDef mit demselben Namensraum und Namen. Findet sie stattdessen eine ExportedType-Zeile, ist der Typ weitergeleitet, und die Suche geht in der dort genannten Assembly weiter. So zeigen Verweise auf `System.Object`, die gegen `System.Runtime` kompiliert wurden, am Ende auf die Implementierung in `System.Private.CoreLib`.
+
+{/* TODO(verify): That System.Runtime forwards System.Object to System.Private.CoreLib via ExportedType, and that resolution is triggered lazily by the JIT (getCallInfo / resolveToken in the JIT-EE interface). */}
+
+Damit nicht jeder Aufruf dieselbe Suche auslöst, merkt sich die Runtime aufgelöste Tokens pro Modul in Nachschlagetabellen, die von der Zeilennummer direkt zum Laufzeitobjekt führen, etwa zur MethodTable eines Typs oder zum MethodDesc einer Methode. Wie aus einer TypeDef-Zeile eine MethodTable wird, beschreibt „Wie ein Typ geladen wird“. Wie der Binder die richtige Version einer Assembly findet, behandelt „Versionierung und Binding“.
+
+{/* TODO(verify): Per-module lookup maps from RID to TypeHandle / MethodDesc in CoreCLR (Module::LookupTypeDef, LookupMemberRef in ceeload.h). */}
+
+<Callout kind="version">
+  Das Tabellenformat ist seit der Einführung der Generics weitgehend stabil. Ergänzungen und
+  Abweichungen der heutigen Runtime vom Standard, etwa für Default-Interface-Methoden, sammelt das
+  Dokument ECMA-335 Augments im Repository dotnet/runtime. Portable PDBs nutzen dasselbe Format mit
+  eigenen Tabellen für Debuginformationen.
+</Callout>
+
+{/* TODO(verify): Contents of Ecma-335-Augments.md (default interface methods, other relaxations) and the Portable PDB table range. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das Programm liest seine eigenen Metadaten auf zwei Wegen: einmal direkt aus der Datei mit `MetadataReader`, einmal über Reflection, indem es das IL von `Main` Byte für Byte durchgeht und jedes Token mit `Module.ResolveMethod` und `Module.ResolveString` auflöst. Der Dekoder kennt nur die drei Instruktionen, die in `Main` vorkommen, und ist kein vollständiger IL-Leser.
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ausführen (dotnet run -c Release). Erwartet: TypeDef enthält Module, Program und je nach Compiler einige eingebettete Hilfstypen. Unter den MemberRefs findet sich Console::WriteLine mit einem Token, das mit 0x0A beginnt. Main und Helper haben Tokens, die mit 0x06 beginnen, das ldstr-Token ist 0x70000001. Lies in ILSpy dieselbe Assembly und vergleiche die Tokens."
+  code={tokenCode}
+/>
+
+{/* TODO(verify): Expected output of the verify sample (row counts, Main 0x06000001, 0x70000001, MemberRef tokens). */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="metadaten-tabellen"
+  questions={[
+    {
+      q: 'Was steht im IL für den Aufruf Console.WriteLine("Hallo") hinter dem Opcode call?',
+      options: [
+        'Der Name WriteLine als String',
+        'Ein vier Byte langes Token auf eine MemberRef-Zeile',
+        'Die Adresse des Maschinencodes von WriteLine',
+      ],
+      correct: 1,
+      explanation:
+        'Das IL enthält nur das Token. Der Name steht in #Strings und ist über die MemberRef-Zeile erreichbar. Maschinencode gibt es beim Kompilieren noch gar nicht.',
+    },
+    {
+      q: 'Was bedeutet das Token 0x06000003?',
+      options: [
+        'Zeile 3 der Tabelle MethodDef in diesem Modul',
+        'Die dritte Methode irgendeiner geladenen Assembly',
+        'Offset 3 im Heap #Strings',
+      ],
+      correct: 0,
+      explanation:
+        'Das oberste Byte 0x06 wählt die Tabelle MethodDef, die unteren drei Byte die Zeile. Tokens gelten immer nur im Modul, in dem sie stehen.',
+    },
+    {
+      q: 'Warum ruft dein Code Console.WriteLine über eine MemberRef-Zeile auf und nicht über MethodDef?',
+      options: [
+        'Weil WriteLine statisch ist',
+        'Weil WriteLine in einer anderen Assembly definiert ist',
+        'Weil WriteLine überladen ist',
+      ],
+      correct: 1,
+      explanation:
+        'Def-Tabellen beschreiben, was im eigenen Modul definiert ist. Fremde Member werden in MemberRef mit Name und Signatur beschrieben und zur Laufzeit gebunden.',
+    },
+    {
+      q: 'Was ist an ldstr mit dem Token 0x70000001 besonders?',
+      options: [
+        'Es zeigt auf Zeile 1 einer String-Tabelle',
+        'Die unteren drei Byte sind ein Offset in den Heap #US, eine Tabelle 0x70 gibt es nicht',
+      ],
+      correct: 1,
+      explanation:
+        '0x70 kennzeichnet User Strings. Weil Offset 0 in #US leer ist, beginnt das erste Literal bei Offset 1.',
+    },
+    {
+      q: 'Eine Bibliothek ergänzt eine Methode um einen optionalen Parameter. Was passiert mit einer Anwendung, die gegen die alte Version kompiliert wurde und nicht neu gebaut wird?',
+      options: [
+        'Sie funktioniert, der Standardwert wird automatisch eingesetzt',
+        'Sie bekommt eine MissingMethodException',
+      ],
+      correct: 1,
+      explanation:
+        'Die MemberRef enthält die alte Signatur mit einem Parameter. Die Runtime bindet per Name und Signatur und findet keine passende Methode. Standardwerte setzt nur der Compiler ein.',
+    },
+    {
+      q: 'Wie verweist der Aufruf list.Add(42) auf eine List<int> in den Metadaten?',
+      options: [
+        'Über ein TypeRef mit dem Namen List<int>',
+        'Über eine MemberRef, deren Class auf ein TypeSpec mit der Signatur List`1<int32> zeigt',
+        'Über eine eigene TypeDef-Zeile für List<int>',
+      ],
+      correct: 1,
+      explanation:
+        'Konkrete generische Typen sind Typsignaturen im Blob, auf die eine TypeSpec-Zeile zeigt. Das TypeRef beschreibt nur die offene Definition List`1.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Metadaten sind eine kleine **relationale Datenbank**: Tabellen mit Zeilen fester Größe, nummeriert ab 1, dazu Heaps für alles Variable.
+- Ein **Token** ist Tabellennummer im obersten Byte plus Zeile in den unteren drei Byte, zum Beispiel `0x02` TypeDef, `0x06` MethodDef, `0x01` TypeRef, `0x0A` MemberRef. `0x70` ist kein Tabellenindex, sondern ein Offset in `#US`.
+- Der IL-Code enthält **keine Namen**, sondern Tokens. Namen, Signaturen und Literale stehen in `#Strings`, `#Blob` und `#US`.
+- **Def** beschreibt, was im Modul definiert ist, **Ref** beschreibt fremde Typen und Member mit Name und Signatur. Die Kette MemberRef, TypeRef, AssemblyRef endet bei einer anderen Assembly.
+- Die Runtime bindet Refs **zur Laufzeit per Name und Signatur**. Deshalb bricht schon ein zusätzlicher optionaler Parameter alte Aufrufer.
+- Generische Instanzen sind Signaturen: **TypeSpec** für Typen wie `List<int>`, **MethodSpec** für Methoden wie `Array.Empty<int>()`.
+- Tokens sind nur **innerhalb ihres Moduls** eindeutig. `Module.ResolveMethod` und `MetadataReader` machen sie lesbar.
+
+</Block>

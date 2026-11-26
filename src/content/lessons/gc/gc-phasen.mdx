@@ -1,0 +1,352 @@
+---
+id: gc-phasen
+title: 'Mark, Plan, Relocate, Compact'
+summary: Was zwischen dem Anhalten und dem Weiterlaufen der Threads passiert, wie der GC Lebendes findet, Plugs und Lücken plant, Verweise umschreibt und den Heap zusammenschiebt oder nur freigibt.
+status: draft
+dotnetVersion: '7+'
+sources:
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'Grundlagen der Garbage Collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/garbage-collection/fundamentals
+  - title: 'Quellcode: Markierphase (mark_phase.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/mark_phase.cpp
+  - title: 'Quellcode: Planphase und Kompaktierungsentscheidung (plan_phase.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/plan_phase.cpp
+  - title: 'Quellcode: Relocate und Compact (relocate_compact.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/relocate_compact.cpp
+  - title: 'GCMemoryInfo (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/api/system.gcmemoryinfo
+  - title: 'Ereignisse der Garbage Collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/fundamentals/diagnostics/runtime-garbage-collection-events
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './gc-phasen.steps';
+import pinnedScript from './gc-phasen-pinned.steps';
+import sweepScript from './gc-phasen-sweep.steps';
+
+<Block n={1} title="Das Problem">
+
+Ein Garbage Collector hat drei Aufgaben, die sich gegenseitig im Weg stehen. Er muss **alle lebenden Objekte finden**, ohne ein einziges zu übersehen, denn ein fälschlich freigegebenes Objekt bedeutet Speicherkorruption. Er muss den Speicher der toten Objekte **wieder nutzbar machen**. Und er sollte dabei **Fragmentierung vermeiden**, damit neue Objekte weiterhin schnell und zusammenhängend angelegt werden können.
+
+Das Ganze passiert, während dein Programm eigentlich arbeiten will. Ein blockierender GC hält alle verwalteten Threads an, und solange sie stehen, verarbeitet dein Server keine Anfragen und deine Oberfläche reagiert nicht. Jede Millisekunde, die der GC braucht, ist eine Millisekunde Pause.
+
+Der naheliegende Ansatz wäre, tote Objekte einzeln zu suchen und freizugeben. Das ist teuer, weil es meist sehr viele tote Objekte gibt, und es hinterlässt einen löchrigen Heap. Der .NET-GC geht umgekehrt vor: Er sucht nur das **Lebende**, plant anhand dessen, wie der Heap danach aussehen soll, und entscheidet erst dann, ob er die Überlebenden zusammenschiebt oder die Lücken nur in eine Liste einträgt. Diese Abfolge aus Markieren, Planen, Verweise anpassen und Kompaktieren (oder Freigeben) ist das Thema dieser Lektion.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Das Book of the Runtime beschreibt eine blockierende Collection als feste Folge von Phasen. Sechs Sätze tragen den Rest:
+
+1. **Anhalten.** Die Runtime stoppt alle verwalteten Threads an sicheren Punkten. Wie das geht, zeigen „Wie Threads für den GC angehalten werden“ und „GC-Info und Safe Points“.
+2. **Markieren (Mark).** Ausgehend von den Roots wird alles Erreichbare in den eingesammelten Generationen markiert. Was unmarkiert bleibt, ist tot, ohne dass der GC es je anfasst.
+3. **Planen (Plan).** Der GC läuft linear durch die eingesammelten Generationen, fasst benachbarte Überlebende zu **Plugs** zusammen und berechnet, wohin jeder Plug beim Zusammenschieben käme. Diese simulierte Kompaktierung entscheidet, ob sich echtes Kompaktieren lohnt.
+4. **Verweise anpassen (Relocate).** Wenn kompaktiert wird, schreibt der GC jeden Verweis auf ein verschobenes Objekt auf dessen neue Adresse um, in Objekten, Stack-Slots, Registern und Handles.
+5. **Kompaktieren (Compact) oder Freigeben (Sweep).** Entweder werden die Plugs an ihre geplanten Adressen kopiert, oder die Lücken zwischen ihnen werden zu Free-Objekten in einer **Freiliste**.
+6. **Weiterlaufen.** Die Threads werden fortgesetzt. Für deinen Code sieht es so aus, als hätte sich nichts geändert, nur die Adressen in seinen Verweisen sind andere.
+
+Diese Phasen gelten für jede blockierende Collection, ob Gen0, Gen1 oder Gen2. Unterschiedlich ist nur, welche Generationen **verurteilt** (condemned) sind, also eingesammelt werden, und woher die Roots kommen. Bei einer Gen0- oder Gen1-Collection gehören auch die Objekte älterer Generationen in markierten Karten zu den Roots. Background GC weicht für Gen2 davon ab und markiert größtenteils parallel zum Programm, dazu mehr in „Background GC“.
+
+<Callout kind="fehlannahme">
+  „Der GC sucht den Müll und löscht ihn.“ Nein, der GC sucht das Lebende. Tote Objekte findet er
+  nur als Lücken zwischen Lebendem, und zwar in einem einzigen linearen Durchlauf der Planphase.
+  Deshalb kostet eine Collection vor allem pro Überlebendem, nicht pro totem Objekt.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel erzeugt vier überlebende und zwei tote Objekte in Gen0 und löst dann eine Gen0-Collection aus. Achte darauf, aus welchen Quellen der GC beim Markieren Lebendes findet, und darauf, dass in der Phase „Verweise anpassen“ noch kein Objekt bewegt wurde.
+
+<StepPlayer script={script} />
+
+Die Reihenfolge der letzten beiden Phasen wirkt zunächst verkehrt herum: Erst werden die Verweise umgeschrieben, dann die Objekte kopiert. Das geht, weil die Planphase alle Zieladressen bereits kennt und kein Thread läuft, der einen halb umgeschriebenen Zustand sehen könnte. Die Adressen im Beispiel sind erfunden, die Größen beziehen sich auf 64-Bit. Wo genau die Überlebenden nach der Collection liegen, hängt von der Heap-Organisation ab, siehe „Segments und Regions“.
+
+{/* TODO(verify): Object sizes in the walkthrough (Node 32 B, byte[64] 88 B, string with 10 chars 48 B, byte[32] 56 B on x64). */}
+
+</Block>
+
+<Block n={4} title="Markieren im Detail">
+
+### Woher die Roots kommen
+
+Die Markierphase arbeitet mehrere Quellen ab, bevor sie fertig ist. In der Reihenfolge, in der `mark_phase` sie im Quellcode des GC aufruft:
+
+- **Stack und Register.** Die Runtime geht die Stacks aller angehaltenen Threads durch. Für jede verwaltete Methode liefert die **GC-Info** des JIT, welche Stack-Slots und Register an der aktuellen Stelle lebende Verweise enthalten. Deshalb ist eine lokale Variable, die nicht mehr gebraucht wird, in optimiertem Code keine Root mehr.
+- **Finalisierungsdaten.** Objekte, die bereits auf ihren Finalizer warten, werden am Leben gehalten.
+- **Handles.** Starke und fixierte (pinned) GC-Handles sind Roots. Statische Felder gehören konzeptionell ebenfalls dazu: Die Runtime hält die Objekte, in denen statische Verweise liegen, selbst über solche Strukturen am Leben.
+- **Markierte Karten.** Nur bei ephemeren Collections: Objekte älterer Generationen in markierten Karten werden durchsucht, ihre Verweise in jüngere Generationen wirken wie Roots. Wie die Karten entstehen, zeigt „Write Barriers und Card Tables“.
+
+Danach kommen noch Sonderfälle: Dependent Handles (ein Objekt hält ein anderes nur am Leben, solange es selbst lebt), das Auflösen schwacher Verweise und die Suche nach unerreichbaren Objekten mit Finalizer. Diese werden noch einmal markiert, damit ihr Finalizer laufen kann. Was das für die Lebensdauer bedeutet, steht in „Finalisierung“.
+
+{/* TODO(verify): Exact root scanning order in mark_phase (stack roots, finalization queue, handles, cards, dependent handles, short weak handles, ScanForFinalization, long weak handles) for current main; how statics are rooted in .NET 8+ (pinned object[] per module vs. handles). */}
+
+### Der Mark Stack und der GC-Deskriptor
+
+Markieren ist eine Graphensuche. Wenn der GC ein Objekt zum ersten Mal erreicht, setzt er dessen **Markierbit** und legt das Objekt auf einen eigenen **Mark Stack**. Solange der Stack nicht leer ist, nimmt er ein Objekt herunter, besucht alle seine Verweisfelder und markiert und stapelt jedes Ziel, das noch nicht markiert ist. Ist ein Objekt schon markiert, passiert nichts. So terminiert die Suche auch bei Zyklen.
+
+Das Markierbit steckt nicht in einem separaten Feld. Der GC nutzt das unterste Bit des MethodTable-Zeigers im Objekt, das wegen der Ausrichtung sonst immer 0 ist. Am Ende der Collection wird es wieder gelöscht.
+
+{/* TODO(verify): Mark bit is bit 0 of the MethodTable pointer (GC_MARKED in gcinternal.h); pinned bit is BIT_SBLK_GC_RESERVE in the object header. */}
+
+Woher weiß der GC, welche Felder eines Objekts Verweise sind? Aus der MethodTable. Typen mit Verweisfeldern haben einen **GC-Deskriptor**, eine kompakte Liste von Bereichen („ab Offset X folgen N Verweise“), die direkt vor der MethodTable im Speicher liegt. Ein Typ ganz ohne Verweise trägt ein Flag, und der GC überspringt seinen Inhalt vollständig. Ein `byte[]` mit einer Million Elementen kostet beim Markieren deshalb fast nichts, ein `object[]` derselben Länge eine Million Prüfungen.
+
+{/* TODO(verify): GC descriptor (CGCDesc in gcdesc.h) stored at negative offsets before the MethodTable, and the ContainsGCPointers flag. */}
+
+Läuft der Mark Stack über, weil ein Objektgraph sehr tief ist, merkt sich der GC einen Adressbereich und durchsucht ihn später erneut. Das kostet Zeit, verliert aber keine Objekte.
+
+{/* TODO(verify): Mark stack overflow handling (min_overflow_address/max_overflow_address and process_mark_overflow). */}
+
+</Block>
+
+<Block n={5} title="Planen, Verschieben, Freigeben">
+
+### Plugs, Lücken und die Brick Table
+
+Nach dem Markieren kennt der GC nur Markierbits. Die Planphase macht daraus einen Plan. Sie geht Objekt für Objekt durch die verurteilten Generationen und fasst jede Folge direkt benachbarter, markierter Objekte zu einem **Plug** zusammen. Die toten Bereiche dazwischen heißen **Lücken** (Gaps). Für jeden Plug berechnet sie die Adresse, an der er nach dem Zusammenschieben stünde, und damit seine Verschiebung.
+
+Diese Information muss irgendwo hin, und der GC nutzt dafür einen eleganten Trick: Er schreibt sie in die Lücke direkt vor dem Plug. Dort liegt ohnehin nur noch ein totes Objekt, dessen Speicher niemand mehr braucht. Die Einträge enthalten unter anderem die Größe der Lücke und die Verschiebung des folgenden Plugs.
+
+Damit die Relocate-Phase zu einer beliebigen alten Adresse schnell die neue findet, gibt es zusätzlich die **Brick Table**. Sie teilt den Heap in gleich große Abschnitte (Bricks) und verweist pro Abschnitt auf die Plug-Information darin. Statt den Heap von vorn zu durchlaufen, springt der GC über die Brick Table in die Nähe und sucht dort den passenden Plug.
+
+{/* TODO(verify): Plug info layout (plug_and_gap: gap, reloc, left/right tree pointers) stored in front of each plug; brick_size 4096 bytes on 64-bit (gcinternal.h); plugs within a brick organized as a binary tree. */}
+
+### Die Entscheidung: kompaktieren oder freigeben
+
+Am Ende der Planphase weiß der GC, wie viel Platz eine Kompaktierung gewinnen würde, also wie groß die **Fragmentierung** ist. Kompaktieren ist teuer: Jeder verschobene Plug muss kopiert werden, und jeder Verweis auf ihn muss umgeschrieben werden. Freigeben ist billig, lässt aber die Löcher, wo sie sind.
+
+Im Quellcode trifft `decide_on_compacting` diese Entscheidung. Der wichtigste Grund ist, dass die Fragmentierung sowohl absolut als auch im Verhältnis zur Generationsgröße einen Grenzwert überschreitet. Daneben gibt es feste Gründe: eine ausdrücklich kompaktierende Collection per `GC.Collect`, zu wenig Platz für die ephemeren Generationen, hohe Speicherlast des Rechners oder ein letzter Versuch vor einer `OutOfMemoryException`. Welcher Grund gegriffen hat, meldet der GC in seinen Ereignissen.
+
+{/* TODO(verify): Compaction reasons and thresholds in decide_on_compacting (dd_fragmentation_limit, dd_fragmentation_burden_limit, compact_low_ephemeral, high memory load, last GC before OOM, induced compacting) and how they are exposed in GCPerHeapHistory events. */}
+
+### Relocate und Compact
+
+Fällt die Entscheidung auf Kompaktieren, sucht die Relocate-Phase **alle** Verweise, die in die verurteilten Generationen zeigen, und ersetzt sie. Das sind mehr Stellen als beim Markieren: Neben Stack, Registern, starken Handles und markierten Karten auch **schwache** Verweise, denn auch eine `WeakReference` auf ein überlebendes Objekt muss nach dem Verschieben auf die neue Adresse zeigen. Das Book of the Runtime hebt diesen Unterschied ausdrücklich hervor.
+
+Die Compact-Phase ist danach fast mechanisch: Sie kopiert jeden Plug an seine geplante Adresse. Weil Plugs nur nach unten rutschen, überschreibt dabei kein Plug einen anderen, der noch nicht kopiert wurde. Hinter dem letzten Plug bleibt ein zusammenhängender freier Bereich, in dem neue Objekte wieder einfach durch Weiterschieben eines Zeigers angelegt werden.
+
+Beim Kopieren werden auch die Karten mitgenommen: Lag ein verschobenes Objekt in einer markierten Karte, muss die Karte an der neuen Adresse ebenfalls markiert sein.
+
+{/* TODO(verify): copy_cards_for_addresses is called while compacting to carry card marks to the destination. */}
+
+### Sweep: freigeben ohne zu verschieben
+
+Entscheidet sich der GC gegen das Kompaktieren, entfällt die Relocate-Phase vollständig. In der Sweep-Phase sucht er die toten Bereiche zwischen lebenden Objekten, macht aus jedem ein **Free-Objekt** (benachbarte tote Objekte werden zu einem zusammengefasst) und hängt sie in die Freiliste der Generation. Ein Free-Objekt hat eine eigene MethodTable, damit der Heap weiterhin linear durchlaufen werden kann.
+
+<StepPlayer script={sweepScript} />
+
+Freigeben ist vor allem in Gen2 attraktiv, wo meist fast alles überlebt und Kompaktieren viel kopieren würde. Der Preis ist Fragmentierung: Der freie Speicher ist da, aber in Stücken. Gen2-Freilisten werden genutzt, wenn spätere Collections Objekte nach Gen2 promotet, und nur Objekte, die in ein Stück passen, profitieren davon.
+
+{/* TODO(verify): Free objects use a dedicated free MethodTable (g_pFreeObjectMethodTable) and gen2 free list items are used when promoting into gen2 (allocate_in_older_generation). */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Fixierte Objekte bremsen die Kompaktierung
+
+Ein fixiertes Objekt (über `fixed`, `GCHandleType.Pinned` oder intern beim Marshalling) darf seine Adresse nicht ändern. In der Planphase wird es zu einem **fixierten Plug**, dessen neue Adresse seine alte ist. Plugs dahinter können nur bis direkt hinter ihn rutschen, und die Lücke davor bleibt bestehen.
+
+<StepPlayer script={pinnedScript} />
+
+Ein einzelnes kurz fixiertes Objekt ist harmlos. Problematisch wird es, wenn viele Puffer in Gen0 fixiert sind, während Collections laufen, typisch bei asynchroner I/O mit vielen kleinen Puffern. Dann durchlöchern sie jede Kompaktierung. Der GC hat dafür Gegenmaßnahmen, etwa fixierte Plugs nicht zu promoten, damit sie nicht Gen2 fragmentieren. Den sauberen Ausweg, langlebige Puffer gleich im Pinned Object Heap anzulegen, beschreibt „Pinning und Fragmentierung“.
+
+{/* TODO(verify): Demotion of pinned plugs (stay in gen0 instead of being promoted) with segments and regions. */}
+
+### Viele Überlebende, lange Pausen
+
+Weil die Kosten am Lebenden hängen, ist eine Gen0-Collection mit wenigen Überlebenden kurz, egal wie viel Müll in Gen0 lag. Überlebt dagegen viel, wird jede Phase teurer: mehr zu markieren, mehr Plugs zu planen, mehr Verweise umzuschreiben, mehr Bytes zu kopieren. Ein großer, neu aufgebauter Cache, der während einer Gen0-Collection gerade frisch befüllt ist, kann eine normalerweise kurze Pause deutlich verlängern.
+
+Ein Sonderfall sind Objekte mit Finalizer: Unerreichbare finalisierbare Objekte werden am Ende der Markierphase wieder lebendig gemacht, damit ihr Finalizer laufen kann. Sie überleben also mindestens eine Collection mehr und werden mitsamt allem, worauf sie zeigen, promotet und eventuell kopiert.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Pausen und Phasen beobachten
+
+Für einen ersten Blick genügt die Laufzeit selbst. `GC.GetGCMemoryInfo()` liefert Daten über die letzte Collection, darunter ihre Generation, die Pausendauern, ob sie kompaktiert hat (`Compacted`), wie viele Bytes überlebt haben (`PromotedBytes`), wie viele fixierte Objekte sie gefunden hat (`PinnedObjectsCount`) und wie groß die Fragmentierung ist (`FragmentedBytes`). `GC.GetTotalPauseDuration()` summiert alle GC-Pausen seit dem Prozessstart.
+
+{/* TODO(verify): GCMemoryInfo members (Compacted, PauseDurations, PromotedBytes, PinnedObjectsCount, FragmentedBytes, Generation) and GC.GetTotalPauseDuration available since .NET 7. */}
+
+Für einzelne Collections brauchst du die GC-Ereignisse der Runtime. Jede Collection meldet Beginn und Ende, das Anhalten und Fortsetzen der Threads und detaillierte Daten pro Heap. Ereignisse zur Markierphase zeigen sogar, wie viel über welche Root-Art (Stack, Finalisierung, Handles, ältere Generationen) markiert wurde. Aufzeichnen kannst du sie mit `dotnet-trace`, auswerten bequem mit PerfView, dessen GCStats-Ansicht jede Collection mit Generation, Auslöser, Pausendauer und Kompaktierung auflistet.
+
+```bash
+dotnet-trace collect --process-id <pid> --profile gc-verbose
+```
+
+{/* TODO(verify): dotnet-trace profile name gc-verbose in current versions; PerfView GCStats column names; GCMarkWithType root kinds (stack, finalize queue, handles, older generation). */}
+
+### Muster und ihre Wirkung
+
+| Muster | Effekt auf die Phasen | Warum | Ausweg |
+| --- | --- | --- | --- |
+| Viel kurzlebiger Müll | Kurze Gen0-Pausen | Tote Objekte werden nie besucht | Meist unkritisch |
+| Große, frisch befüllte Datenstruktur | Lange Mark- und Compact-Phase | Viele Überlebende werden markiert und kopiert | Einmalig aufbauen und behalten, `GC.TryStartNoGCRegion` für kritische Abschnitte |
+| Tiefe verkettete Strukturen | Großer Mark Stack, eventuell Überlauf | Graphensuche über viele Ebenen | Arrays statt Ketten, verweisfreie Structs |
+| Viele kurz fixierte Puffer | Löcher nach der Kompaktierung | Fixierte Plugs bewegen sich nicht | Puffer poolen, langlebige Puffer im POH |
+| Gen2 mit wenig Toten | Sweep statt Compact, Fragmentierung | Kompaktieren würde kaum etwas gewinnen | Meist richtig so, `FragmentedBytes` beobachten |
+| Viele Objekte mit Finalizer | Zusätzliche Überlebende, mehr Promotion | Finalisierbare Objekte werden wiederbelebt | `IDisposable` mit `GC.SuppressFinalize` |
+
+### Einstellungen
+
+`GCSettings.LatencyMode` beeinflusst, wie aggressiv der GC blockierende Collections ausführt, etwa `SustainedLowLatency`, um volle blockierende Collections möglichst zu vermeiden. `GCSettings.LargeObjectHeapCompactionMode` fordert für die nächste volle Collection einmalig an, auch den LOH zu kompaktieren, der sonst nur freigegeben wird. Mit `GC.Collect(generation, mode, blocking, compacting: true)` erzwingst du eine kompaktierende Collection, sinnvoll höchstens in Tests oder nach einem einmaligen großen Aufräumen.
+
+{/* TODO(verify): LOH is swept by default and compacted only on request or under memory pressure; semantics of GCLatencyMode.SustainedLowLatency. */}
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Der JIT ist an jeder Collection beteiligt, ohne dass es auffällt. Er erzeugt für jede Methode die GC-Info, ohne die der GC Stack-Slots und Register nicht als Roots erkennen und in der Relocate-Phase nicht umschreiben könnte. Und er fügt die Write Barriers ein, aus denen die Karten für ephemere Collections entstehen.
+
+Der GC selbst arbeitet mit Server GC auf mehreren Threads parallel, jeder Heap markiert und plant seinen Teil, und Markierarbeit kann zwischen Threads umverteilt werden. Workstation GC erledigt eine blockierende Collection dagegen auf dem Thread, der sie ausgelöst hat. Mehr dazu in „Workstation, Server und DATAS“.
+
+{/* TODO(verify): Work stealing during mark (mark stealing, card marking stealing) with Server GC; WKS blocking GC runs on the triggering user thread (BOTR code flow). */}
+
+<Callout kind="version">
+  Seit .NET 7 verwendet der GC auf 64-Bit standardmäßig Regions. Die Phasen bleiben dieselben, aber
+  die Planphase kann damit ganze Regions einer anderen Generation zuschlagen oder Regions mit sehr
+  vielen Überlebenden nur freigeben, statt sie zu kopieren. Die Ereignisse und
+  `GCMemoryInfo.Compacted` zeigen, was tatsächlich passiert ist.
+</Callout>
+
+{/* TODO(verify): Regions: special sweep and sweep in plan (sweep_region_in_plan) for regions with high survival rate since .NET 7. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das Experiment erzeugt Fragmentierung in Gen2 und vergleicht eine freigebende mit einer kompaktierenden Collection. `GCMemoryInfo` zeigt danach, ob kompaktiert wurde und wie viel fragmentiert ist.
+
+{/* TODO(verify): Expected output in Release: after compacting: false, Compacted False and FragmentedBytes clearly above zero; after compacting: true, Compacted True and FragmentedBytes close to zero. Whether compacting: false really prevents compaction or only does not force it. */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ohne Debugger ausführen (dotnet run -c Release). Erwartet: Die erste Collection gibt nur frei, Compacted ist False und FragmentedBytes deutlich größer als 0. Die zweite kompaktiert, Compacted ist True und die Fragmentierung fällt stark."
+  code={`var keep = new List<byte[]>();
+var all = new List<byte[]>();
+for (int i = 0; i < 100_000; i++) all.Add(new byte[1000]);
+GC.Collect();
+GC.Collect();                       // zwei Collections: alles nach Gen2 bringen
+for (int i = 0; i < all.Count; i += 2) keep.Add(all[i]);
+all = null;                         // jedes zweite Array wird unerreichbar
+
+GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
+Report("ohne Kompaktierung");
+
+GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+Report("mit Kompaktierung");
+GC.KeepAlive(keep);
+
+static void Report(string label)
+{
+    var info = GC.GetGCMemoryInfo();
+    Console.WriteLine($"{label}: Compacted={info.Compacted}, " +
+        $"Fragmentiert={info.FragmentedBytes / 1024} KB, " +
+        $"Pause={info.PauseDurations[0].TotalMilliseconds:F2} ms");
+}`}
+/>
+
+Die Pausendauern zeigen nebenbei, dass Kompaktieren mehr kostet als Freigeben, weil die Hälfte der Arrays kopiert und alle Verweise in `keep` umgeschrieben werden. Wiederhole das Experiment mit einem `GCHandle` vom Typ `Pinned` auf eines der überlebenden Arrays und beobachte `PinnedObjectsCount`.
+
+{/* TODO(verify): Pause durations measured for both collections on a typical machine. */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="gc-phasen"
+  questions={[
+    {
+      q: 'Wie erfährt der GC, dass ein totes Objekt tot ist?',
+      options: [
+        'Er besucht es und stellt fest, dass kein Verweis darauf zeigt',
+        'Gar nicht einzeln: Es bleibt unmarkiert und liegt in einer Lücke zwischen Plugs',
+        'Über einen Referenzzähler im Objekt-Header',
+      ],
+      correct: 1,
+      explanation:
+        'Markiert wird nur Erreichbares. Tote Objekte tauchen erst in der Planphase als Lücken zwischen markierten Objekten auf, ohne dass ihre Felder je gelesen werden.',
+    },
+    {
+      q: 'Woher weiß der GC beim Markieren, welche Felder eines Objekts Verweise sind?',
+      options: [
+        'Er prüft jedes 8-Byte-Wort, ob es wie eine Heap-Adresse aussieht',
+        'Aus dem GC-Deskriptor, der zur MethodTable des Typs gehört',
+        'Aus Reflection-Metadaten',
+      ],
+      correct: 1,
+      explanation:
+        'Der .NET-GC ist präzise. Die MethodTable beschreibt, an welchen Offsets Verweise liegen, und Typen ohne Verweise werden komplett übersprungen.',
+    },
+    {
+      q: 'In welcher Reihenfolge laufen Relocate und Compact?',
+      options: [
+        'Erst kopieren, dann Verweise suchen und anpassen',
+        'Erst alle Verweise auf die geplanten Adressen umschreiben, dann die Plugs kopieren',
+        'Beides gleichzeitig pro Objekt',
+      ],
+      correct: 1,
+      explanation:
+        'Die Planphase hat alle neuen Adressen bereits berechnet. Weil kein Thread läuft, dürfen Verweise kurzzeitig auf noch leere Ziele zeigen.',
+    },
+    {
+      q: 'Warum muss die Relocate-Phase auch schwache Verweise anfassen, die Markierphase aber nicht?',
+      options: [
+        'Weil schwache Verweise beim Markieren schon gelöscht wurden',
+        'Weil schwache Verweise ein Objekt nicht am Leben halten, auf ein überlebendes, verschobenes Objekt aber trotzdem zeigen können',
+        'Weil schwache Verweise nur in Gen2 vorkommen',
+      ],
+      correct: 1,
+      explanation:
+        'Beim Markieren zählt nur, was am Leben hält. Beim Verschieben muss jeder Verweis stimmen, sonst zeigt eine WeakReference ins Leere oder auf ein falsches Objekt.',
+    },
+    {
+      q: 'Was passiert mit einer Lücke direkt vor einem fixierten Objekt bei einer kompaktierenden Collection?',
+      options: [
+        'Sie wird geschlossen, indem das fixierte Objekt nach vorn rückt',
+        'Sie bleibt bestehen und wird zu freiem Speicher, weil der fixierte Plug seine Adresse behält',
+        'Der GC bricht die Collection ab',
+      ],
+      correct: 1,
+      explanation:
+        'Ein fixierter Plug hat als neue Adresse seine alte. Was davor frei wird, kann nicht durch Verschieben gefüllt werden.',
+    },
+    {
+      q: 'Wann gibt der GC eher frei, statt zu kompaktieren?',
+      options: [
+        'Wenn fast alles tot ist',
+        'Wenn die geplante Fragmentierung gering ist und Kompaktieren viel kopieren würde, typisch für Gen2',
+        'Grundsätzlich bei Gen0',
+      ],
+      correct: 1,
+      explanation:
+        'Kompaktieren lohnt sich erst, wenn genug Platz gewonnen wird. Bleibt die Fragmentierung unter den Grenzwerten und gibt es keinen anderen Grund, genügt eine Freiliste.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Eine blockierende Collection läuft in festen Phasen: **anhalten, markieren, planen, dann Verweise anpassen und kompaktieren oder freigeben, weiterlaufen**.
+- **Markieren** startet bei Stack und Registern (über die GC-Info des JIT), Finalisierungsdaten, Handles und bei ephemeren Collections bei markierten Karten. Der Mark Stack und der GC-Deskriptor der MethodTable steuern die Graphensuche.
+- **Planen** fasst Überlebende zu Plugs zusammen, berechnet neue Adressen und misst die Fragmentierung. Danach fällt die Entscheidung zwischen Kompaktieren und Freigeben.
+- **Relocate** schreibt alle Verweise um, auch schwache und die in Stack-Slots. **Compact** kopiert danach nur noch die Plugs.
+- **Sweep** lässt Objekte liegen und macht aus Lücken Free-Objekte in der Freiliste. Das ist billig, hinterlässt aber Fragmentierung.
+- **Fixierte Objekte** werden zu Plugs, die sich nicht bewegen, und hinterlassen Löcher.
+- Die Pause hängt an den **Überlebenden**. Beobachten lässt sie sich mit `GC.GetGCMemoryInfo`, GC-Ereignissen, `dotnet-trace` und PerfView.
+
+</Block>

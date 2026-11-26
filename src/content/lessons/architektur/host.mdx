@@ -1,0 +1,314 @@
+---
+id: host
+title: 'Der Host: dotnet, hostfxr, hostpolicy'
+summary: Was zwischen dem Aufruf von dotnet App.dll und dem ersten Aufruf von Main passiert, welche native Komponente welche Entscheidung trifft, wie die Framework-Version gewählt wird und wie du den Start mit Host-Tracing beobachtest.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'dotnet/runtime: Host components'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-components.md
+  - title: 'dotnet/runtime: Native hosting'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/native-hosting.md
+  - title: 'dotnet/runtime: Host probing'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-probing.md
+  - title: 'dotnet/runtime: Framework version resolution'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/framework-version-resolution.md
+  - title: 'dotnet/runtime: Host tracing'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/features/host-tracing.md
+  - title: 'Auswählen der zu verwendenden .NET-Version (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/versions/selection
+  - title: '.NET-Umgebungsvariablen (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/tools/dotnet-environment-variables
+  - title: 'Schreiben eines benutzerdefinierten .NET-Hosts (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/tutorials/netcore-hosting
+updated: 2026-11-25
+---
+
+import { Block, Callout, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './host.steps';
+import rollForwardScript from './host-rollforward.steps';
+import apphostScript from './host-apphost.steps';
+import { propsCode } from './host-verify';
+
+<Block n={1} title="Das Problem">
+
+Eine `App.dll` ist kein Programm, das das Betriebssystem starten könnte. Sie enthält IL und Metadaten, aber keinen Maschinencode, den die CPU ausführen könnte, und keinen Hinweis darauf, wo die Runtime liegt. Irgendein nativer Code muss also zuerst laufen und eine Reihe von Fragen beantworten, bevor überhaupt eine Runtime existiert: Ist das ein SDK-Befehl oder eine App? Welche Runtime-Version braucht die App? Ist sie installiert, und wenn mehrere passen, welche nimmt man? Welche Assemblies gehören zur App, welche zum Framework, und wo liegen sie?
+
+Diese Arbeit erledigt der **Host**. Er ist kein einzelnes Programm, sondern eine Kette aus drei bis vier nativen Komponenten. Warum so viele? Wieder steckt der Konflikt zwischen Teilen und Unabhängigkeit dahinter. Manche Entscheidungen müssen für alle installierten Versionen gelten, etwa welche Runtime eine App bekommt. Die Komponente, die das entscheidet, sollte deshalb immer die neueste sein. Andere Entscheidungen hängen eng an einer bestimmten Runtime-Version, etwa welche Einstellungen die Runtime beim Start erwartet. Diese Komponente muss genau zur Runtime passen.
+
+Ergebnis ist eine Aufteilung, die auf den ersten Blick umständlich wirkt und auf den zweiten sehr durchdacht ist. Wer sie kennt, versteht die meisten Startfehler sofort: falsche Version, fehlende Runtime, App-Starter findet nichts. Diese Lektion geht die Kette Glied für Glied durch.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Vier Sätze tragen das Modell:
+
+1. **Muxer oder App-Starter ist der Einstieg.** `dotnet` (der Muxer) oder die ausführbare Datei mit dem Namen deiner App (der App-Starter, englisch apphost) ist das Programm, das das Betriebssystem startet. Seine einzige echte Aufgabe: `hostfxr` finden und laden.
+2. **hostfxr entscheidet, was läuft.** Es unterscheidet App und SDK-Befehl, liest `runtimeconfig.json`, wählt die Framework-Versionen und lädt `hostpolicy` aus dem gewählten Framework. Es wird immer in der neuesten installierten Version verwendet.
+3. **hostpolicy bereitet die Runtime vor.** Es liest die `.deps.json`-Dateien, baut die Liste aller Assemblies (die TPA-Liste), lädt `coreclr` und übergibt dieser Bibliothek alles, was sie zum Start braucht. Es stammt immer aus derselben Version wie die Runtime.
+4. **Alles passiert in einem Prozess.** Jede Komponente ist eine Bibliothek, die die vorherige in den laufenden Prozess lädt. Es gibt keinen zweiten Prozess für die Runtime.
+
+| Komponente | Datei unter Linux | Liegt in | Version |
+| --- | --- | --- | --- |
+| Muxer | `dotnet` | dotnet-Wurzel | die installierte |
+| App-Starter | `App` | App-Ordner | aus dem SDK beim Build |
+| hostfxr | `libhostfxr.so` | `host/fxr/<Version>/` | die höchste installierte |
+| hostpolicy | `libhostpolicy.so` | `shared/Microsoft.NETCore.App/<Version>/` | wie die gewählte Runtime |
+| Runtime | `libcoreclr.so` | `shared/Microsoft.NETCore.App/<Version>/` | die gewählte |
+
+Unter Windows heißen die Bibliotheken `hostfxr.dll`, `hostpolicy.dll` und `coreclr.dll`, unter macOS enden sie auf `.dylib`.
+
+{/* TODO(verify): File names per OS in a current installation; that the apphost template comes from packs/Microsoft.NETCore.App.Host.<rid>/. */}
+
+<Callout kind="fehlannahme">
+  „Die Runtime durchsucht beim Laden Ordner nach passenden DLLs.“ Für Framework- und
+  App-Assemblies nicht: `hostpolicy` übergibt der Runtime vorab eine fertige Liste mit vollständigen
+  Pfaden. Was nicht auf dieser Liste steht, findet der Standard-Ladekontext nicht, auch wenn die
+  Datei im App-Ordner liegt.
+</Callout>
+
+{/* TODO(verify): That the default AssemblyLoadContext resolves app assemblies only via the TPA list (plus app paths) and does not probe the app directory when a .deps.json is present. */}
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Eine framework-abhängige App wird über den Muxer gestartet. Achte darauf, aus welchem Ordner welche Komponente kommt: `hostfxr` aus `host/fxr/` in Version 9, `hostpolicy` und `coreclr` aus dem Framework-Ordner in Version 8. Im letzten Schritt geht es um die häufigste Fehlannahme.
+
+<StepPlayer script={script} />
+
+Der Code-Tab zeigt die beiden Dateien, die der Build neben `App.dll` legt. `App.runtimeconfig.json` beantwortet die Frage „welche Runtime?“ und wird von `hostfxr` gelesen. `App.deps.json` beantwortet die Frage „welche Assemblies?“ und wird von `hostpolicy` gelesen. Beide Dateien und ihre weiteren Einträge behandelt die Lektion „runtimeconfig.json und deps.json“.
+
+</Block>
+
+<Block n={4} title="Muxer, SDK-Befehle und App-Starter">
+
+### Ein Programm, zwei Rollen
+
+Der Muxer heißt so, weil er mehrere Aufgaben über einen Einstiegspunkt bündelt (Multiplexer). `dotnet App.dll` startet eine App, `dotnet build` einen SDK-Befehl. Die Unterscheidung trifft nicht der Muxer selbst, sondern `hostfxr`, das er als Erstes lädt. Für den Start einer App gibt es auch die ausführliche Form `dotnet exec App.dll`, die zusätzliche Optionen wie `--runtimeconfig`, `--depsfile` oder `--roll-forward` annimmt.
+
+Bei einem SDK-Befehl sucht `hostfxr` statt eines Frameworks ein **SDK**. Ohne weitere Angaben nimmt es das neueste installierte aus `sdk/<Version>/`. Liegt im aktuellen Ordner oder darüber eine `global.json`, kann diese eine bestimmte SDK-Version festlegen. Das Bemerkenswerte: Das SDK ist selbst eine .NET-Anwendung. `hostfxr` startet die verwaltete Assembly `dotnet.dll` aus dem SDK-Ordner, und von da an läuft dieselbe Kette wie bei deiner App, mit `hostpolicy`, `coreclr` und `Main`. Auch `dotnet run` folgt diesem Weg: Es baut deine App und startet sie dann als eigenen Prozess.
+
+{/* TODO(verify): That SDK commands execute sdk/<version>/dotnet.dll through hostpolicy, and that dotnet run launches the built app as a child process. */}
+
+### Der App-Starter
+
+Beim Build legt das SDK standardmäßig neben `App.dll` eine ausführbare Datei `App` (unter Windows `App.exe`) an. Sie entsteht aus einer Vorlage im SDK, in die der Build den Namen der App-Assembly einträgt. Der App-Starter übernimmt die Rolle des Muxers, kennt aber nur einen Zweck: genau diese App starten. Dafür bekommt der Prozess den Namen deiner App statt `dotnet`, unter Windows ein eigenes Symbol, und du musst `dotnet` nicht im `PATH` haben.
+
+Den Preis dafür siehst du in der Stolperfalle weiter unten: Der Muxer weiß immer, wo `hostfxr` liegt, weil es neben ihm liegt. Der App-Starter einer framework-abhängigen App muss die .NET-Installation erst suchen.
+
+</Block>
+
+<Block n={5} title="Framework-Auflösung und Roll Forward">
+
+### Warum die Version eine Untergrenze ist
+
+Die Version in `runtimeconfig.json` ist die Version des Frameworks, gegen das gebaut wurde, typischerweise `8.0.0` für `net8.0`. Würde `hostfxr` genau diese Version verlangen, müsste jede Maschine jede jemals verwendete Patchversion installiert haben, und Sicherheitsupdates kämen nur mit einem Neubau jeder einzelnen App an. Deshalb gilt die Zahl als **Mindestversion**, und eine Regel namens **Roll Forward** legt fest, wie weit nach oben ausgewichen werden darf.
+
+<StepPlayer script={rollForwardScript} />
+
+Die möglichen Werte für `rollForward`:
+
+| Wert | Verhalten |
+| --- | --- |
+| `LatestPatch` | neuester Patch der geforderten Haupt- und Nebenversion, nie eine höhere Nebenversion |
+| `Minor` (Standard) | wie `LatestPatch`, fehlt die Nebenversion, die nächsthöhere Nebenversion |
+| `Major` | wie `Minor`, fehlt die Hauptversion, die nächsthöhere Hauptversion |
+| `LatestMinor` | höchste installierte Nebenversion derselben Hauptversion |
+| `LatestMajor` | höchste installierte Version überhaupt |
+| `Disable` | nur genau die geforderte Version |
+
+Setzen lässt sich die Regel in der Projektdatei (`<RollForward>`), in `runtimeconfig.json`, über die Umgebungsvariable `DOTNET_ROLL_FORWARD` oder beim Muxer mit `--roll-forward`. Vorabversionen werden nach eigenen Regeln behandelt: Eine stabile Anforderung rollt standardmäßig nicht auf eine Vorabversion.
+
+{/* TODO(verify): Precedence between --roll-forward, DOTNET_ROLL_FORWARD and runtimeconfig.json rollForward; pre-release handling (DOTNET_ROLL_FORWARD_TO_PRERELEASE). */}
+
+### Mehrere Frameworks
+
+Eine ASP.NET-Core-App fordert in ihrer `runtimeconfig.json` nicht `Microsoft.NETCore.App`, sondern `Microsoft.AspNetCore.App`. Dieses Framework hat in seinem eigenen Ordner wiederum eine Konfiguration, die `Microsoft.NETCore.App` verlangt. `hostfxr` löst diese Kette auf und muss dabei für jedes Framework eine Version finden, die alle Anforderungen erfüllt. Erst wenn beide feststehen, geht es weiter. `hostpolicy` wird dann aus dem untersten Framework geladen, also aus `Microsoft.NETCore.App`.
+
+{/* TODO(verify): That hostpolicy is always loaded from the Microsoft.NETCore.App framework directory in multi-framework apps (host-components.md). */}
+
+</Block>
+
+<Block n={6} title="hostpolicy und die TPA-Liste">
+
+### Was in die Liste kommt
+
+`hostpolicy` hat eine einzige große Aufgabe: der Runtime sagen, welche Dateien zu diesem Prozess gehören. Dafür liest es die `.deps.json` der App und die jedes beteiligten Frameworks. Eine `.deps.json` beschreibt die Abhängigkeiten einer Anwendung: welche Pakete und Projekte beteiligt sind und welche Dateien davon zur Laufzeit gebraucht werden, getrennt nach verwalteten Assemblies, nativen Bibliotheken und Ressourcen.
+
+Aus allen Dateien entstehen mehrere Listen. Die wichtigste ist die **TPA-Liste** (Trusted Platform Assemblies): die vollständigen Pfade aller verwalteten Assemblies von App und Frameworks. Kommt eine Assembly in App und Framework zugleich vor, etwa weil die App ein NuGet-Paket mit einer neueren Version mitbringt, entscheidet `hostpolicy` nach Versionsnummern, welche Datei auf die Liste kommt. Daneben gibt es die Suchpfade für native Bibliotheken, die später ein `DllImport` verwendet.
+
+{/* TODO(verify): Conflict resolution rule between app-local and framework assemblies (assembly version, then file version) in host-probing.md. */}
+
+Fehlt die `.deps.json` der App, nimmt `hostpolicy` alle Assemblies im App-Ordner auf. Das funktioniert für einfache Fälle, verliert aber die Information über Pakete und plattformspezifische Dateien.
+
+### Der Übergang zur Runtime
+
+Mit den fertigen Listen lädt `hostpolicy` die Bibliothek `coreclr` aus dem Framework-Ordner und ruft zwei ihrer exportierten Funktionen auf. `coreclr_initialize` startet die Runtime und bekommt dabei die Listen und Einstellungen als Paare aus Namen und Wert, darunter `TRUSTED_PLATFORM_ASSEMBLIES`, `NATIVE_DLL_SEARCH_DIRECTORIES` und `APP_CONTEXT_BASE_DIRECTORY`. Auch alles aus `configProperties` in `runtimeconfig.json` reist auf diesem Weg zur Runtime, etwa die GC-Einstellungen. Danach lädt `coreclr_execute_assembly` die App-Assembly und ruft `Main` auf.
+
+{/* TODO(verify): Function names coreclr_initialize, coreclr_execute_assembly and coreclr_shutdown_2 in src/coreclr/hosts/inc/coreclrhost.h and their use in hostpolicy. */}
+
+Innerhalb der App kommst du an diese Werte über `AppContext.GetData`. Das ist kein Zufall: Die Runtime legt die beim Start übergebenen Eigenschaften genau dort ab. Was `coreclr_initialize` intern alles tut, bevor `Main` läuft, beschreibt die Lektion „Vom Prozessstart bis Main“.
+
+</Block>
+
+<Block n={7} title="Self-contained und eigene Hosts">
+
+### Self-contained Apps
+
+Bei einer self-contained App liegen `hostfxr`, `hostpolicy`, `coreclr` und die ganze Klassenbibliothek im App-Ordner. Gestartet wird sie über den App-Starter, der `hostfxr` direkt neben sich findet. In `runtimeconfig.json` steht dann keine Anforderung an ein installiertes Framework, sondern die Angabe, welche Frameworks mitgeliefert wurden. `hostfxr` macht deshalb keine Versionsauflösung und kein Roll Forward: Es nimmt, was da ist. Eine installierte .NET-Version auf der Maschine spielt keine Rolle.
+
+{/* TODO(verify): That self-contained runtimeconfig.json uses "includedFrameworks" and that hostfxr skips framework resolution in that mode. */}
+
+Eine Variante davon ist die **Single-File**-Veröffentlichung, bei der App und Bibliotheken in eine einzige Programmdatei gebündelt werden. Die Host-Komponenten sind dort in den App-Starter eingebaut. Native AOT dagegen verzichtet auf die ganze Kette: Das Programm enthält seine Runtime selbst, es gibt weder `hostfxr` noch `hostpolicy` noch `runtimeconfig.json`-Auflösung.
+
+{/* TODO(verify): That in self-contained single-file apps hostfxr and hostpolicy are statically linked into the apphost (singlefilehost). */}
+
+### Die Runtime in eigenen Programmen
+
+Die Kette ist nicht nur für `dotnet` da. `hostfxr` exportiert eine dokumentierte Schnittstelle, mit der jedes native Programm .NET laden kann: Es initialisiert die Runtime für eine bestimmte `runtimeconfig.json` und lässt sich einen Funktionszeiger auf eine verwaltete Methode geben. Die Bibliothek `nethost` hilft dabei, `hostfxr` überhaupt erst zu finden. So arbeiten etwa die Hosts für COM-Komponenten und C++/CLI. Microsoft beschreibt das in der Anleitung zum Schreiben eines eigenen Hosts.
+
+{/* TODO(verify): Export names hostfxr_initialize_for_runtime_config and hostfxr_get_runtime_delegate, and that comhost and ijwhost use them (native-hosting.md). */}
+
+<Callout kind="version">
+  Die Aufteilung in Muxer, `hostfxr` und `hostpolicy` und die Roll-Forward-Regeln gelten seit .NET
+  Core 3.0. Seit .NET 9 lässt sich zusätzlich beim Build festlegen, wo der App-Starter nach der
+  .NET-Installation sucht, etwa relativ zum App-Ordner. Die Beispiele dieser Lektion verwenden .NET
+  8 und 9.
+</Callout>
+
+{/* TODO(verify): .NET 9 apphost search options (AppHostDotNetSearch, AppHostRelativeDotNet MSBuild properties). */}
+
+</Block>
+
+<Block n={8} title="Stolperfalle: Der App-Starter findet .NET nicht">
+
+Wer .NET per Installationsskript in sein Home-Verzeichnis installiert, etwa auf einem Build-Agent oder in einem selbst gebauten Container-Image, erlebt oft Folgendes: `dotnet App.dll` läuft, `./App` bricht ab. Der Unterschied liegt allein darin, wie die beiden Starter `hostfxr` suchen.
+
+<StepPlayer script={apphostScript} />
+
+Die Suchreihenfolge des App-Starters ist fest: erst der eigene Ordner, dann die Umgebungsvariablen `DOTNET_ROOT_<ARCH>` und `DOTNET_ROOT`, dann der systemweit registrierte Installationsort, zuletzt der Standardpfad. `PATH` gehört nicht dazu. Die Variante mit Architektur, etwa `DOTNET_ROOT_X64`, ist für Maschinen gedacht, auf denen eine x64- und eine Arm64-Installation nebeneinander liegen.
+
+Die Lösung ist fast immer, `DOTNET_ROOT` auf die dotnet-Wurzel zu setzen. Alternativ startest du die App über `dotnet App.dll`, dann braucht es keine Suche.
+
+</Block>
+
+<Block n={9} title="In der Praxis">
+
+| Symptom | Ursache in der Kette | Ausweg |
+| --- | --- | --- |
+| „You must install or update .NET to run this application“ mit Name und Version eines Frameworks | `hostfxr` findet keine Version, die die Roll-Forward-Regel erfüllt | passende Runtime installieren oder bewusst `rollForward` anpassen |
+| App-Starter meldet, .NET sei nicht installiert, `dotnet` funktioniert aber | App-Starter findet `hostfxr` nicht | `DOTNET_ROOT` setzen oder mit `dotnet App.dll` starten |
+| App läuft auf dem Server mit einem anderen Patch als lokal | Roll Forward wählt den neuesten installierten Patch | so gewollt, `--list-runtimes` auf beiden Maschinen vergleichen |
+| `FileNotFoundException` für eine Assembly, die im App-Ordner liegt | Datei fehlt in der `.deps.json` und damit in der TPA-Liste | Paket korrekt referenzieren statt Dateien von Hand kopieren |
+| `dotnet build` nimmt ein unerwartetes SDK | `global.json` in einem übergeordneten Ordner | `dotnet --info` zeigt, welche `global.json` gilt |
+
+{/* TODO(verify): Wording of the missing framework error; that dotnet --info names the global.json file in use. */}
+
+Ein Muster zieht sich durch die Tabelle: Jeder Startfehler gehört zu genau einer Komponente. Fehlermeldungen über Framework-Versionen kommen von `hostfxr`, Meldungen über eine fehlende Installation vom App-Starter, Fehler beim Laden einzelner Assemblies erst aus der Runtime. Wer die Komponente kennt, weiß, welche Datei oder Variable er prüfen muss.
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+### Host-Tracing einschalten
+
+Die Host-Komponenten können jeden ihrer Schritte protokollieren. Eingeschaltet wird das mit Umgebungsvariablen, die Ausgabe geht auf den Fehlerkanal oder in eine Datei:
+
+```bash
+export COREHOST_TRACE=1
+export COREHOST_TRACEFILE=host-trace.txt
+dotnet bin/Release/net8.0/App.dll
+```
+
+Unter Windows setzt du die Variablen in PowerShell mit `$env:COREHOST_TRACE = 1`. Mit `COREHOST_TRACE_VERBOSITY` lässt sich die Menge begrenzen, von nur Fehlern bis zu allen Details.
+
+{/* TODO(verify): COREHOST_TRACE_VERBOSITY levels (1 errors, 2 warnings, 3 info, 4 verbose, default 4) and whether newer versions also accept DOTNET_HOST_TRACE. */}
+
+Erwartetes Ergebnis: Die Datei folgt genau der Kette aus dieser Lektion. Am Anfang meldet sich der Muxer, dann siehst du, welche `hostfxr`-Versionen in `host/fxr/` gefunden wurden und welche geladen wird. Es folgen das Lesen von `App.runtimeconfig.json`, die gefundenen Versionen von `Microsoft.NETCore.App` und die Entscheidung des Roll Forward. Danach liest `hostpolicy` die `.deps.json`-Dateien, und weit unten stehen die Eigenschaften, die an `coreclr_initialize` gehen, darunter die vollständige TPA-Liste. Der genaue Wortlaut ändert sich zwischen Versionen, die Reihenfolge nicht.
+
+{/* TODO(verify): Run with .NET 8 and 9 and check that the trace shows fxr resolution, framework resolution, deps.json parsing and the runtime properties in this order. */}
+
+Probier anschließend zwei Varianten: einmal mit `DOTNET_ROLL_FORWARD=Disable`, um den Abbruch aus dem Durchspielen zu sehen, und einmal über den App-Starter mit leerem `DOTNET_ROOT`, um die Suchreihenfolge im Protokoll zu verfolgen.
+
+### Die Übergabe aus Sicht der App
+
+Das Programm unten liest die Eigenschaften, die `hostpolicy` an die Runtime übergeben hat. Führe es lokal aus, SharpLab hat eine andere Startkette.
+
+<VerifyCard
+  sharplab="Dieses Experiment ist für die lokale Ausführung gedacht. Lege mit dotnet new console ein Projekt an, ersetze Program.cs und starte es mit dotnet run."
+  code={propsCode}
+/>
+
+Erwartetes Ergebnis: Die TPA-Liste umfasst deine `App.dll` und alle Assemblies des Frameworks, darunter `System.Private.CoreLib.dll`, jeweils mit vollständigem Pfad in den Framework-Ordner der gewählten Version. Bei einer ASP.NET-Core-App kommen die Assemblies aus `shared/Microsoft.AspNetCore.App/` hinzu.
+
+{/* TODO(verify): Count of TPA entries for a console app on .NET 8 (order of magnitude) and that AppContext.GetData returns the host properties. */}
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="host"
+  questions={[
+    {
+      q: 'Auf einer Maschine sind hostfxr 8.0.11 und 9.0.0 installiert. Welches lädt der Muxer für eine .NET-8-App?',
+      options: ['8.0.11, passend zur App', '9.0.0, die höchste Version'],
+      correct: 1,
+      explanation:
+        'Der Muxer nimmt immer das höchste hostfxr aus host/fxr/. hostfxr ist abwärtskompatibel. Erst hostpolicy und coreclr stammen aus der gewählten Framework-Version.',
+    },
+    {
+      q: 'runtimeconfig.json fordert 8.0.0, installiert sind 8.0.4 und 8.0.11. Was wählt der Host ohne weitere Einstellungen?',
+      options: ['Abbruch, 8.0.0 fehlt', '8.0.4', '8.0.11'],
+      correct: 2,
+      explanation:
+        'Die Standardregel Minor nimmt bei vorhandener Nebenversion den neuesten Patch. Die Zahl in runtimeconfig.json ist eine Untergrenze.',
+    },
+    {
+      q: 'Dieselbe App auf einer Maschine nur mit .NET 9. Was passiert mit der Standardregel?',
+      options: ['Sie läuft auf 9.0', 'Der Start bricht ab'],
+      correct: 1,
+      explanation:
+        'Minor wechselt nie die Hauptversion. Dafür müsste rollForward auf Major oder LatestMajor stehen.',
+    },
+    {
+      q: 'Welche Komponente liest die .deps.json-Dateien und baut die TPA-Liste?',
+      options: ['Der Muxer', 'hostfxr', 'hostpolicy', 'coreclr'],
+      correct: 2,
+      explanation:
+        'hostfxr wählt die Frameworks, hostpolicy aus dem gewählten Framework liest die deps.json-Dateien und übergibt die Listen an coreclr_initialize.',
+    },
+    {
+      q: 'dotnet App.dll funktioniert, ./App meldet, .NET sei nicht installiert. Was ist die wahrscheinlichste Ursache?',
+      options: ['Die App ist beschädigt', 'Der App-Starter findet die .NET-Installation nicht, etwa weil DOTNET_ROOT fehlt', 'Die falsche Runtime-Version ist installiert'],
+      correct: 1,
+      explanation:
+        'Der Muxer findet hostfxr neben sich. Der App-Starter sucht in fester Reihenfolge und berücksichtigt PATH nicht. DOTNET_ROOT behebt das.',
+    },
+    {
+      q: 'Wie viele Prozesse sind beim Start mit dotnet App.dll bis zum Aufruf von Main beteiligt?',
+      options: ['Einer', 'Zwei: dotnet und die Runtime', 'Vier: einer pro Komponente'],
+      correct: 0,
+      explanation:
+        'Muxer, hostfxr, hostpolicy und coreclr laufen im selben Prozess. Jede Komponente lädt die nächste als Bibliothek.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Der **Host** ist eine Kette nativer Komponenten im selben Prozess: Muxer oder App-Starter, dann `hostfxr`, dann `hostpolicy`, dann `coreclr`.
+- **hostfxr** wird immer in der neuesten installierten Version genutzt. Es unterscheidet App und SDK-Befehl, liest `runtimeconfig.json` und wählt die Framework-Versionen.
+- Die Version in `runtimeconfig.json` ist eine **Untergrenze**. Standard ist Roll Forward auf den neuesten Patch derselben Hauptversion, nie auf eine neue Hauptversion.
+- **hostpolicy** stammt aus dem gewählten Framework, liest die `.deps.json`-Dateien und übergibt der Runtime die **TPA-Liste** und alle Einstellungen über `coreclr_initialize`.
+- Der **App-Starter** muss die .NET-Installation suchen: eigener Ordner, `DOTNET_ROOT`, registrierter Ort, Standardpfad. `PATH` zählt nicht.
+- Self-contained Apps bringen alle Komponenten mit und überspringen die Versionsauflösung. Native AOT braucht die Kette gar nicht.
+- `COREHOST_TRACE=1` protokolliert jeden Schritt des Hosts und ist das erste Werkzeug bei Startproblemen.
+
+</Block>

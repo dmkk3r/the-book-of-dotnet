@@ -1,0 +1,419 @@
+---
+import '@/styles/global.css';
+import Sidebar from '@/components/layout/Sidebar.astro';
+import ThemeToggle from '@/components/layout/ThemeToggle.astro';
+import Search from '@/components/layout/Search.astro';
+import Icon from '@/components/Icon.astro';
+import { curriculum, lessonPath, chapterPath } from '@/lib/curriculum';
+import { getReadyIds } from '@/lib/lessons';
+import { withBase } from '@/lib/paths';
+
+interface Props {
+  title?: string;
+  description?: string;
+  currentChapter?: string;
+  currentLesson?: string;
+  /** Hub pages (start page) use the full width instead of the 688px text column. */
+  wide?: boolean;
+}
+
+const { title, description, currentChapter, currentLesson, wide = false } = Astro.props;
+const fullTitle = title ? `${title} | The Book of .NET` : 'The Book of .NET';
+const ready = await getReadyIds();
+const hasRail = Astro.slots.has('rail');
+const firstReady = curriculum.lessons.find((l) => ready.has(l.id)) ?? curriculum.lessons[0]!;
+// Product bar: the central chapters, like the product navigation of documentation sites.
+const PRODUCT_LINKS: [string, string][] = [
+  ['Architektur', 'architektur'],
+  ['Typsystem', 'typsystem'],
+  ['Garbage Collector', 'gc'],
+  ['JIT', 'jit'],
+  ['Async', 'async'],
+  ['Diagnose', 'diagnose'],
+];
+
+// Compact index for the progress script (src/scripts/progress-ui.ts).
+const lessonIndex = {
+  chapters: Object.fromEntries(curriculum.chapters.map((c) => [c.id, c.lessons.map((l) => l.id)])),
+  lessons: curriculum.lessons.map((l) => ({
+    id: l.id,
+    title: l.title,
+    href: withBase(lessonPath(l.chapter.id, l.id)),
+    ready: ready.has(l.id),
+  })),
+};
+---
+
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>{fullTitle}</title>
+    {description && <meta name="description" content={description} />}
+    <link rel="icon" type="image/svg+xml" href={withBase('favicon.svg')} />
+    <script is:inline>
+      // Runs before paint: avoids a flash of the wrong theme and enables JS-only layout.
+      document.documentElement.classList.add('js');
+      try {
+        const t = localStorage.getItem('book-of-dotnet:theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+        if (localStorage.getItem('book-of-dotnet:side-collapsed') === '1')
+          document.documentElement.classList.add('side-collapsed');
+      } catch {
+        // Storage blocked: follow the system setting.
+      }
+    </script>
+  </head>
+  <body>
+    <a class="skip" href="#main">
+      Zum Inhalt springen
+    </a>
+    <header class="site-header">
+      <div class="hdr-row hdr-global">
+        <button
+          type="button"
+          class="menu-btn"
+          aria-controls="side"
+          aria-expanded="false"
+          aria-label="Inhaltsverzeichnis"
+          data-menu-button
+        >
+          <Icon name="menu" />
+        </button>
+        <a class="brand" href={withBase('')}>
+          The Book of .NET
+        </a>
+        <nav class="hdr-nav" aria-label="Hauptnavigation">
+          <a href={withBase('')}>Kapitel</a>
+          <a href={withBase('glossar/')}>Glossar</a>
+          <a href={withBase('fortschritt/')}>Fortschritt</a>
+        </nav>
+        <Search />
+      </div>
+      <div class="hdr-row hdr-product">
+        <a class="product" href={withBase('')}>
+          .NET Runtime
+        </a>
+        <nav class="hdr-nav" aria-label="Kapitel">
+          {PRODUCT_LINKS.map(([label, id]) => (
+            <a
+              href={withBase(chapterPath(id))}
+              aria-current={currentChapter === id ? 'page' : undefined}
+            >
+              {label}
+            </a>
+          ))}
+        </nav>
+        <a
+          class="btn primary hdr-cta"
+          data-continue
+          href={withBase(lessonPath(firstReady.chapter.id, firstReady.id))}
+        >
+          Weiter lernen
+        </a>
+      </div>
+    </header>
+
+    <div class="layout" data-rail={hasRail}>
+      <div class="side-wrap">
+        <Sidebar currentChapter={currentChapter} currentLesson={currentLesson} />
+      </div>
+      <div class="backdrop" data-menu-backdrop hidden></div>
+      <main id="main" tabindex="-1" data-wide={wide}>
+        <slot />
+      </main>
+      {hasRail && (
+        <aside class="rail" aria-label="Auf dieser Seite">
+          <slot name="rail" />
+        </aside>
+      )}
+    </div>
+
+    <footer class="site-footer">
+      <div class="footer-left">
+        <span class="footer-lang">
+          <Icon name="globe" /> Deutsch
+        </span>
+        <ThemeToggle />
+      </div>
+      <nav class="footer-links" aria-label="Fußzeile">
+        <a href={withBase('')}>Kapitel</a>
+        <a href={withBase('glossar/')}>Glossar</a>
+        <a href={withBase('fortschritt/')}>Fortschritt</a>
+        <span class="footer-note">
+          Inoffizielles Lernprojekt, nicht mit Microsoft verbunden. Code unter MIT, Inhalte unter CC
+          BY 4.0.
+        </span>
+      </nav>
+    </footer>
+
+    <script type="application/json" id="lesson-index" set:html={JSON.stringify(lessonIndex)} />
+    <script>
+      import '@/scripts/theme';
+      import '@/scripts/menu';
+      import '@/scripts/side-collapse';
+      import '@/scripts/progress-ui';
+      import '@/scripts/toc-filter';
+      import '@/scripts/rail';
+      import '@/scripts/copy-code';
+      import '@/scripts/search';
+    </script>
+  </body>
+</html>
+
+<style>
+  .skip {
+    position: absolute;
+    left: 12px;
+    top: -60px;
+    z-index: 100;
+    background: var(--surface);
+    padding: 8px 12px;
+    border: 1px solid var(--line-strong);
+  }
+  .skip:focus {
+    top: 8px;
+  }
+
+  /* Header: two rows of 54px on a light grey band, scrolls away with the page. */
+  .site-header {
+    position: relative;
+    z-index: 20;
+    padding-top: env(safe-area-inset-top, 0px);
+    background: var(--header-bg);
+  }
+  .hdr-row {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    height: 54px;
+    padding: 0 24px;
+    border-bottom: 1px solid var(--line);
+  }
+  .brand,
+  .product {
+    flex: none;
+    font-size: 20px;
+    font-weight: 600;
+    line-height: 1;
+    color: var(--ink);
+  }
+  .brand:hover,
+  .product:hover {
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .hdr-nav {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+    font-size: 15px;
+  }
+  .hdr-nav a {
+    padding: 4px 8px;
+    border-radius: var(--radius);
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .hdr-nav a:hover {
+    color: var(--ink);
+    text-decoration: underline;
+  }
+  .hdr-nav a[aria-current='page'] {
+    font-weight: 600;
+  }
+  .hdr-product .hdr-nav {
+    overflow: hidden;
+  }
+  /* The opened search takes the place of the navigation. */
+  .hdr-global:has(:global(.search.open)) .hdr-nav {
+    display: none;
+  }
+  .hdr-cta {
+    margin-left: auto;
+    min-height: 32px;
+    padding: 0 12px;
+    border-radius: 2px;
+    font-size: 15px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  @media (max-width: 1024px) {
+    .hdr-row {
+      gap: 12px;
+      padding: 0 16px;
+    }
+    .hdr-global .hdr-nav {
+      display: none;
+    }
+    .hdr-product {
+      display: none;
+    }
+  }
+
+  /* Page grid: sidebar 275px, content, rail 275px (as on documentation sites). */
+  .layout {
+    display: grid;
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+    grid-template-areas: 'side main';
+    max-width: var(--content-max);
+    margin: 0 auto;
+    min-height: calc(100vh - var(--header-height));
+  }
+  .layout[data-rail='true'] {
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--rail-width);
+    grid-template-areas: 'side main rail';
+  }
+  @media (min-width: 1201px) {
+    :global(html.side-collapsed) .layout[data-rail='true'] {
+      grid-template-columns: 48px minmax(0, 1fr) var(--rail-width);
+    }
+  }
+  @media (min-width: 1025px) {
+    :global(html.side-collapsed) .layout {
+      grid-template-columns: 48px minmax(0, 1fr);
+    }
+  }
+  .side-wrap {
+    grid-area: side;
+    border-right: 1px solid var(--line);
+  }
+  .side-wrap > :global(.toc) {
+    position: sticky;
+    top: var(--sticky-top);
+    max-height: 100vh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  main {
+    grid-area: main;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 24px 24px 48px;
+    outline: none;
+    container-type: inline-size;
+  }
+  /* Text column of 688px, centred; wide elements (visualizations) may use the full width. */
+  main[data-wide='false'] > :global(*) {
+    width: 100%;
+    max-width: var(--text-width);
+    margin-inline: auto;
+  }
+  .rail {
+    grid-area: rail;
+  }
+  .rail > :global(*) {
+    position: sticky;
+    top: var(--sticky-top);
+  }
+
+  .site-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 24px;
+    padding: 24px 24px calc(24px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--line);
+    background: var(--footer-bg);
+    font-size: 14px;
+  }
+  .footer-left,
+  .footer-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 24px;
+  }
+  .footer-lang {
+    display: inline-flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .footer-links a {
+    color: var(--ink);
+  }
+  .footer-note {
+    color: var(--muted);
+  }
+
+  .backdrop,
+  .menu-btn {
+    display: none;
+  }
+
+  @media (max-width: 1200px) {
+    .layout[data-rail='true'] {
+      grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+      grid-template-areas: 'side main';
+    }
+    .rail {
+      display: none;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    .layout,
+    .layout[data-rail='true'] {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas: 'main' 'side';
+    }
+    main {
+      padding: 16px 16px 40px;
+    }
+    /* Without JavaScript the table of contents is a normal block below the content. */
+    .side-wrap > :global(.toc) {
+      position: static;
+      max-height: none;
+      border-top: 1px solid var(--line);
+    }
+    :global(html.js) .menu-btn {
+      display: grid;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      margin-left: -6px;
+      border: 0;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--ink);
+    }
+    .menu-btn :global(.icon) {
+      width: 20px;
+      height: 20px;
+    }
+    :global(html.js) .side-wrap > :global(.toc) {
+      position: fixed;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      width: min(340px, 88vw);
+      max-height: none;
+      z-index: 40;
+      border-top: 0;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      padding-top: calc(20px + env(safe-area-inset-top, 0px));
+      transform: translateX(-100%);
+      visibility: hidden;
+      transition:
+        transform 0.2s,
+        visibility 0s 0.2s;
+    }
+    :global(html.js) .side-wrap > :global(.toc.open) {
+      transform: none;
+      visibility: visible;
+      transition: transform 0.2s;
+    }
+    :global(html.js) .backdrop:not([hidden]) {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      background: rgb(0 0 0 / 0.4);
+    }
+  }
+</style>

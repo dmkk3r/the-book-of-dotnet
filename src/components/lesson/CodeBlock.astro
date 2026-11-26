@@ -1,0 +1,56 @@
+---
+import Icon from '@/components/Icon.astro';
+import { highlightLines } from '@/lib/viz/highlight';
+import type { CodeTab } from '@/lib/viz/types';
+
+interface Props {
+  code: string;
+  lang?: CodeTab;
+}
+const LABELS: Record<CodeTab, string> = { cs: 'C#', lowered: 'C#', il: 'IL', asm: 'Assembler' };
+const { code, lang = 'cs' } = Astro.props;
+const lines = await highlightLines(code.trim(), lang);
+---
+
+<div class="codeblock">
+  <div class="codeblock-head" data-pagefind-ignore>
+    <span>{LABELS[lang]}</span>
+    <button type="button" class="copy" data-copy hidden>
+      <Icon name="copy" />
+      <span data-copy-label>Kopieren</span>
+    </button>
+  </div>
+  <pre tabindex="0"><code set:html={lines.join('\n')} /></pre>
+</div>
+
+<style>
+  /* Code block as on documentation sites: grey header with language and copy button. */
+  .codeblock {
+    margin: 16px 0 0;
+  }
+  .codeblock-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    height: 32px;
+    padding: 0 8px 0 12px;
+    border: 1px solid var(--line-strong);
+    border-bottom: 0;
+    border-radius: var(--radius) var(--radius) 0 0;
+    background: var(--code-head-bg);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  pre {
+    margin: 0;
+    padding: 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: 0 0 var(--radius) var(--radius);
+    background: var(--code-bg);
+    font-size: 14px;
+    line-height: 19px;
+    overflow-x: auto;
+    color: var(--ink);
+  }
+</style>

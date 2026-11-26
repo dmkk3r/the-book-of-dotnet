@@ -1,0 +1,323 @@
+---
+id: pe-format
+title: Aufbau einer Assembly
+summary: Warum eine .NET-Assembly eine PE-Datei ist, wie der Weg vom ersten Byte über den CLI-Header bis zum IL einer Methode verläuft und was in einer DLL wirklich steht.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'ECMA-335 (CLI-Standard), Partition II, Kapitel 24 und 25: Metadaten und Dateiformat'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'PE Format (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
+  - title: 'ECMA-335 Augments (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/specs/Ecma-335-Augments.md
+  - title: 'Book of the Runtime: ReadyToRun Format'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/readytorun-format.md
+  - title: 'Assemblys in .NET (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/assembly/
+  - title: 'PEReader (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.reflection.portableexecutable.pereader
+  - title: 'Referenzassemblys (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/standard/assembly/reference-assemblies
+  - title: 'ReadyToRun-Kompilierung (Microsoft Learn)'
+    url: https://learn.microsoft.com/de-de/dotnet/core/deploying/ready-to-run
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './pe-format.steps';
+import cliHeaderScript from './pe-format-cliheader.steps';
+import methodBodyScript from './pe-format-methodbody.steps';
+import { peReaderCode } from './pe-format-verify';
+
+<Block n={1} title="Das Problem">
+
+Wenn du `dotnet build` aufrufst, entsteht eine Datei mit der Endung `.dll`. Dieselbe Datei läuft unter Windows, Linux und macOS, auf x64 und auf Arm64. Eine native DLL, etwa eine in C++ geschriebene, kann das nicht: Sie enthält Maschinencode für genau einen Prozessor und ist in einem Format verpackt, das genau ein Betriebssystem versteht. Die .NET-Datei muss also etwas grundlegend anderes enthalten.
+
+Gleichzeitig muss diese Datei sehr viel mehr beschreiben als nur Code. Die Runtime will wissen, welche Typen es gibt, welche Felder und Methoden sie haben, welche anderen Assemblies gebraucht werden, welche Attribute an welchem Element hängen und wie jede Methode aufgerufen werden darf. Der Compiler einer anderen Sprache will dieselben Informationen, um gegen die Bibliothek zu kompilieren, ohne den Quelltext zu sehen. Reflection will sie zur Laufzeit abfragen können.
+
+Als .NET entworfen wurde, stand das Team vor der Wahl: ein eigenes Dateiformat erfinden oder ein vorhandenes erweitern. Es hat sich für das zweite entschieden. Eine Assembly ist eine Datei im **PE/COFF-Format** (Portable Executable), demselben Containerformat, in dem Windows seine EXE- und DLL-Dateien speichert. Darin steckt ein zusätzlicher Bereich, den nur .NET versteht.
+
+Der Zielkonflikt dahinter: Ein bekanntes Format bringt Werkzeuge, Signaturverfahren, Ressourcen und Ladelogik mit, die es schon gibt. Dafür schleppt es Altlasten mit, die für .NET bedeutungslos sind, vom DOS-Header bis zur Kennung eines 32-Bit-Prozessors in einer Datei, die auf jedem Prozessor läuft. Wer verstehen will, was in einer Assembly steht, muss beide Schichten auseinanderhalten.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Eine Assembly ist eine Zwiebel mit wenigen Schichten. Vier Sätze tragen den Rest der Lektion:
+
+1. **Außen PE, innen .NET.** Die äußere Hülle ist eine gewöhnliche PE-Datei mit DOS-Header, PE-Header und Abschnitten. Ein einziger Eintrag im PE-Header zeigt auf den **CLI-Header**, und ab dort beginnt die .NET-Welt.
+2. **Der CLI-Header zeigt auf die Metadaten.** Die Metadaten sind eine kleine Datenbank aus Tabellen und Heaps. Sie beschreiben jeden Typ, jede Methode, jedes Feld und jeden Verweis auf eine andere Assembly.
+3. **Code ist IL, nicht Maschinencode.** Jede Methode mit Rumpf hat in den Metadaten eine Adresse. Dort liegt ein kleiner Header und dahinter die IL-Bytes. Maschinencode erzeugt erst der JIT zur Laufzeit.
+4. **Alles verweist über Adressen und Indizes.** Nichts in der Datei ist ein Objekt mit Zeigern. Es gibt nur Positionen relativ zur Ladeadresse (RVAs), Indizes in Tabellen und Indizes in Heaps.
+
+Wann brauchst du dieses Modell? Immer dann, wenn du verstehen willst, was zwischen `dotnet build` und dem ersten Aufruf einer Methode passiert, wenn ein Werkzeug wie ILSpy dir Tabellen und Token zeigt, wenn du eine Assembly analysierst, ohne sie zu laden, oder wenn du dich fragst, was ReadyToRun und Referenzassemblies eigentlich anders machen.
+
+<Callout kind="fehlannahme">
+  „Eine DLL enthält Maschinencode.“ Eine normale .NET-Assembly enthält für deine Methoden nur IL und
+  Metadaten. Dass die Datei die Endung `.dll` trägt und im selben Format wie eine native Windows-DLL
+  gespeichert ist, heißt nicht, dass sie auch denselben Inhalt hat. Ausnahmen sind ReadyToRun-Images,
+  die zusätzlich vorkompilierten Code enthalten, und Native AOT, das gar keine Assembly mehr erzeugt.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Die Visualisierung folgt dem Weg, den die Runtime oder ein Werkzeug wie `PEReader` vom ersten Byte einer Datei bis zum IL der Methode `Add` geht. Achte darauf, an welcher Stelle die PE-Welt endet und die .NET-Welt beginnt, und darauf, was am Ende tatsächlich in der Datei steht.
+
+<StepPlayer script={script} />
+
+Im Tab „IL“ siehst du die Methode so, wie ildasm oder ILSpy sie anzeigen. Die Zeile `.maxstack 8` ist kein gespeicherter Wert: Das Tiny-Format hat dafür keinen Platz, und die Werkzeuge zeigen den Wert an, der für dieses Format implizit gilt. Die vier Instruktionen sind die einzigen vier Byte, die für `Add` in der Datei stehen.
+
+{/* TODO(verify): Concrete values in the walkthrough (Machine i386 for AnyCPU, PE32, three sections, version string v4.0.30319, tiny header 0x12) against a Release build with the current SDK. */}
+
+</Block>
+
+<Block n={4} title="Vom DOS-Header zum CLI-Header">
+
+### Die PE-Hülle
+
+Die PE-Spezifikation von Microsoft beschreibt eine Datei, die aus mehreren Headern und dahinter aus **Abschnitten** (Sections) besteht. Für eine Assembly sind diese Teile wichtig:
+
+- **DOS-Header und DOS-Stub.** Ein Relikt aus der Zeit, als dieselbe Datei auch unter MS-DOS gestartet werden konnte. Der Header beginnt mit den Zeichen `MZ`, an Offset `0x3C` steht die Position des PE-Headers. Der Stub dahinter ist ein winziges DOS-Programm, das nur meldet, dass es unter DOS nicht läuft.
+- **PE-Signatur und COFF-Header.** Die vier Bytes `PE\0\0`, danach die Zielmaschine, die Anzahl der Abschnitte, ein Zeitstempel und Merkmale wie „ist eine DLL“.
+- **Optional Header.** Trotz des Namens bei ausführbaren Dateien Pflicht. Er enthält das Format (PE32 oder PE32+), Ausrichtungen, die bevorzugte Ladeadresse und am Ende die **Datenverzeichnisse**: eine Liste von Paaren aus Adresse und Größe, etwa für Import-Tabelle, Ressourcen, Relocations und, an 15. Stelle, den CLR Runtime Header.
+- **Abschnittstabelle.** Für jeden Abschnitt Name, Adresse im Speicher (`VirtualAddress`), Größe und Position in der Datei (`PointerToRawData`).
+
+{/* TODO(verify): e_lfanew at offset 0x3C, data directory index 14 (15th entry) is the CLR Runtime Header, as stated in the PE format docs. */}
+
+Fast alle Adressen in einer PE-Datei sind **RVAs**, relative virtuelle Adressen. Eine RVA ist der Abstand zur Adresse, an die das Betriebssystem oder die Runtime die Datei in den Speicher abbildet. Um von einer RVA zur Position in der Datei zu kommen, suchst du den Abschnitt, in dessen Bereich die RVA fällt, und rechnest `RVA - VirtualAddress + PointerToRawData`. Genau das tut `PEReader` intern bei jedem Zugriff.
+
+### Die Abschnitte einer Assembly
+
+Eine typische C#-Assembly hat wenige Abschnitte:
+
+| Abschnitt | Inhalt                                                                                                                       |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `.text`   | Fast alles, was .NET betrifft: CLI-Header, Methodenrümpfe mit IL, Metadaten, eingebettete verwaltete Ressourcen, Platz für die Signatur |
+| `.rsrc`   | Win32-Ressourcen, vor allem die Versionsinformation, die der Windows-Explorer in den Dateieigenschaften anzeigt                 |
+| `.reloc`  | Relocations für den kleinen nativen Einstiegsstub, den der Compiler aus Kompatibilitätsgründen bei manchen Zielplattformen erzeugt |
+
+{/* TODO(verify): Section set of an AnyCPU library built with the current SDK (.text, .rsrc, .reloc), and whether Roslyn still emits the mscoree import stub and .reloc for AnyCPU (PE32) but not for x64 (PE32+). */}
+
+Ein Detail, das oft überrascht: Verwaltete Ressourcen, also Dateien, die du mit `EmbeddedResource` einbettest und mit `GetManifestResourceStream` liest, stehen nicht in `.rsrc`. Sie liegen in `.text` und werden über den CLI-Header gefunden. `.rsrc` ist für Windows, nicht für die Runtime.
+
+### Der CLI-Header
+
+Der CLI-Header, nach seiner Struktur in den Windows-Headern auch **COR20-Header** genannt, ist der Punkt, an dem die .NET-Welt beginnt. ECMA-335 beschreibt ihn in Partition II, Abschnitt 25.3.3. Er ist klein und hat feste Felder:
+
+<StepPlayer script={cliHeaderScript} />
+
+Zwei Felder solltest du dir merken. **MetaData** führt zu allem, was die Runtime über Typen wissen muss. **Flags** entscheidet unter anderem über die Bitbreite: Bei einer AnyCPU-Assembly ist der Prozess frei, ob er sie als 32- oder 64-Bit-Code ausführt. Erst ein gesetztes Flag wie `32BITREQUIRED` bindet sie an 32 Bit. Deshalb ist die i386-Kennung im COFF-Header bei AnyCPU bedeutungslos, sie ist nur das, was ein PE32-Container dort eben tragen muss.
+
+{/* TODO(verify): Flag names ILONLY, 32BITREQUIRED, 32BITPREFERRED, STRONGNAMESIGNED and their meaning for AnyCPU in ECMA-335 II.25.3.3.1 and corhdr.h. */}
+
+</Block>
+
+<Block n={5} title="Metadaten und Methodenrümpfe">
+
+### Der Metadatenstamm und seine Streams
+
+Das Feld MetaData im CLI-Header zeigt auf den **Metadatenstamm** (Metadata Root). Er beginnt mit der Signatur `0x424A5342`, die als Bytes gelesen die Zeichen `BSJB` ergibt. Danach folgen eine Version, ein Versionsstring und eine Liste von **Streams**, jeder mit Offset, Größe und Namen.
+
+{/* TODO(verify): Signature value 0x424A5342 and the root layout in ECMA-335 II.24.2.1. */}
+
+| Stream     | Inhalt                                                                                                     |
+| ---------- | ---------------------------------------------------------------------------------------------------------- |
+| `#~`       | Die Metadatentabellen in komprimierter Form: TypeDef, MethodDef, Field, TypeRef, MemberRef und viele weitere |
+| `#Strings` | Bezeichner als nullterminiertes UTF-8: Namen von Typen, Methoden, Feldern, Namensräumen                    |
+| `#US`      | „User Strings“: die String-Literale aus deinem Code als UTF-16, jeweils mit Längenpräfix                   |
+| `#Blob`    | Binärdaten mit Längenpräfix: Signaturen von Methoden und Feldern, Konstanten, Werte von Attributen         |
+| `#GUID`    | 16-Byte-GUIDs, vor allem die Modulversions-ID (MVID), die jeden Build eindeutig kennzeichnet               |
+
+Diese Trennung ist ein bewusster Entwurf. Tabellen haben Zeilen fester Größe, damit die Runtime die n-te Zeile mit einer Multiplikation findet. Alles, was variabel lang ist, steht in einem der Heaps, und die Tabellenzeile enthält nur einen Index dorthin. Ein Name wie `WriteLine`, der in vielen Signaturen vorkommt, steht nur einmal in `#Strings`. Wie die Tabellen genau aufgebaut sind und wie Tokens auf ihre Zeilen zeigen, zeigt die Lektion „Metadatentabellen und Tokens“.
+
+Der Versionsstring im Metadatenstamm lautet auch bei aktuellen .NET-Versionen meist `v4.0.30319`. Das ist kein Hinweis auf .NET Framework 4, sondern die Version des Metadatenformats, die sich seitdem nicht geändert hat. Welche .NET-Version eine Assembly erwartet, steht im Attribut `TargetFrameworkAttribute` und im Verweis auf die Kernbibliothek.
+
+### Methodenrümpfe: Tiny und Fat
+
+Jede Zeile der Tabelle MethodDef hat eine Spalte **RVA**. Bei abstrakten Methoden, Interface-Methoden ohne Standardimplementierung und `extern`-Methoden ist sie 0, bei allen anderen zeigt sie auf einen **Methodenrumpf** im Abschnitt `.text`. ECMA-335 kennt zwei Formate für dessen Header. Welches der Compiler wählt, hängt allein von der Methode ab:
+
+<StepPlayer script={methodBodyScript} />
+
+Das Tiny-Format ist eine Platzersparnis für den häufigen Fall kleiner Methoden. Property-Getter, einfache Weiterleitungen und kurze Berechnungen kommen mit einem einzigen Byte Verwaltungsaufwand aus. Sobald eine Methode lokale Variablen, einen Ausnahmeblock, mehr als 8 Stackeinträge oder mindestens 64 Byte IL braucht, nimmt der Compiler den 12 Byte großen Fat Header.
+
+{/* TODO(verify): Tiny format limits (code size < 64, max stack <= 8, no locals, no exceptions) in ECMA-335 II.25.4.2. */}
+
+Bemerkenswert ist, was **nicht** im Methodenrumpf steht: kein Name, keine Parameterliste, keine Typen der lokalen Variablen. Name und Signatur stehen in der MethodDef-Zeile, die Typen der Locals in einer Signatur im `#Blob`-Heap, auf die der Fat Header nur per Token verweist. Der IL-Code selbst enthält ebenfalls keine Namen. Wenn er eine andere Methode aufruft, steht im IL ein vier Byte langes Token, das auf eine Tabellenzeile zeigt. Wie die Instruktionen auf dem Evaluation Stack arbeiten, erklärt „IL und der Evaluation Stack“.
+
+### Assembly, Modul und Manifest
+
+Bisher war von „der Datei“ die Rede. Genau genommen ist eine PE-Datei mit Metadaten ein **Modul**. Eine **Assembly** ist die Einheit, die versioniert, geladen und referenziert wird. Was sie ausmacht, steht im **Manifest**: einer Zeile in der Tabelle Assembly mit Name, Version, Kultur und öffentlichem Schlüssel, dazu Tabellen für referenzierte Assemblies, für Dateien und für Typen, die an andere Assemblies weitergeleitet werden.
+
+Der Standard erlaubt Assemblies aus mehreren Modulen, bei denen nur das Hauptmodul ein Manifest hat. .NET Framework konnte solche Mehrdatei-Assemblies laden, das moderne .NET unterstützt sie nicht. Für dich heißt das in der Praxis: Eine Assembly ist eine Datei, und diese Datei hat genau ein Modul mit Manifest.
+
+{/* TODO(verify): Multi-module assemblies are not supported on .NET Core / .NET 5+ (Microsoft Learn "Assemblies in .NET" and dotnet/runtime). */}
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Die Bitbreite steht nicht im COFF-Header
+
+Wer mit einem allgemeinen PE-Werkzeug auf eine AnyCPU-Assembly schaut, sieht „i386“ und schließt daraus, es handle sich um eine 32-Bit-Bibliothek. Das ist falsch. Für .NET entscheiden PE32 oder PE32+ zusammen mit den Flags im CLI-Header. Eine AnyCPU-Assembly ohne `32BITREQUIRED` läuft in einem 64-Bit-Prozess als 64-Bit-Code, weil der JIT ohnehin erst zur Laufzeit Maschinencode erzeugt. Eine Assembly, die mit `PlatformTarget` auf x64 gebaut wurde, ist dagegen PE32+ mit AMD64-Kennung und lässt sich in einem 32-Bit-Prozess nicht laden.
+
+### Gleicher Quelltext, gleiche Datei?
+
+Der COFF-Header enthält einen Zeitstempel, und die Metadaten enthalten eine MVID. Früher unterschieden sich deshalb zwei Builds desselben Quelltexts. Mit **deterministischen Builds**, die das SDK standardmäßig aktiviert, berechnet der Compiler beide Werte aus dem Inhalt. Der Zeitstempel ist dann kein Datum mehr, sondern Teil eines Hashwerts. Werkzeuge, die daraus ein Builddatum ablesen wollen, zeigen Unsinn an.
+
+{/* TODO(verify): Deterministic builds are on by default in the SDK, and the COFF timestamp and MVID are derived from a content hash (Roslyn deterministic inputs docs). */}
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+Im Alltag begegnet dir der Aufbau einer Assembly an mehr Stellen, als man denkt:
+
+| Situation                                        | Was dahintersteckt                                                         | Was du tun kannst                                     |
+| ------------------------------------------------ | -------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `BadImageFormatException` beim Laden             | Datei ist keine Assembly oder passt nicht zur Bitbreite des Prozesses       | CLI-Header und Flags prüfen, PlatformTarget prüfen    |
+| Plugin-Scanner soll Typen finden, ohne zu laden  | Metadaten lassen sich direkt aus der Datei lesen                           | `PEReader` und `MetadataReader` statt `Assembly.LoadFrom` |
+| Assembly im Ordner `ref` eines NuGet-Pakets      | **Referenzassembly**: Metadaten ohne echte Methodenrümpfe                  | Nur zum Kompilieren verwenden, nie ausführen          |
+| Assembly ist viel größer als erwartet            | ReadyToRun-Code oder große eingebettete Ressourcen                         | Abschnitte und CLI-Header ansehen                     |
+| Dateieigenschaften im Explorer zeigen Version    | Win32-Versionsressource in `.rsrc`, nicht die Assembly-Version             | `AssemblyVersion` und `FileVersion` unterscheiden     |
+
+### Referenzassemblies
+
+Eine **Referenzassembly** hat denselben Aufbau wie jede andere, nur ohne echte Implementierung. Sie enthält die öffentliche Oberfläche einer Bibliothek: Typen, Signaturen, Attribute. Die Methodenrümpfe sind leer oder bestehen nur aus einer Anweisung, die eine Ausnahme wirft. Das Attribut `ReferenceAssemblyAttribute` kennzeichnet sie, und die Runtime weigert sich, sie zur Ausführung zu laden. Die Assemblies, gegen die du kompilierst, wenn du `net8.0` als Ziel angibst, sind solche Referenzassemblies aus einem Targeting Pack. Zur Laufzeit lädt die Runtime die Implementierungsassemblies, die zur installierten Runtime gehören. Wie dabei die passende Datei gefunden wird, behandelt „Versionierung und Binding“.
+
+{/* TODO(verify): Reference assembly bodies ("throw null" as emitted by Roslyn), and that the runtime refuses to execute assemblies marked with ReferenceAssemblyAttribute (BadImageFormatException). */}
+
+### Metadaten lesen, ohne zu laden
+
+`Assembly.LoadFrom` lädt eine Datei in den Prozess, bindet ihre Abhängigkeiten und lässt sich im Standardkontext nicht wieder entladen. Für reine Analysen ist das zu viel. `System.Reflection.Metadata` liest dieselben Strukturen, die du in dieser Lektion gesehen hast, direkt aus der Datei: `PEReader` für die PE-Hülle und die Methodenrümpfe, `MetadataReader` für Tabellen und Heaps. Roslyn, ILSpy und viele Analysewerkzeuge bauen darauf auf.
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Die Runtime lädt eine Assembly nicht, indem sie sie Byte für Byte einliest. Sie bildet die Datei in den Speicher ab, ähnlich wie das Betriebssystem eine native DLL abbildet. Danach sind RVAs einfach Abstände zur Basisadresse, und die Runtime greift auf Metadaten und IL direkt im abgebildeten Speicher zu. Auf Linux und macOS übernimmt die Runtime diese Abbildung selbst, weil das Betriebssystem dort kein PE kennt.
+
+{/* TODO(verify): CoreCLR maps PE images itself on non-Windows platforms (PEImageLayout in src/coreclr/vm), and how flat versus mapped layouts are used. */}
+
+Das IL einer Methode liest erst der JIT, und zwar erst dann, wenn die Methode zum ersten Mal aufgerufen wird. Methoden, die nie aufgerufen werden, kosten zur Laufzeit also nur ihren Platz in der Datei. Wie aus dem IL Maschinencode wird und in welchen Stufen, zeigt „Tiered Compilation und OSR“.
+
+### ReadyToRun als Zusatz
+
+Ein **ReadyToRun**-Image (R2R) ist weiterhin eine vollständige Assembly mit IL und Metadaten. Zusätzlich enthält es vorkompilierten Maschinencode für eine bestimmte Plattform, etwa Linux x64. Das Feld ManagedNativeHeader im CLI-Header zeigt auf den ReadyToRun-Header, über den die Runtime diesen Code findet. Passt der Code nicht, etwa weil eine Abhängigkeit sich auf unerwartete Weise geändert hat, verwirft die Runtime ihn und fällt auf den JIT zurück. Dafür braucht sie das IL, deshalb bleibt es erhalten.
+
+<Callout kind="version">
+  ReadyToRun-Code ist an die Zielplattform gebunden, die IL-Teile nicht. Die Bibliotheken der
+  .NET-Runtime selbst werden als ReadyToRun ausgeliefert. Native AOT ist etwas anderes: Es erzeugt
+  eine native ausführbare Datei des Betriebssystems ohne IL, in der zur Laufzeit kein JIT mehr
+  läuft. Mehr dazu in „ReadyToRun und Crossgen“ und „Native AOT“.
+</Callout>
+
+{/* TODO(verify): R2R images are platform specific and the Machine field encodes the target OS (readytorun-format.md); shared framework libraries ship as R2R. */}
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das folgende Programm liest eine Assembly mit `System.Reflection.Metadata`, ohne sie zu laden. Ohne Argument untersucht es sich selbst, mit einem Pfad jede andere Datei. Erstelle eine Konsolenanwendung, füge eine kleine Methode wie `Add` hinzu und baue mit `-c Release`.
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung ausführen (dotnet run -c Release). Erwartet: Machine I386 und Format PE32 bei AnyCPU, Flags ILOnly, die Abschnitte .text, .rsrc und .reloc, Metadaten-Version v4.0.30319. Kleine Methoden wie Add haben einen Rumpf von einem Byte mehr als ihr IL (Tiny Header), Methoden mit lokalen Variablen zwölf Byte mehr (Fat Header). Danach mit dem Pfad einer Datei aus dem Ordner shared/Microsoft.NETCore.App aufrufen: Dort ist ManagedNativeHeader belegt, weil die Framework-Bibliotheken ReadyToRun-Images sind."
+  code={peReaderCode}
+/>
+
+{/* TODO(verify): Expected output of the sample (I386, PE32, ILOnly, sections, v4.0.30319, body sizes) and that framework assemblies show a non-empty ManagedNativeHeader. */}
+
+Mit ILSpy kannst du dieselben Strukturen grafisch ansehen: Neuere Versionen zeigen unterhalb einer Assembly einen Knoten mit den PE-Headern, dem CLI-Header und allen Metadatentabellen. ildasm zeigt mit der Option für Header-Informationen ebenfalls den CLI-Header und die Abschnitte an.
+
+{/* TODO(verify): ILSpy version that introduced the metadata tree node, and the ildasm option (/headers) for header output. */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="pe-format"
+  questions={[
+    {
+      q: 'Was enthält eine normale, mit dotnet build erzeugte Assembly für die Methode Add?',
+      options: [
+        'Maschinencode für x64',
+        'Maschinencode für jede unterstützte Plattform',
+        'Einen Methodenheader und IL-Bytes',
+      ],
+      correct: 2,
+      explanation:
+        'Die Datei enthält nur IL und Metadaten. Maschinencode erzeugt der JIT zur Laufzeit. Nur ReadyToRun-Images enthalten zusätzlich vorkompilierten Code für eine Plattform.',
+    },
+    {
+      q: 'Ein PE-Werkzeug zeigt für eine AnyCPU-Assembly die Maschine i386. Was folgt daraus?',
+      options: [
+        'Sie läuft nur in 32-Bit-Prozessen',
+        'Nichts über die Bitbreite: Das entscheiden die Flags im CLI-Header',
+      ],
+      correct: 1,
+      explanation:
+        'Ein PE32-Container trägt die Kennung i386. Ob die Assembly an 32 Bit gebunden ist, steht im CLI-Header (etwa 32BITREQUIRED). Ohne dieses Flag läuft sie auch als 64-Bit-Code.',
+    },
+    {
+      q: 'Woran erkennt die Runtime, dass eine PE-Datei eine .NET-Assembly ist?',
+      options: [
+        'An der Dateiendung .dll',
+        'Am DOS-Stub',
+        'Am belegten Datenverzeichnis für den CLR Runtime Header',
+      ],
+      correct: 2,
+      explanation:
+        'Erst der Eintrag im Optional Header, der auf den CLI-Header zeigt, macht aus einer PE-Datei eine Assembly. Endung und DOS-Stub haben auch native DLLs.',
+    },
+    {
+      q: 'Wo stehen die String-Literale aus deinem C#-Code?',
+      options: ['Im Heap #Strings', 'Im Heap #US', 'Im Abschnitt .rsrc'],
+      correct: 1,
+      explanation:
+        '#US enthält die User Strings, also Literale als UTF-16. #Strings enthält Bezeichner wie Typ- und Methodennamen, .rsrc ist für Win32-Ressourcen.',
+    },
+    {
+      q: 'Warum braucht die Methode Sum mit einer lokalen Variable einen Fat Header?',
+      options: [
+        'Weil der Tiny Header keine Verweise auf die Signatur der Locals speichern kann',
+        'Weil sie öffentlich ist',
+        'Weil sie eine Schleife enthält',
+      ],
+      correct: 0,
+      explanation:
+        'Der Tiny Header ist ein Byte mit Format und Codegröße. Für lokale Variablen braucht es LocalVarSigTok, und das gibt es nur im 12 Byte großen Fat Header.',
+    },
+    {
+      q: 'Ein ReadyToRun-Image enthält vorkompilierten Code. Warum steckt trotzdem IL darin?',
+      options: [
+        'Nur für Debugger',
+        'Damit die Runtime auf den JIT zurückfallen und später optimierten Code erzeugen kann',
+        'Es steckt kein IL darin',
+      ],
+      correct: 1,
+      explanation:
+        'Die Runtime kann R2R-Code verwerfen, wenn er nicht passt, und mit Tiered Compilation heiße Methoden neu übersetzen. Für beides braucht der JIT das IL.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Eine .NET-Assembly ist eine **PE/COFF-Datei**, auch unter Linux und macOS. Die PE-Hülle ist Verpackung, die .NET-Welt beginnt beim **CLI-Header**.
+- Der CLI-Header zeigt auf die **Metadaten**, enthält Flags wie `ILONLY` und `32BITREQUIRED` und den Token des Einstiegspunkts. Die Maschinenkennung im COFF-Header sagt bei AnyCPU nichts über die Bitbreite.
+- Die Metadaten bestehen aus **Tabellen** im Stream `#~` und den Heaps `#Strings`, `#US`, `#Blob` und `#GUID`. Tabellenzeilen enthalten nur Indizes, Variables steht in den Heaps.
+- Jede Methode mit Rumpf hat in MethodDef eine **RVA**. Dort liegt ein **Tiny** (1 Byte) oder **Fat** Header (12 Byte) und dahinter das IL. Namen, Signaturen und Typen der Locals stehen nicht im Rumpf.
+- Eine normale Assembly enthält **keinen Maschinencode** für deine Methoden. ReadyToRun fügt welchen hinzu, behält aber IL und Metadaten.
+- **Referenzassemblies** haben denselben Aufbau ohne echte Implementierung und dienen nur dem Compiler.
+- Mit `PEReader` und `MetadataReader` liest du all das, ohne die Assembly zu laden.
+
+</Block>

@@ -1,0 +1,141 @@
+---
+import Icon from '@/components/Icon.astro';
+// Site search (Pagefind). The index is created by `npm run build`; hidden without JavaScript.
+---
+
+<div class="search" role="search" data-search hidden>
+  <button
+    type="button"
+    class="search-toggle"
+    data-search-toggle
+    aria-label="Suche öffnen"
+    aria-expanded="false"
+    aria-controls="search-field"
+  >
+    <Icon name="search" />
+  </button>
+  <div class="search-field" id="search-field">
+    <label class="sr-only" for="site-search">
+      Suchen
+    </label>
+    <input
+      id="site-search"
+      type="search"
+      placeholder="Suchen"
+      autocomplete="off"
+      spellcheck="false"
+      aria-controls="search-results"
+      data-search-input
+    />
+    <div class="search-panel" id="search-results" data-search-panel hidden>
+      <p class="search-status" aria-live="polite" data-search-status></p>
+      <ol class="search-list" data-search-list></ol>
+    </div>
+  </div>
+</div>
+
+<style>
+  /* Collapsed to a magnifier button; opens to a field (see src/scripts/search.ts). */
+  .search {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+  }
+  .search.open {
+    flex: 1;
+    max-width: 640px;
+  }
+  .search-toggle {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 32px;
+    height: 32px;
+    border: 0;
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--ink);
+  }
+  .search-toggle :global(.icon) {
+    width: 20px;
+    height: 20px;
+  }
+  .search-toggle:hover {
+    background: var(--surface-alt);
+  }
+  .search-field {
+    display: none;
+    position: relative;
+    flex: 1;
+  }
+  .search.open .search-field {
+    display: block;
+  }
+  input {
+    width: 100%;
+    height: 32px;
+    padding: 4px 12px;
+    border: 1px solid var(--line-strong);
+    border-bottom-color: var(--input-line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    font-size: 14px;
+  }
+  input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 0;
+    border-color: var(--accent);
+  }
+  .search-panel {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    width: min(560px, calc(100vw - 32px));
+    max-height: min(70vh, 560px);
+    overflow-y: auto;
+    padding: 8px 0;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    z-index: 50;
+  }
+  .search-status {
+    margin: 0;
+    padding: 4px 16px 8px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .search-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .search-list :global(a) {
+    display: block;
+    padding: 8px 16px;
+    color: var(--ink);
+  }
+  .search-list :global(a:hover),
+  .search-list :global(a:focus-visible) {
+    background: var(--surface-alt);
+    text-decoration: none;
+    outline-offset: -2px;
+  }
+  .search-list :global(.r-title) {
+    display: block;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .search-list :global(.r-excerpt) {
+    display: block;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .search-list :global(mark) {
+    background: var(--hl);
+    color: var(--ink);
+  }
+</style>

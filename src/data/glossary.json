@@ -1,0 +1,809 @@
+{
+  "terms": [
+    {
+      "id": "boxing",
+      "term": "Boxing",
+      "aliases": ["Unboxing"],
+      "definition": "Boxing verpackt einen Werttyp in ein neu angelegtes Heap-Objekt, damit er als object oder Interface verwendet werden kann. Unboxing prüft den Typ und kopiert den Wert wieder heraus.",
+      "lesson": "boxing"
+    },
+    {
+      "id": "bucket",
+      "term": "Bucket",
+      "aliases": ["Buckets"],
+      "definition": "Fach einer Hash-Tabelle, ausgewählt über den Hashcode des Schlüssels. Einträge mit demselben Bucket werden miteinander verkettet.",
+      "lesson": "dictionary"
+    },
+    {
+      "id": "card-table",
+      "term": "Card Table",
+      "aliases": ["Card Tables"],
+      "definition": "Datenstruktur des GC, die vermerkt, in welchen Bereichen älterer Generationen Verweise geschrieben wurden. So muss eine Collection der jungen Generationen nicht den ganzen Heap durchsuchen.",
+      "lesson": "card-tables"
+    },
+    {
+      "id": "dynamic-pgo",
+      "term": "Dynamic PGO",
+      "aliases": ["PGO"],
+      "definition": "Profilgesteuerte Optimierung zur Laufzeit: Instrumentierter Code sammelt Daten, etwa welche Typen tatsächlich vorkommen, und der JIT nutzt sie für die optimierte Übersetzung. Seit .NET 8 standardmäßig aktiv.",
+      "lesson": "pgo"
+    },
+    {
+      "id": "finalizer",
+      "term": "Finalizer",
+      "aliases": ["Finalizern"],
+      "definition": "Methode, in C# als ~Klasse() geschrieben, die die Runtime aufruft, bevor ein Objekt freigegeben wird. Objekte mit Finalizer überleben dafür mindestens eine zusätzliche Collection.",
+      "lesson": "finalisierung"
+    },
+    {
+      "id": "gc-root",
+      "term": "GC-Root",
+      "aliases": ["GC-Roots", "Root", "Roots"],
+      "definition": "Startpunkt, von dem aus der GC erreichbare Objekte sucht: lokale Variablen und Register laufender Methoden, statische Felder und GC-Handles.",
+      "lesson": "generationen"
+    },
+    {
+      "id": "generation",
+      "term": "Generation",
+      "aliases": ["Generationen", "Gen0", "Gen1", "Gen2"],
+      "definition": "Altersstufe von Objekten im verwalteten Heap. Neue Objekte beginnen in Gen0, wer eine Collection überlebt, rückt eine Stufe weiter, höchstens bis Gen2.",
+      "lesson": "generationen"
+    },
+    {
+      "id": "heap",
+      "term": "Heap",
+      "aliases": ["Managed Heap"],
+      "definition": "Speicherbereich für Objekte von Referenztypen und für geboxte Werte. Er wird vom Garbage Collector verwaltet.",
+      "lesson": "werttypen"
+    },
+    {
+      "id": "il",
+      "term": "Intermediate Language",
+      "aliases": ["IL", "CIL", "MSIL"],
+      "definition": "Plattformunabhängiger Bytecode, in den C# übersetzt wird. Der JIT oder ein AOT-Compiler erzeugt daraus Maschinencode.",
+      "lesson": "il-grundlagen"
+    },
+    {
+      "id": "inlining",
+      "term": "Inlining",
+      "aliases": ["inlinen"],
+      "definition": "Der JIT ersetzt einen Methodenaufruf durch den Rumpf der aufgerufenen Methode. Das spart den Aufruf und ermöglicht weitere Optimierungen.",
+      "lesson": "inlining"
+    },
+    {
+      "id": "jit",
+      "term": "JIT-Compiler",
+      "aliases": ["JIT"],
+      "definition": "Übersetzt IL zur Laufzeit in Maschinencode, Methode für Methode, in der Regel beim ersten Aufruf.",
+      "lesson": "jit-pipeline"
+    },
+    {
+      "id": "loh",
+      "term": "Large Object Heap",
+      "aliases": ["LOH"],
+      "definition": "Bereich für große Objekte, standardmäßig ab 85.000 Byte. Er wird zusammen mit Gen2 eingesammelt und standardmäßig nicht kompaktiert.",
+      "lesson": "loh-poh"
+    },
+    {
+      "id": "methodtable",
+      "term": "MethodTable",
+      "aliases": [],
+      "definition": "Interne Struktur der CoreCLR, die einen Typ zur Laufzeit beschreibt, unter anderem mit Größe, Basistyp, Interfaces und den Einträgen für virtuelle Methoden. Jedes Objekt auf dem Heap enthält einen Zeiger darauf.",
+      "lesson": "method-table"
+    },
+    {
+      "id": "native-aot",
+      "term": "Native AOT",
+      "aliases": [],
+      "definition": "Veröffentlicht eine Anwendung vollständig vorab übersetzt als native ausführbare Datei. Zur Laufzeit gibt es keinen JIT.",
+      "lesson": "native-aot"
+    },
+    {
+      "id": "object-header",
+      "term": "Object Header",
+      "aliases": ["Objekt-Header"],
+      "definition": "Feld vor jedem Heap-Objekt, auf 64-Bit-Systemen 8 Byte groß. Die Runtime nutzt es unter anderem für Sperren mit lock und für Hashcodes.",
+      "lesson": "objektheader"
+    },
+    {
+      "id": "osr",
+      "term": "On-Stack Replacement",
+      "aliases": ["OSR"],
+      "definition": "Wechsel von wenig optimiertem zu optimiertem Code mitten in einer laufenden Methode, typischerweise in einer lange laufenden Schleife.",
+      "lesson": "tiered"
+    },
+    {
+      "id": "padding",
+      "term": "Padding",
+      "aliases": [],
+      "definition": "Ungenutzte Bytes, die die Runtime zwischen oder nach Feldern einfügt, damit jedes Feld an einer passenden Adresse beginnt.",
+      "lesson": "struct-layout"
+    },
+    {
+      "id": "pinning",
+      "term": "Pinning",
+      "aliases": [],
+      "definition": "Fixieren eines Objekts, damit der GC es nicht verschiebt, etwa mit fixed oder einem GCHandle. Viele fixierte Objekte erschweren das Kompaktieren.",
+      "lesson": "pinning"
+    },
+    {
+      "id": "poh",
+      "term": "Pinned Object Heap",
+      "aliases": ["POH"],
+      "definition": "Seit .NET 5 ein eigener Bereich für Objekte, die von Anfang an fixiert sind und nie verschoben werden, etwa Puffer für Interop.",
+      "lesson": "loh-poh"
+    },
+    {
+      "id": "promotion",
+      "term": "Promotion",
+      "aliases": ["promotet"],
+      "definition": "Aufstieg eines Objekts in die nächste Generation, nachdem es eine Collection überlebt hat.",
+      "lesson": "generationen"
+    },
+    {
+      "id": "readytorun",
+      "term": "ReadyToRun",
+      "aliases": ["R2R"],
+      "definition": "Format, bei dem Assemblies bereits vorübersetzten Maschinencode enthalten. Das verkürzt den Start, der JIT kann häufig genutzte Methoden trotzdem neu übersetzen.",
+      "lesson": "readytorun"
+    },
+    {
+      "id": "referenztyp",
+      "term": "Referenztyp",
+      "aliases": ["Referenztypen"],
+      "definition": "Typ, dessen Objekte auf dem Heap liegen. Variablen enthalten nur einen Verweis auf das Objekt, zum Beispiel bei class, string und Arrays.",
+      "lesson": "werttypen"
+    },
+    {
+      "id": "safe-point",
+      "term": "Safe Point",
+      "aliases": ["Safe Points"],
+      "definition": "Stelle im Code, an der ein Thread angehalten werden kann und die Runtime genau weiß, wo Verweise liegen. Der GC wartet, bis alle verwalteten Threads einen solchen Punkt erreicht haben.",
+      "lesson": "safe-points"
+    },
+    {
+      "id": "span",
+      "term": "Span<T>",
+      "aliases": [],
+      "definition": "Typsicherer Ausschnitt aus zusammenhängendem Speicher, etwa einem Array, dem Stack oder nativem Speicher, ohne Kopie. Als ref struct kann er nicht auf dem Heap liegen.",
+      "lesson": "span"
+    },
+    {
+      "id": "stack",
+      "term": "Stack",
+      "aliases": [],
+      "definition": "Speicherbereich je Thread für Methodenaufrufe: Rücksprungadressen, Parameter und lokale Variablen. Beim Verlassen einer Methode wird ihr Bereich automatisch wieder frei.",
+      "lesson": "werttypen"
+    },
+    {
+      "id": "stack-frame",
+      "term": "Stack-Frame",
+      "aliases": ["Stack-Frames"],
+      "definition": "Bereich auf dem Stack, den ein einzelner Methodenaufruf für lokale Variablen, Rücksprungadresse und gesicherte Register belegt.",
+      "lesson": "stack-walking"
+    },
+    {
+      "id": "state-machine",
+      "term": "State Machine",
+      "aliases": [],
+      "definition": "Struktur, die der C#-Compiler aus einer async-Methode erzeugt. Sie speichert Zustand und lokale Variablen und setzt die Methode nach jedem await an der richtigen Stelle fort.",
+      "lesson": "state-machine"
+    },
+    {
+      "id": "synchronizationcontext",
+      "term": "SynchronizationContext",
+      "aliases": [],
+      "definition": "Abstraktion, die bestimmt, wo Fortsetzungen nach einem await ausgeführt werden, etwa auf dem UI-Thread. Konsolenanwendungen und ASP.NET Core haben standardmäßig keinen.",
+      "lesson": "sync-context"
+    },
+    {
+      "id": "threadpool",
+      "term": "ThreadPool",
+      "aliases": ["ThreadPool-Thread", "ThreadPool-Threads"],
+      "definition": "Von der Runtime verwalteter Vorrat an Threads für kurze Arbeitseinheiten, Task-Fortsetzungen und Timer-Callbacks. Er passt die Zahl der Threads an die Last an.",
+      "lesson": "threadpool"
+    },
+    {
+      "id": "tiered-compilation",
+      "term": "Tiered Compilation",
+      "aliases": ["Tier 0", "Tier 1"],
+      "definition": "Methoden werden zuerst schnell und kaum optimiert übersetzt (Tier 0). Häufig aufgerufene Methoden übersetzt der JIT später erneut mit allen Optimierungen (Tier 1).",
+      "lesson": "tiered"
+    },
+    {
+      "id": "werttyp",
+      "term": "Werttyp",
+      "aliases": ["Werttypen"],
+      "definition": "Typ, dessen Variablen den Wert selbst enthalten, etwa struct, int oder enum. Eine Zuweisung kopiert den Wert.",
+      "lesson": "werttypen"
+    },
+    {
+      "id": "write-barrier",
+      "term": "Write Barrier",
+      "aliases": ["Write Barriers"],
+      "definition": "Kleiner Codeabschnitt, den der JIT beim Schreiben eines Verweises in ein Heap-Objekt einfügt. Er pflegt unter anderem die Card Table.",
+      "lesson": "card-tables"
+    },
+    {
+      "id": "eeclass",
+      "term": "EEClass",
+      "aliases": [],
+      "definition": "Interne Struktur der CoreCLR mit selten benötigten Typinformationen wie Felddeskriptoren und dem Bezug zu den Metadaten. Sie ergänzt die MethodTable, damit diese klein bleibt.",
+      "lesson": "method-table"
+    },
+    {
+      "id": "generic-math",
+      "term": "Generic Math",
+      "aliases": [],
+      "definition": "Interfaces wie INumber<T> seit .NET 7, mit denen sich Rechencode einmal generisch für alle Zahlentypen schreiben lässt. Sie beruhen auf statischen abstrakten Interface-Membern.",
+      "lesson": "static-abstract"
+    },
+    {
+      "id": "generic-dictionary",
+      "term": "Generisches Wörterbuch",
+      "aliases": ["Wörterbuch"],
+      "definition": "Tabelle, aus der geteilter generischer Code zur Laufzeit das konkrete Typargument und davon abhängige Informationen liest.",
+      "lesson": "generics-runtime"
+    },
+    {
+      "id": "loader-heap",
+      "term": "Loader Heap",
+      "aliases": [],
+      "definition": "Speicher der Runtime für Typinformationen wie MethodTable und EEClass. Er wird nicht vom GC verwaltet, sondern zusammen mit dem AssemblyLoadContext freigegeben.",
+      "lesson": "method-table"
+    },
+    {
+      "id": "sync-block",
+      "term": "Sync Block",
+      "aliases": ["Sync Blocks"],
+      "definition": "Zusatzstruktur der Runtime für ein Objekt, wenn der Object Header nicht ausreicht, etwa für Sperre und Hashcode zugleich. Der Header enthält dann nur noch den Index des Sync Blocks.",
+      "lesson": "objektheader"
+    },
+    {
+      "id": "thin-lock",
+      "term": "Thin Lock",
+      "aliases": [],
+      "definition": "Leichtgewichtige Sperre, bei der die Runtime die ID des sperrenden Threads direkt im Object Header vermerkt, ohne einen Sync Block anzulegen.",
+      "lesson": "objektheader"
+    },
+    {
+      "id": "virtual-stub-dispatch",
+      "term": "Virtual Stub Dispatch",
+      "aliases": ["VSD"],
+      "definition": "Mechanismus der CoreCLR für Interface-Aufrufe: Die Aufrufstelle springt in kleine Stubs, die sich gesehene Typen merken und so das Ziel schnell finden.",
+      "lesson": "virtual-dispatch"
+    },
+    {
+      "id": "allokationsbudget",
+      "term": "Allokationsbudget",
+      "aliases": ["Budget"],
+      "definition": "Speichermenge, die in einer Generation zwischen zwei Collections alloziert oder hineinpromotet werden darf. Ist das Gen0-Budget erschöpft, löst die nächste Allokation eine Collection aus.",
+      "lesson": "generationen"
+    },
+    {
+      "id": "array-kovarianz",
+      "term": "Array-Kovarianz",
+      "aliases": ["kovariant"],
+      "definition": "Regel, nach der ein Array eines abgeleiteten Referenztyps auch als Array des Basistyps verwendet werden kann, etwa string[] als object[]. Dafür prüft die Runtime jeden Schreibzugriff auf solche Arrays.",
+      "lesson": "arrays-strings"
+    },
+    {
+      "id": "awaiter",
+      "term": "Awaiter",
+      "aliases": ["Awaiters"],
+      "definition": "Objekt, das GetAwaiter() liefert und das Warten auf ein Ergebnis abwickelt: Es meldet über IsCompleted, ob das Ergebnis da ist, registriert Fortsetzungen und liefert über GetResult das Ergebnis.",
+      "lesson": "method-builder"
+    },
+    {
+      "id": "constrained-call",
+      "term": "constrained-Aufruf",
+      "aliases": ["constrained."],
+      "definition": "IL-Aufruf mit dem Präfix constrained., mit dem generischer Code eine Methode auf einem Wert vom Typ T aufruft. Für Werttypen ruft der JIT die Methode direkt auf, ohne den Wert zu boxen.",
+      "lesson": "generics-runtime"
+    },
+    {
+      "id": "devirtualisierung",
+      "term": "Devirtualisierung",
+      "aliases": ["devirtualisiert", "devirtualisieren"],
+      "definition": "Optimierung des JIT, die einen virtuellen oder Interface-Aufruf durch einen direkten Aufruf ersetzt, wenn das Ziel feststeht oder sehr wahrscheinlich ist. Danach kann der Aufruf auch geinlined werden.",
+      "lesson": "devirtualisierung"
+    },
+    {
+      "id": "execution-context",
+      "term": "ExecutionContext",
+      "aliases": [],
+      "definition": "Sammlung von Umgebungsdaten wie AsyncLocal-Werten, die über await und Thread-Wechsel hinweg mitgenommen wird.",
+      "lesson": "execution-context"
+    },
+    {
+      "id": "fortsetzung",
+      "term": "Fortsetzung",
+      "aliases": ["Fortsetzungen", "Continuation"],
+      "definition": "Code, der ausgeführt wird, sobald eine asynchrone Operation abgeschlossen ist. Bei await ist das der Rest der Methode, also ein erneuter Aufruf von MoveNext der State Machine.",
+      "lesson": "state-machine"
+    },
+    {
+      "id": "freiliste",
+      "term": "Freiliste",
+      "aliases": [],
+      "definition": "Verkettete Liste freigegebener Plätze in einer Datenstruktur, die beim nächsten Einfügen wiederverwendet werden, statt die übrigen Einträge zu verschieben.",
+      "lesson": "dictionary"
+    },
+    {
+      "id": "generationenhypothese",
+      "term": "Generationenhypothese",
+      "aliases": [],
+      "definition": "Beobachtung über reale Programme: Die meisten Objekte sterben jung, und Objekte, die schon eine Weile leben, leben meist noch lange. Auf ihr beruht die Aufteilung des Heaps in Generationen.",
+      "lesson": "generationen"
+    },
+    {
+      "id": "guarded-devirtualization",
+      "term": "Guarded Devirtualization",
+      "aliases": [],
+      "definition": "Optimierung mit Dynamic PGO: Der JIT prüft an einem virtuellen Aufruf zuerst auf den häufigsten Typ und ruft dessen Methode direkt auf. Nur für andere Typen bleibt der virtuelle Aufruf.",
+      "lesson": "pgo"
+    },
+    {
+      "id": "hashcode",
+      "term": "Hashcode",
+      "aliases": ["Hashcodes"],
+      "definition": "Zahl, die eine Hashfunktion aus einem Schlüssel berechnet und aus der eine Hashtabelle die Position ableitet. Gleiche Schlüssel müssen denselben Hashcode liefern, verschiedene dürfen kollidieren.",
+      "lesson": "dictionary"
+    },
+    {
+      "id": "interning",
+      "term": "Interning",
+      "aliases": ["interniert"],
+      "definition": "Verfahren, bei dem gleiche Strings nur einmal als Objekt existieren. String-Literale werden automatisch interniert, zur Laufzeit erzeugte Strings nur mit String.Intern.",
+      "lesson": "arrays-strings"
+    },
+    {
+      "id": "kollision",
+      "term": "Kollision",
+      "aliases": ["Kollisionen"],
+      "definition": "Fall, in dem verschiedene Schlüssel auf dieselbe Position einer Hashtabelle abgebildet werden. Dictionary verkettet solche Einträge.",
+      "lesson": "dictionary"
+    },
+    {
+      "id": "midlife-crisis",
+      "term": "Midlife Crisis",
+      "aliases": [],
+      "definition": "Muster, bei dem Objekte gerade lange genug leben, um nach Gen2 promotet zu werden, und dort bald sterben. Das macht teure volle Collections häufiger.",
+      "lesson": "generationen"
+    },
+    {
+      "id": "patchpoint",
+      "term": "Patchpoint",
+      "aliases": ["Patchpoints"],
+      "definition": "Stelle im Tier-0-Code einer Schleife, an der die Runtime mit On-Stack Replacement auf eine optimierte Codeversion wechseln kann.",
+      "lesson": "tiered"
+    },
+    {
+      "id": "valuetask",
+      "term": "ValueTask",
+      "aliases": ["ValueTask<T>"],
+      "definition": "Struct, das entweder ein Ergebnis direkt oder einen Task enthält. Es vermeidet eine Allokation, wenn eine asynchrone Methode häufig synchron endet, hat aber strengere Nutzungsregeln als Task.",
+      "lesson": "valuetask"
+    },
+    {
+      "id": "allocation-context",
+      "term": "Allocation Context",
+      "aliases": ["Allocation Contexts"],
+      "definition": "Speicherblock in Gen0, den ein Thread exklusiv zum Allozieren nutzt. Er besteht im Kern aus einem Zeiger auf das nächste freie Byte und dem Ende des Blocks, sodass eine Allokation ohne Lock auskommt.",
+      "lesson": "allokation"
+    },
+    {
+      "id": "allocation-quantum",
+      "term": "Allocation Quantum",
+      "aliases": [],
+      "definition": "Größe des Blocks, den der GC einem Thread zuteilt, wenn dessen Allocation Context voll ist. Laut Book of the Runtime typischerweise rund 8 KB.",
+      "lesson": "allokation"
+    },
+    {
+      "id": "background-gc",
+      "term": "Background GC",
+      "aliases": ["BGC"],
+      "definition": "Art, wie der GC volle Collections standardmäßig ausführt: Gen2 wird auf einem eigenen Thread markiert, während die Anwendung weiterläuft. Es bleiben nur kurze Pausen am Anfang und Ende.",
+      "lesson": "background-gc"
+    },
+    {
+      "id": "conditionalweaktable",
+      "term": "ConditionalWeakTable",
+      "aliases": [],
+      "definition": "Tabelle, die einem Objekt Daten zuordnet, ohne es am Leben zu halten. Ein Wert lebt genau so lange wie sein Schlüssel, intern über Dependent Handles.",
+      "lesson": "gc-handles"
+    },
+    {
+      "id": "datas",
+      "term": "DATAS",
+      "aliases": [],
+      "definition": "Dynamic Adaptation To Application Sizes: Server GC, der mit einem Heap startet und die Zahl der Heaps an die Last anpasst. Seit .NET 9 bei Server GC standardmäßig aktiv.",
+      "lesson": "gc-modi"
+    },
+    {
+      "id": "demotion",
+      "term": "Demotion",
+      "aliases": [],
+      "definition": "Ausnahme von der Promotion: Überlebende Objekte bleiben in einer jüngeren Generation, etwa wenn fixierte Objekte das Zusammenschieben verhindern.",
+      "lesson": "pinning"
+    },
+    {
+      "id": "dependent-handle",
+      "term": "Dependent Handle",
+      "aliases": ["Dependent Handles", "Dependent-Handle"],
+      "definition": "GC-Handle aus zwei Objekten: Das erste wird schwach gehalten, das zweite lebt genau so lange wie das erste.",
+      "lesson": "gc-handles"
+    },
+    {
+      "id": "escape-analyse",
+      "term": "Escape-Analyse",
+      "aliases": [],
+      "definition": "Analyse des JIT, ob ein Objekt die Methode verlassen kann. Bleibt es nachweislich lokal, kann der JIT es in neueren Versionen auf dem Stack statt auf dem Heap anlegen.",
+      "lesson": "escape-analysis"
+    },
+    {
+      "id": "f-reachable-queue",
+      "term": "F-Reachable Queue",
+      "aliases": [],
+      "definition": "Liste unerreichbarer Objekte mit Finalizer, deren Finalizer noch laufen muss. Sie ist eine Root, deshalb überleben diese Objekte die Collection, in der sie als tot erkannt wurden.",
+      "lesson": "finalisierung"
+    },
+    {
+      "id": "finalization-queue",
+      "term": "Finalization Queue",
+      "aliases": [],
+      "definition": "Liste aller lebenden Objekte, deren Typ einen Finalizer hat. Die Runtime trägt sie bei der Allokation ein. Die Liste ist keine Root.",
+      "lesson": "finalisierung"
+    },
+    {
+      "id": "finalizer-thread",
+      "term": "Finalizer-Thread",
+      "aliases": [],
+      "definition": "Eigener Thread der Runtime, der die Finalizer der Objekte in der F-Reachable Queue ausführt.",
+      "lesson": "finalisierung"
+    },
+    {
+      "id": "foreground-gc",
+      "term": "Foreground GC",
+      "aliases": [],
+      "definition": "Blockierende Collection von Gen0 oder Gen1, die während einer laufenden Background GC stattfindet.",
+      "lesson": "background-gc"
+    },
+    {
+      "id": "fragmentierung",
+      "term": "Fragmentierung",
+      "aliases": ["fragmentiert", "fragmentieren"],
+      "definition": "Zustand, in dem freier Speicher in viele Lücken zwischen lebenden Objekten zerfallen ist. Neue Objekte passen dann womöglich nicht hinein, obwohl insgesamt genug frei ist.",
+      "lesson": "pinning"
+    },
+    {
+      "id": "gc-handle",
+      "term": "GC-Handle",
+      "aliases": ["GC-Handles", "GCHandle"],
+      "definition": "Eintrag in der Handle-Tabelle der Runtime, der auf ein Objekt zeigt und festlegt, wie der GC es behandelt: stark, schwach, fixiert oder abhängig.",
+      "lesson": "gc-handles"
+    },
+    {
+      "id": "heap-hard-limit",
+      "term": "Heap Hard Limit",
+      "aliases": [],
+      "definition": "Obergrenze für den Speicher des verwalteten Heaps. Im Container setzt der GC sie ohne eigene Angabe auf 75 Prozent des Speicherlimits, mindestens 20 MB.",
+      "lesson": "gc-konfiguration"
+    },
+    {
+      "id": "kompaktieren",
+      "term": "Kompaktieren",
+      "aliases": ["kompaktiert", "Kompaktierung"],
+      "definition": "Zusammenschieben der überlebenden Objekte, damit freier Speicher wieder an einem Stück liegt. Alle Verweise auf verschobene Objekte werden dabei angepasst.",
+      "lesson": "gc-phasen"
+    },
+    {
+      "id": "non-gc-heap",
+      "term": "Non-GC-Heap",
+      "aliases": [],
+      "definition": "Speicherbereich für Objekte, die nie sterben, etwa String-Literale. Der GC durchsucht und verschiebt sie nicht. Seit .NET 8.",
+      "lesson": "loh-poh"
+    },
+    {
+      "id": "plug",
+      "term": "Plug",
+      "aliases": ["Plugs"],
+      "definition": "Gruppe benachbarter überlebender Objekte, die der GC in der Planphase gemeinsam behandelt und beim Kompaktieren als Ganzes verschiebt.",
+      "lesson": "gc-phasen"
+    },
+    {
+      "id": "region",
+      "term": "Region",
+      "aliases": ["Regions"],
+      "definition": "Gleich großer Speicherblock, aus dem der GC seit .NET 7 auf 64-Bit-Systemen den Heap aufbaut. Jede Generation besitzt eine Liste von Regions.",
+      "lesson": "regions"
+    },
+    {
+      "id": "safehandle",
+      "term": "SafeHandle",
+      "aliases": [],
+      "definition": "Klasse, die ein Betriebssystem-Handle sicher kapselt und es auch dann freigibt, wenn Dispose vergessen wurde. Empfohlen statt eigener Finalizer.",
+      "lesson": "safehandle"
+    },
+    {
+      "id": "segment",
+      "term": "Segment",
+      "aliases": ["Segmente", "Segments"],
+      "definition": "Großer Speicherblock, in dem der GC vor .NET 7 den Heap organisierte. Gen0 und Gen1 lagen gemeinsam im ephemeren Segment.",
+      "lesson": "regions"
+    },
+    {
+      "id": "server-gc",
+      "term": "Server GC",
+      "aliases": [],
+      "definition": "GC-Modus mit einem Heap und einem GC-Thread pro logischem Kern. Hoher Durchsatz, größere Budgets, mehr Speicherbedarf. Standard in ASP.NET Core.",
+      "lesson": "gc-modi"
+    },
+    {
+      "id": "sweep",
+      "term": "Sweep",
+      "aliases": [],
+      "definition": "Variante einer Collection, bei der die Überlebenden an ihrem Platz bleiben und die Lücken toter Objekte in eine Freiliste kommen, statt zu kompaktieren.",
+      "lesson": "gc-phasen"
+    },
+    {
+      "id": "weakreference",
+      "term": "WeakReference",
+      "aliases": ["WeakReference<T>"],
+      "definition": "Verweis, der ein Objekt nicht am Leben hält. Wird das Objekt eingesammelt, liefert die WeakReference danach kein Ziel mehr.",
+      "lesson": "gc-handles"
+    },
+    {
+      "id": "workstation-gc",
+      "term": "Workstation GC",
+      "aliases": [],
+      "definition": "GC-Modus mit einem einzigen Heap. Eine Collection läuft auf dem Thread, der sie ausgelöst hat. Standard für eigenständige Anwendungen.",
+      "lesson": "gc-modi"
+    },
+    {
+      "id": "write-watch",
+      "term": "Write Watch",
+      "aliases": ["Software Write Watch"],
+      "definition": "Verfahren, mit dem der GC während einer Background GC erfährt, welche Speicherseiten das laufende Programm verändert hat, um sie erneut zu prüfen.",
+      "lesson": "background-gc"
+    },
+    {
+      "id": "assembly",
+      "term": "Assembly",
+      "aliases": ["Assemblies"],
+      "definition": "Einheit für Auslieferung, Versionierung und Laden in .NET: eine PE-Datei mit IL, Metadaten und einem Manifest, das Name, Version und Abhängigkeiten beschreibt.",
+      "lesson": "pe-format"
+    },
+    {
+      "id": "pe-datei",
+      "term": "PE-Datei",
+      "aliases": ["Portable Executable", "PE/COFF"],
+      "definition": "Dateiformat für ausführbare Dateien und Bibliotheken unter Windows. .NET-Assemblies nutzen es auf allen Betriebssystemen als Container für IL und Metadaten.",
+      "lesson": "pe-format"
+    },
+    {
+      "id": "cli-header",
+      "term": "CLI-Header",
+      "aliases": ["COR20-Header"],
+      "definition": "Struktur in einer .NET-Assembly, auf die ein Eintrag im PE-Header zeigt. Sie verweist unter anderem auf die Metadaten und nennt den Einstiegspunkt.",
+      "lesson": "pe-format"
+    },
+    {
+      "id": "metadaten-token",
+      "term": "Metadaten-Token",
+      "aliases": ["Metadaten-Tokens"],
+      "definition": "32-Bit-Wert, der eine Zeile einer Metadatentabelle bezeichnet: Das oberste Byte nennt die Tabelle, die unteren drei Bytes die Zeile. IL-Instruktionen verweisen über Tokens auf Typen, Methoden und Felder.",
+      "lesson": "metadaten-tabellen"
+    },
+    {
+      "id": "typeref",
+      "term": "TypeRef",
+      "aliases": [],
+      "definition": "Eintrag der Metadatentabelle TypeRef: Verweis auf einen Typ, der in einer anderen Assembly oder einem anderen Modul definiert ist. Eigene Typen stehen in der Tabelle TypeDef.",
+      "lesson": "metadaten-tabellen"
+    },
+    {
+      "id": "memberref",
+      "term": "MemberRef",
+      "aliases": [],
+      "definition": "Eintrag der Metadatentabelle MemberRef: Verweis auf eine Methode oder ein Feld eines Typs, der nicht im eigenen Modul definiert ist (oder auf eine generische Instanz).",
+      "lesson": "metadaten-tabellen"
+    },
+    {
+      "id": "assemblyref",
+      "term": "AssemblyRef",
+      "aliases": [],
+      "definition": "Eintrag in den Metadaten, der eine referenzierte Assembly mit Name, Version, Kultur und Public Key Token beschreibt.",
+      "lesson": "binding"
+    },
+    {
+      "id": "typweiterleitung",
+      "term": "Typweiterleitung",
+      "aliases": ["Type Forwarding", "Type Forwarder"],
+      "definition": "Eintrag in einer Assembly, der besagt, dass ein Typ in einer anderen Assembly definiert ist. So bleiben kompilierte Verweise gültig, wenn ein Typ verschoben wird.",
+      "lesson": "bausteine"
+    },
+    {
+      "id": "referenzassembly",
+      "term": "Referenzassembly",
+      "aliases": ["Referenzassemblies", "Reference Assembly"],
+      "definition": "Assembly, die nur die öffentliche API ohne Implementierung enthält. Gegen sie wird kompiliert, zur Laufzeit wird die Implementierung geladen.",
+      "lesson": "bausteine"
+    },
+    {
+      "id": "corelib",
+      "term": "System.Private.CoreLib",
+      "aliases": ["CoreLib"],
+      "definition": "Zentrale Bibliothek der Runtime mit den grundlegenden Typen wie Object, String und den primitiven Typen. Sie ist eng mit der Runtime verzahnt und wird beim Start der Runtime geladen.",
+      "lesson": "bausteine"
+    },
+    {
+      "id": "coreclr",
+      "term": "CoreCLR",
+      "aliases": [],
+      "definition": "Die Runtime von .NET für Desktop und Server: Typsystem, JIT, GC, Ausnahmebehandlung und Interop. Daneben gibt es Mono, vor allem für mobile Plattformen und WebAssembly.",
+      "lesson": "bausteine"
+    },
+    {
+      "id": "bcl",
+      "term": "BCL",
+      "aliases": ["Base Class Library"],
+      "definition": "Die Klassenbibliothek von .NET mit den Namespaces System.*, ausgeliefert zusammen mit der Runtime.",
+      "lesson": "bausteine"
+    },
+    {
+      "id": "shared-framework",
+      "term": "Shared Framework",
+      "aliases": ["Shared Frameworks"],
+      "definition": "Zentral installierte Runtime-Bibliotheken wie Microsoft.NETCore.App oder Microsoft.AspNetCore.App, die framework-abhängige Apps nutzen, statt sie mitzubringen.",
+      "lesson": "bausteine"
+    },
+    {
+      "id": "self-contained",
+      "term": "Self-contained",
+      "aliases": [],
+      "definition": "Bereitstellungsart, bei der die App die Runtime selbst mitbringt und kein installiertes .NET braucht.",
+      "lesson": "bausteine"
+    },
+    {
+      "id": "muxer",
+      "term": "Muxer",
+      "aliases": [],
+      "definition": "Das Programm dotnet: Es leitet SDK-Befehle an das SDK weiter und startet Apps über hostfxr.",
+      "lesson": "host"
+    },
+    {
+      "id": "apphost",
+      "term": "Apphost",
+      "aliases": [],
+      "definition": "Native Startdatei mit dem Namen der App, die die Runtime sucht und die App startet, ohne dass dotnet aufgerufen werden muss.",
+      "lesson": "host"
+    },
+    {
+      "id": "hostfxr",
+      "term": "hostfxr",
+      "aliases": [],
+      "definition": "Teil des Hosts, der die passende Framework-Version auswählt (Roll Forward) und hostpolicy lädt.",
+      "lesson": "host"
+    },
+    {
+      "id": "hostpolicy",
+      "term": "hostpolicy",
+      "aliases": [],
+      "definition": "Teil des Hosts, der deps.json und runtimeconfig.json auswertet, die Liste der Assemblies und Suchpfade aufbaut und die Runtime startet.",
+      "lesson": "host"
+    },
+    {
+      "id": "tpa",
+      "term": "TPA-Liste",
+      "aliases": ["Trusted Platform Assemblies"],
+      "definition": "Liste der Pfade aller Assemblies von App und Framework, die der Host der Runtime beim Start übergibt. Der Default-Kontext lädt Assemblies anhand dieser Liste.",
+      "lesson": "host"
+    },
+    {
+      "id": "roll-forward",
+      "term": "Roll Forward",
+      "aliases": [],
+      "definition": "Regel, nach der der Host eine neuere Framework-Version wählt, wenn die angeforderte nicht installiert ist. Einstellbar über rollForward in runtimeconfig.json.",
+      "lesson": "host"
+    },
+    {
+      "id": "deps-json",
+      "term": "deps.json",
+      "aliases": [],
+      "definition": "Datei neben der App, die alle Abhängigkeiten mit ihren Dateien und plattformspezifischen Varianten beschreibt. hostpolicy baut daraus die TPA-Liste und Suchpfade.",
+      "lesson": "runtimeconfig"
+    },
+    {
+      "id": "runtimeconfig-json",
+      "term": "runtimeconfig.json",
+      "aliases": [],
+      "definition": "Datei neben der App mit Ziel-Framework, Roll-Forward-Regel und Runtime-Einstellungen wie System.GC.Server. Der Host liest sie beim Start.",
+      "lesson": "runtimeconfig"
+    },
+    {
+      "id": "rid",
+      "term": "RID",
+      "aliases": ["Runtime Identifier"],
+      "definition": "Kennung für Betriebssystem und Prozessorarchitektur, etwa linux-x64 oder win-arm64.",
+      "lesson": "runtimeconfig"
+    },
+    {
+      "id": "appcontext",
+      "term": "AppContext",
+      "aliases": [],
+      "definition": "Klasse für prozessweite Einstellungen: Über AppContext.GetData und Schalter liest Code Werte, die unter anderem aus runtimeconfig.json stammen.",
+      "lesson": "runtimeconfig"
+    },
+    {
+      "id": "startup-hook",
+      "term": "Startup Hook",
+      "aliases": ["Startup Hooks"],
+      "definition": "Assembly, die über die Umgebungsvariable DOTNET_STARTUP_HOOKS angegeben wird und deren Initialize-Methode die Runtime vor Main aufruft.",
+      "lesson": "start-bis-main"
+    },
+    {
+      "id": "typehandle",
+      "term": "TypeHandle",
+      "aliases": [],
+      "definition": "Interner Verweis der Runtime auf einen geladenen Typ, in der Regel auf dessen MethodTable.",
+      "lesson": "typladen"
+    },
+    {
+      "id": "statischer-konstruktor",
+      "term": "Statischer Konstruktor",
+      "aliases": ["Typinitialisierer"],
+      "definition": "Methode, die die statischen Felder eines Typs initialisiert. Die Runtime ruft sie höchstens einmal auf, bevor der Typ benutzt wird; wann genau, hängt von beforefieldinit ab.",
+      "lesson": "typladen"
+    },
+    {
+      "id": "beforefieldinit",
+      "term": "beforefieldinit",
+      "aliases": [],
+      "definition": "Flag eines Typs in den Metadaten: Die Runtime darf den statischen Konstruktor zu einem beliebigen Zeitpunkt vor dem ersten Zugriff auf ein statisches Feld ausführen statt genau beim ersten Zugriff.",
+      "lesson": "typladen"
+    },
+    {
+      "id": "assemblyloadcontext",
+      "term": "AssemblyLoadContext",
+      "aliases": ["Ladekontext"],
+      "definition": "Bereich, in den Assemblies geladen werden. Derselbe Typ aus zwei Kontexten gilt als zwei verschiedene Typen. Entladbare Kontexte lassen sich wieder freigeben.",
+      "lesson": "assembly-load-context"
+    },
+    {
+      "id": "starker-name",
+      "term": "Starker Name",
+      "aliases": ["Strong Name", "Strong Naming"],
+      "definition": "Identität einer Assembly aus Name, Version, Kultur und öffentlichem Schlüssel. In .NET (Core) prüft die Runtime die Signatur beim Laden nicht.",
+      "lesson": "binding"
+    },
+    {
+      "id": "fcall",
+      "term": "FCall",
+      "aliases": ["FCalls"],
+      "definition": "Interner Aufruf aus System.Private.CoreLib direkt in nativen Code der Runtime, in C# mit MethodImplOptions.InternalCall markiert. Wird in neueren Versionen zunehmend durch C# oder QCalls ersetzt.",
+      "lesson": "runtime-repo"
+    },
+    {
+      "id": "qcall",
+      "term": "QCall",
+      "aliases": ["QCalls"],
+      "definition": "Aufruf aus System.Private.CoreLib in nativen Code der Runtime über einen P/Invoke-ähnlichen Mechanismus.",
+      "lesson": "runtime-repo"
+    },
+    {
+      "id": "public-key-token",
+      "term": "Public Key Token",
+      "aliases": [],
+      "definition": "Kurzer Hashwert des öffentlichen Schlüssels einer Assembly mit starkem Namen, Teil ihrer Identität.",
+      "lesson": "binding"
+    },
+    {
+      "id": "binding-redirect",
+      "term": "Binding Redirect",
+      "aliases": ["Binding Redirects"],
+      "definition": "Eintrag in der app.config von .NET Framework, der Anfragen nach einer Assembly-Version auf eine andere umleitet. In .NET (Core) gibt es diesen Mechanismus nicht.",
+      "lesson": "binding"
+    }
+  ]
+}

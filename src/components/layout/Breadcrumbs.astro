@@ -1,0 +1,23 @@
+---
+import Icon from '@/components/Icon.astro';
+
+interface Props {
+  items: { label: string; href?: string }[];
+}
+const { items } = Astro.props;
+---
+
+<nav class="crumb" aria-label="Brotkrümelnavigation" data-pagefind-ignore>
+  <ol>
+    {items.map((item, i) => (
+      <li>
+        {item.href ? (
+          <a href={item.href}>{item.label}</a>
+        ) : (
+          <span aria-current={i === items.length - 1 ? 'page' : undefined}>{item.label}</span>
+        )}
+        <Icon name="chevron-right" class="crumb-sep" />
+      </li>
+    ))}
+  </ol>
+</nav>

@@ -1,0 +1,335 @@
+---
+id: background-gc
+title: Background GC
+summary: Wie der GC Gen2 nebenläufig zum Programm markiert und freigibt, warum dabei trotzdem kurze Pausen und Foreground GCs auftreten und weshalb Background GC Pausen spart, aber keine Arbeit.
+status: draft
+dotnetVersion: 'Core 1.0+'
+sources:
+  - title: 'Background garbage collection (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/background-gc
+  - title: 'Garbage collector config settings (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector
+  - title: 'Book of the Runtime: Garbage Collection Design'
+    url: https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/garbage-collection.md
+  - title: 'Maoni Stephens: .NET Memory Performance Analysis'
+    url: https://github.com/Maoni0/mem-doc/blob/master/doc/.NETMemoryPerformanceAnalysis.md
+  - title: 'Latency modes (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/latency
+  - title: 'Quellcode des GC in dotnet/runtime (gc.cpp)'
+    url: https://github.com/dotnet/runtime/blob/main/src/coreclr/gc/gc.cpp
+updated: 2026-11-25
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './background-gc.steps';
+import writeWatchScript from './background-gc-writewatch.steps';
+import foregroundScript from './background-gc-foreground.steps';
+import { verifyCode } from './background-gc-verify';
+
+<Block n={1} title="Das Problem">
+
+Ephemere Collections sind billig. Eine Gen0-Collection besucht nur das, was in den jungen Generationen überlebt, und das ist meist wenig. Wie das funktioniert, zeigt die Lektion „Generationen“. Früher oder später ist aber auch das Budget von Gen2 erschöpft, und dann steht eine **volle Collection** an: Der GC muss alles Lebende im gesamten Heap markieren.
+
+Bei einem Dienst mit großem, langlebigem Datenbestand ist das eine ganz andere Größenordnung. Ein Cache mit Millionen Einträgen, ein In-Memory-Index, geladene Konfiguration und Verbindungsobjekte: All das liegt in Gen2 und lebt. Die Markierphase muss jedes dieser Objekte besuchen und jedem Verweis folgen. Ihre Dauer wächst mit der Menge lebender Objekte, nicht mit der Menge Müll.
+
+Würde der GC diese Arbeit so erledigen wie eine Gen0-Collection, also **blockierend**, stünden während der ganzen Zeit alle verwalteten Threads still. Maoni Stephens, die Architektin des .NET-GC, schreibt dazu nüchtern: Bei einem großen Heap verursacht eine blockierende Gen2-Collection eine lange Pause. Für eine Desktopanwendung heißt das eine eingefrorene Oberfläche, für einen Webdienst Anfragen, die plötzlich ein Vielfaches ihrer üblichen Antwortzeit brauchen.
+
+Der Zielkonflikt: Die volle Collection muss sein, sonst wächst der Heap unbegrenzt. Aber ihre Arbeit lässt sich nicht beliebig verkleinern, denn alles Lebende muss markiert werden. Was sich ändern lässt, ist, **wann** und **neben wem** diese Arbeit passiert. Genau hier setzt Background GC an.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Background GC (kurz BGC) ist die Art, wie der .NET-GC volle Collections standardmäßig ausführt. Sechs Sätze tragen den Rest der Lektion:
+
+1. **Background GC gilt nur für Gen2.** Ephemere Collections (Gen0 und Gen1) sind immer blockierend, weil sie kurz genug sind.
+2. **Die Arbeit läuft auf einem eigenen Thread.** Ein dedizierter BGC-Thread markiert Gen2, während die Anwendungs-Threads weiterlaufen und weiter allozieren.
+3. **Es bleiben kurze Pausen.** Eine BGC hält die Threads am Anfang und noch einmal zum Abschluss der Markierung kurz an. Dazwischen und während des Freigebens läuft das Programm.
+4. **Ephemere Collections dürfen dazwischenfunken.** Ist während einer BGC das Gen0-Budget erschöpft, läuft eine normale, blockierende Gen0- oder Gen1-Collection. Sie heißt **Foreground GC**.
+5. **Eine BGC kompaktiert nicht.** Sie gibt nur frei (Sweep): Die Lücken toter Gen2-Objekte kommen in eine Freiliste, die Überlebenden bleiben, wo sie sind.
+6. **Background GC ist standardmäßig an.** Abschalten lässt es sich mit `System.GC.Concurrent`, dann werden volle Collections wieder blockierend.
+
+Microsoft Learn fasst es knapp zusammen: Während einer Background GC werden die ephemeren Generationen bei Bedarf eingesammelt, die BGC selbst läuft auf einem oder mehreren dedizierten Threads und betrifft nur Gen2-Collections. Mit „mehreren“ ist Server GC gemeint, dazu unten mehr.
+
+Der Name in der Konfiguration ist ein Überbleibsel: Die Einstellung heißt „Concurrent“, weil der Vorgänger **Concurrent GC** hieß. Er erlaubte während einer nebenläufigen Gen2-Collection keine ephemeren Collections, sodass Threads beim Allozieren irgendwann warten mussten. Background GC hat ihn in .NET Framework 4 abgelöst und genau diese Einschränkung aufgehoben. In .NET (Core) gibt es nur noch Background GC.
+
+<Callout kind="fehlannahme">
+  „Background GC läuft im Hintergrund, also kostet sie nichts.“ Nein. Die BGC muss genauso alles
+  Lebende in Gen2 markieren wie eine blockierende Collection, nur eben neben dem Programm. Sie
+  belegt dabei einen Kern, konkurriert mit deinen Threads um CPU-Zeit und braucht zusätzliche
+  Buchführung. Background GC verkürzt **Pausen**, nicht die **Arbeit**.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Die Visualisierung zeigt denselben Dienst zweimal, oben mit einer blockierenden Gen2-Collection, unten mit Background GC. Achte darauf, wie lange die Anfrage-Threads jeweils stehen und was der BGC-Thread in dieser Zeit tut.
+
+<StepPlayer script={script} />
+
+Die Zeiteinheiten sind abstrakt. Die Visualisierung zeigt das Prinzip, kein gemessenes Verhältnis. Wie lang die beiden BGC-Pausen tatsächlich sind, hängt vor allem davon ab, wie viel in der Zwischenzeit nachgearbeitet werden muss, und wie lang die blockierende Variante wäre, von der Größe des lebenden Gen2. Die Grundidee ist aber genau diese: Die teure Phase, das Markieren eines großen Heaps, wandert aus der Pause heraus auf einen eigenen Thread.
+
+Das Book of the Runtime beschreibt den Ablauf so: Nach der anfänglichen Suspendierung setzt der BGC-Thread die verwalteten Threads wieder in Gang, diese allozieren weiter, während die BGC arbeitet. Zum Abschluss der Markierung suspendiert die BGC die Threads erneut und startet danach die nebenläufige Sweep-Phase. Maoni Stephens nennt das „ein zweites Suspend/Restart-Paar in der Mitte“.
+
+</Block>
+
+<Block n={4} title="Nebenläufig markieren">
+
+### Das Programm ändert den Graphen, während der GC ihn liest
+
+Nebenläufiges Markieren hat ein grundsätzliches Problem. Der GC läuft den Objektgraphen ab, während das Programm diesen Graphen verändert. Hat der BGC-Thread ein Objekt bereits besucht und schreibt das Programm danach einen neuen Verweis hinein, sieht der GC diesen Verweis nicht mehr. Wird gleichzeitig der einzige andere Weg zum Zielobjekt gekappt, würde ein lebendes Objekt als tot gelten. Das wäre ein katastrophaler Fehler.
+
+<StepPlayer script={writeWatchScript} />
+
+### Geänderte Seiten nacharbeiten
+
+Die Lösung besteht darin, Schreibzugriffe während der Markierung zu protokollieren. Der .NET-GC verwendet dafür **Write Watch**: Für jede Speicherseite wird festgehalten, ob sie seit einem bestimmten Zeitpunkt beschrieben wurde. Auf Windows kann das Betriebssystem diese Information liefern, alternativ pflegt die Runtime sie selbst (**Software Write Watch**), indem die Write Barrier bei jeder Verweis-Zuweisung zusätzlich die betroffene Seite als „beschrieben“ markiert. Die Write Barrier kennst du aus „Generationen“, dort markiert sie Karten in der Card Table.
+
+{/* TODO(verify): Which platforms use OS write watch vs. software write watch in current .NET (FEATURE_USE_SOFTWARE_WRITE_WATCH_FOR_GC_HEAP in dotnet/runtime, softwarewritewatch.h), and that the software write watch is updated by the write barrier only while a BGC is in progress. */}
+
+Die BGC besucht beschriebene Seiten erneut und folgt den Verweisen der Objekte darauf. Das passiert zunächst nebenläufig, eventuell mehrfach, solange das Programm weiterschreibt. Der letzte Durchgang findet in der Abschlusspause statt, wenn kein Thread mehr schreiben kann. Erst dann ist das Ergebnis der Markierung garantiert vollständig.
+
+{/* TODO(verify): Number of concurrent revisit passes and that the final revisit runs during the second suspension (revisit_written_pages, background_mark_phase in gc.cpp). */}
+
+Daraus folgt eine Eigenschaft, die man kennen sollte: Die Länge der Abschlusspause hängt davon ab, wie viel das Programm während der BGC schreibt. Ein Dienst, der ständig Verweise in große Gen2-Strukturen schreibt, hinterlässt viele beschriebene Seiten und damit mehr Nacharbeit.
+
+### Was mit neuen Objekten passiert
+
+Das Programm alloziert während der BGC weiter. Kleine Objekte landen wie immer in Gen0, die BGC betrachtet sie nicht. Für sie sind die ephemeren Collections zuständig, die während der BGC als Foreground GCs laufen dürfen. Objekte, die während der BGC direkt in Gen2-Bereiche gelangen, etwa große Objekte im Large Object Heap oder Überlebende einer Foreground GC, kann die laufende BGC nicht mehr sinnvoll prüfen. Sie behandelt sie als lebend, eingesammelt werden sie frühestens bei der nächsten vollen Collection.
+
+{/* TODO(verify): Objects allocated in gen2/UOH during BGC are treated as live ("allocated black") and gen1 survivors promoted during a foreground GC are not swept by the current BGC (gc.cpp, background_allocation / bgc_alloc_lock). */}
+
+</Block>
+
+<Block n={5} title="Foreground GCs, Sweep und blockierende Ausnahmen">
+
+### Eine Gen0-Collection mitten in der BGC
+
+Eine BGC über einen großen Heap kann lange dauern, und das Programm alloziert in dieser Zeit weiter. Gäbe es keine ephemeren Collections, würde Gen0 volllaufen, und die Threads müssten warten. Deshalb darf während einer BGC eine **Foreground GC** laufen. Microsoft Learn beschreibt den Ablauf: Der BGC-Thread prüft an häufigen sicheren Punkten, ob eine Foreground GC angefordert wurde. Wenn ja, unterbricht er sich selbst, die Foreground GC läuft mit allen verwalteten Threads angehalten, danach setzen BGC-Thread und Anwendungs-Threads ihre Arbeit fort.
+
+<StepPlayer script={foregroundScript} />
+
+Die Foreground GC ist eine ganz gewöhnliche ephemere Collection mit allem, was dazugehört: Sie ist blockierend, sie kompaktiert bei Bedarf, und ihre Dauer hängt an den Überlebenden in Gen0 und Gen1. Neu ist nur, dass gleichzeitig eine BGC existiert, die pausiert und danach weitermacht.
+
+### Warum Sweep statt Kompaktieren
+
+Kompaktieren heißt Objekte verschieben und alle Verweise auf sie umschreiben. Das lässt sich nicht gut nebenläufig erledigen, denn das Programm liest und schreibt genau diese Verweise. Eine BGC gibt deshalb nur frei. Maoni Stephens formuliert die Aufgabe so: Die BGC soll in Gen2 eine Freiliste aufbauen, in der die Überlebenden der Gen1-Collections Platz finden.
+
+Das hat zwei Folgen. Erstens ist Gen2 nach einer BGC oft voller Lücken. Das ist kein Fehler, die Lücken sind der Platz, in den künftige Promotionen aus Gen1 einziehen. Ein Problem ist es erst, wenn viel davon noch ungenutzt ist, wenn die nächste BGC beginnt. Zweitens verkleinert eine BGC den Heap kaum. Belegter Speicher, zwischen dessen Lücken noch lebende Objekte liegen, bleibt belegt.
+
+{/* TODO(verify): Whether a BGC can decommit or return whole free regions to the OS under regions (.NET 7+), even though it does not compact. */}
+
+### Wann es trotzdem blockierend wird
+
+Background GC ist der Normalfall für volle Collections, aber nicht der einzige. Der GC entscheidet bei jeder Gen2-Collection, ob er sie im Hintergrund oder blockierend ausführt. Blockierend, und dann in der Regel mit Kompaktieren, wird es unter anderem in diesen Fällen:
+
+- **Hohe Speicherauslastung.** Ab einer Speicherlast von standardmäßig 90 Prozent des physischen Speichers (im Container: des Limits) wird der GC laut Microsoft Learn aggressiver mit vollen, kompaktierenden Collections, um Paging zu vermeiden. Darunter bevorzugt er Background GCs.
+- **Starke Fragmentierung in Gen2.** Wenn die Freilisten so zerstückelt sind, dass sie kaum noch nutzen, ist Kompaktieren die einzige Abhilfe.
+- **Explizite Anforderung.** `GC.Collect()` ohne Argumente führt eine blockierende volle Collection aus. Mit der Überladung `GC.Collect(2, GCCollectionMode.Default, blocking: false)` lässt sich eine Background GC anfordern.
+- **Background GC ist abgeschaltet.** Dann ist jede volle Collection blockierend.
+
+{/* TODO(verify): GC.Collect(int, GCCollectionMode, bool blocking) with blocking: false performs a background GC only if possible (API docs: "a background or blocking collection"), and the full list of reasons for a blocking gen2 (gc_reason / gc_heap::should_do_blocking_collection, provisional mode, last gen2 fragmentation) in gc.cpp. */}
+
+Wer volle blockierende Collections vermeiden will, solange es irgend geht, kann den Latenzmodus `GCLatencyMode.SustainedLowLatency` setzen. Laut Maoni Stephens führt der GC dann nur noch volle blockierende Collections aus, wenn er muss. Der Preis ist ein potenziell größerer, stärker fragmentierter Heap.
+
+{/* TODO(verify): Exact semantics of SustainedLowLatency (Microsoft Learn, latency modes) and that it requires background GC to be enabled. */}
+
+### Workstation und Server
+
+Background GC gibt es in beiden GC-Modi. Bei Workstation GC gibt es einen dedizierten BGC-Thread. Bei Server GC gibt es mehrere, laut Microsoft Learn typischerweise einen pro logischem Prozessor, passend zu den Heaps des Server GC. Ein weiterer Unterschied: Der Workstation-BGC-Thread beendet sich nach einer Weile ohne Arbeit (er hat ein Timeout), die Server-BGC-Threads nicht. Ephemere Collections laufen bei Server GC auf den Server-GC-Threads, bei Workstation GC auf dem Thread, der sie ausgelöst hat. Mehr zu den Modi in „Workstation, Server und DATAS“.
+
+</Block>
+
+<Block n={6} title="Stolperfallen">
+
+### Weniger Pause heißt nicht weniger CPU
+
+Der häufigste Denkfehler ist, Background GC als Gratisgewinn zu sehen. Die Markierarbeit bleibt, dazu kommen das Nacharbeiten beschriebener Seiten und der Verwaltungsaufwand für Write Watch. Maoni Stephens weist darauf hin, dass eine BGC deine Threads zwar kaum anhält, aber mit ihnen um CPU konkurriert. In einem Dienst, der ohnehin am CPU-Limit läuft, merkst du das an sinkendem Durchsatz und längeren Antwortzeiten, auch ohne lange Pausen. Wenn die Midlife Crisis aus „Generationen“ viele volle Collections auslöst, mildert Background GC die Pausen, löst aber nicht die Ursache.
+
+### Allokationen werden gebremst
+
+Ganz ungestört alloziert das Programm während einer BGC nicht. Für große Objekte gilt eine besondere Grenze: Der GC lässt laut Maoni Stephens während einer laufenden BGC nicht zu viele Allokationen im Large Object Heap zu. Ein Thread, der dann ein großes Array anlegen will, wartet, bis die BGC weit genug ist. In PerfView erscheint das in GCStats als eigene Tabelle für „LOH Allocation Pause (due to background GC)“. Abhilfe: weniger große temporäre Objekte, etwa durch Pooling (siehe „LOH, POH und Non-GC-Heap“).
+
+{/* TODO(verify): The exact throttling rule for UOH allocations during BGC (bgc_loh_allocate_spin, bgc_begin_loh_alloc in gc.cpp) and whether SOH allocations can also be throttled during BGC. */}
+
+### Fragmentierung erzwingt doch eine lange Pause
+
+Weil Background GCs nie kompaktieren, sammelt sich in manchen Programmen Fragmentierung an. Irgendwann entscheidet der GC, dass eine volle, blockierende, kompaktierende Collection nötig ist, und dann ist die lange Pause, die man vermeiden wollte, doch da. Wer in einer Latenzmessung seltene, sehr lange Ausreißer sieht, sollte deshalb nachsehen, ob es blockierende Gen2-Collections sind (in GCStats als `2N`, siehe unten) und woher die Fragmentierung kommt. Häufige Ursachen sind gepinnte Objekte (siehe „Pinning und Fragmentierung“) und Objekte, die in Gen2 sterben.
+
+</Block>
+
+<Block n={7} title="In der Praxis">
+
+### Wann Background GC hilft und wann nicht
+
+| Szenario | Wirkung | Warum | Empfehlung |
+| --- | --- | --- | --- |
+| Interaktive Anwendung mit großem Heap | Spürbar kürzere Aussetzer | Markieren läuft neben dem UI-Thread | Standard beibehalten |
+| Webdienst mit großem Cache in Gen2 | Weniger Latenzspitzen bei vollen Collections | Lange Pausen werden zu zwei kurzen | Standard beibehalten |
+| Batchjob, CPU voll ausgelastet, Latenz egal | Etwas weniger Durchsatz möglich | BGC kostet zusätzliche CPU und Buchführung | Mit und ohne messen, eventuell abschalten |
+| Viele Prozesse auf einer Maschine | Zusätzliche Threads pro Prozess | Jeder Prozess hat eigene BGC-Threads | Workstation ohne Concurrent erwägen |
+| Viele große temporäre Arrays | Threads warten beim Allozieren | LOH-Allokationen werden während BGC gebremst | Pooling, kleinere Puffer |
+| Seltene, sehr lange Pausen trotz BGC | Ausreißer in der Latenz | Blockierende Gen2 wegen Fragmentierung oder Speicherdruck | Pinning und Midlife Crisis prüfen |
+
+Für die Empfehlung, Concurrent bei sehr vielen Instanzen abzuschalten, gibt es eine direkte Quelle: Microsoft Learn rät, bei Hunderten Instanzen einer Anwendung Workstation GC mit abgeschaltetem Concurrent GC zu erwägen, weil das Kontextwechsel spart.
+
+### Konfiguration
+
+| Ort | Einstellung | Werte |
+| --- | --- | --- |
+| Projektdatei (MSBuild) | `ConcurrentGarbageCollection` | `true` (Standard) oder `false` |
+| `runtimeconfig.json` | `System.GC.Concurrent` | `true` (Standard) oder `false` |
+| Umgebungsvariable | `DOTNET_gcConcurrent` | `1` (Standard) oder `0` |
+
+Wie bei allen GC-Einstellungen liest die Runtime den Wert nur beim Start. Eine Änderung der Umgebungsvariable wirkt sich auf einen laufenden Prozess nicht aus. Zur Laufzeit lässt sich das Verhalten nur indirekt über Latenzmodi beeinflussen. Welche Werte der GC tatsächlich verwendet, liefert seit .NET 7 `GC.GetConfigurationVariables()`.
+
+{/* TODO(verify): GC.GetConfigurationVariables() available since .NET 7 and the key name it uses for the concurrent setting. */}
+
+```xml
+<PropertyGroup>
+  <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+</PropertyGroup>
+```
+
+</Block>
+
+<Block n={8} title="Was Runtime und JIT dazu tun">
+
+Background GC ist seit .NET Core 1.0 der Standard, für Workstation und Server GC. Am Grundprinzip hat sich seitdem nichts geändert, wohl aber an vielen Details: wie die Arbeit auf die Server-BGC-Threads verteilt wird, wann der GC eine blockierende statt einer Background-Collection wählt und wie die Freilisten organisiert sind.
+
+Der JIT ist indirekt beteiligt. Die Write Barrier, die er bei jeder Verweis-Zuweisung in ein Heap-Objekt einfügt, ist dieselbe, die auch die Card Table pflegt. Bei Software Write Watch übernimmt sie zusätzlich das Markieren beschriebener Seiten. Die Runtime kann die Barrier dafür zur Laufzeit gegen eine Variante austauschen, die Write Watch berücksichtigt, und nach der BGC zurückwechseln.
+
+{/* TODO(verify): Runtime write barrier patching for software write watch during BGC (StompWriteBarrierEphemeral / SwitchToWriteWatchBarrier in src/coreclr/vm/gcenv.ee.cpp, writebarriermanager.cpp). */}
+
+Mit .NET 7 wurde die Heap-Organisation auf Regions umgestellt (siehe „Segments und Regions“). Für das Modell dieser Lektion ändert das nichts: Gen2 wird weiterhin im Hintergrund markiert und freigegeben, ephemere Collections bleiben blockierend.
+
+<Callout kind="version">
+  Background GC ersetzt seit .NET Framework 4 den älteren Concurrent GC, für Server GC seit .NET
+  Framework 4.5. In .NET (Core) ist Background GC von Anfang an der Standard für beide Modi. Die
+  Umgebungsvariable `DOTNET_gcConcurrent` gibt es seit .NET 6, davor hieß sie
+  `COMPlus_gcConcurrent` (der alte Präfix funktioniert weiterhin).
+</Callout>
+
+</Block>
+
+<Block n={9} title="Selbst nachweisen">
+
+Das Experiment baut einen großen, langlebigen Objektgraphen in Gen2 auf und erzeugt dann in einer Schleife Müll. Ein zweiter Thread misst, wie lange er für eine winzige Aufgabe braucht, die eigentlich sofort fertig sein sollte. Lange Werte bedeuten, dass er angehalten war. Starte das Programm zweimal, einmal normal und einmal mit `DOTNET_gcConcurrent=0`.
+
+{/* TODO(verify): Expected result on a typical machine: max observed stall clearly lower with background GC than with DOTNET_gcConcurrent=0, and GCStats showing 2B vs 2N. Not measured. */}
+
+<VerifyCard
+  sharplab="Als Konsolenanwendung im Release-Modus ohne Debugger ausführen (dotnet run -c Release), einmal ohne und einmal mit gesetzter Umgebungsvariable DOTNET_gcConcurrent=0. Erwartet: Mit Background GC ist die längste gemessene Unterbrechung des Mess-Threads deutlich kürzer, die Zahl der Gen2-Collections ähnlich. Die konkreten Werte hängen von Heapgröße, Kernzahl und Hardware ab."
+  code={verifyCode}
+/>
+
+Aussagekräftiger als die eigene Stoppuhr sind die GC-Ereignisse der Runtime. Zeichne sie mit `dotnet-trace` auf und öffne die Datei in PerfView:
+
+```bash
+dotnet-trace collect --process-id <pid> --profile gc-verbose
+```
+
+{/* TODO(verify): Profile name "gc-verbose" in current dotnet-trace and that PerfView's GCStats view opens .nettrace files. */}
+
+In PerfView zeigt die Ansicht **GCStats** jede Collection einzeln. In der Spalte „Gen“ steht laut Maoni Stephens `N` für nicht nebenläufig (blockierend), `B` für Background und `F` für Foreground. Eine Background GC erscheint immer als `2B`, nie als `0B` oder `1B`, weil nur Gen2 im Hintergrund laufen kann. Volle blockierende Collections erscheinen als `2N`, Foreground GCs während einer BGC als `0F` oder `1F`. Mit abgeschaltetem Background GC sollten alle Gen2-Einträge `2N` sein. Achte auch auf die Pausenspalte: Bei `2B` ist die Pause klein, obwohl die Collection insgesamt lange dauert. GCStats fasst dabei die beiden Pausen einer BGC zu einem Wert zusammen.
+
+Im Code gibt es eine weitere Möglichkeit: `GC.GetGCMemoryInfo(GCKind.Background)` liefert Informationen zur letzten Background GC, darunter ihre Pausendauern.
+
+{/* TODO(verify): GCMemoryInfo.PauseDurations contains two entries for a background GC and GCMemoryInfo.Concurrent is true (API docs for GCMemoryInfo, .NET 5+). */}
+
+</Block>
+
+<Block n={10} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="background-gc"
+  questions={[
+    {
+      q: 'Welche Collections können als Background GC laufen?',
+      options: [
+        'Alle Generationen, wenn Concurrent aktiv ist',
+        'Nur Gen2-Collections',
+        'Nur Gen0- und Gen1-Collections, weil sie häufig sind',
+      ],
+      correct: 1,
+      explanation:
+        'Background GC gilt nur für Gen2. Ephemere Collections sind immer blockierend, weil sie kurz genug sind. In GCStats siehst du deshalb 2B, aber nie 0B oder 1B.',
+    },
+    {
+      q: 'Während einer Background GC ist das Gen0-Budget erschöpft. Was passiert?',
+      options: [
+        'Die Threads warten, bis die Background GC fertig ist',
+        'Die Background GC wird abgebrochen und als blockierende Collection neu gestartet',
+        'Eine blockierende Gen0- oder Gen1-Collection läuft als Foreground GC, die Background GC pausiert so lange',
+      ],
+      correct: 2,
+      explanation:
+        'Genau das unterscheidet Background GC vom älteren Concurrent GC: Ephemere Collections dürfen während einer BGC laufen. Der BGC-Thread prüft an sicheren Punkten, ob eine Foreground GC ansteht, und unterbricht sich dafür.',
+    },
+    {
+      q: 'Wie viel CPU-Arbeit spart eine Background GC gegenüber einer blockierenden Gen2-Collection?',
+      options: [
+        'Etwa die Hälfte, weil sie parallel läuft',
+        'Keine, sie verlagert die Arbeit neben das Programm und braucht eher zusätzliche Buchführung',
+        'Fast alle, weil nur noch die beiden kurzen Pausen zählen',
+      ],
+      correct: 1,
+      explanation:
+        'Auch die BGC muss alles Lebende in Gen2 markieren. Dazu kommt das Nacharbeiten beschriebener Seiten. Sie spart Pausenzeit, nicht Arbeit, und konkurriert mit deinen Threads um CPU.',
+    },
+    {
+      q: 'Warum muss die BGC Seiten erneut besuchen, die das Programm während der Markierung beschrieben hat?',
+      options: [
+        'Weil ein Verweis in ein schon besuchtes Objekt sonst übersehen würde und ein lebendes Objekt als tot gälte',
+        'Weil beschriebene Seiten automatisch nach Gen0 zurückfallen',
+        'Weil der Sweep sonst die neuen Objekte doppelt freigibt',
+      ],
+      correct: 0,
+      explanation:
+        'Das Programm ändert den Objektgraphen, während der GC ihn abläuft. Write Watch merkt sich beschriebene Seiten, die BGC arbeitet sie nach, zuletzt in der Abschlusspause.',
+    },
+    {
+      q: 'Nach vielen Background GCs ist Gen2 stark fragmentiert. Was ist eine wahrscheinliche Folge?',
+      options: [
+        'Die nächste Background GC kompaktiert nebenläufig',
+        'Der GC entscheidet sich irgendwann für eine blockierende, kompaktierende Gen2-Collection',
+        'Nichts, Fragmentierung spielt mit Background GC keine Rolle',
+      ],
+      correct: 1,
+      explanation:
+        'Background GCs geben nur frei und kompaktieren nicht. Bei hoher Fragmentierung oder hoher Speicherlast wählt der GC eine volle blockierende Collection, um kompaktieren zu können. Das ist dann die lange Pause, die man vermeiden wollte.',
+    },
+    {
+      q: 'Du willst Background GC für einen reinen Batchprozess testweise abschalten. Welche Einstellung ist die richtige?',
+      options: [
+        'ServerGarbageCollection auf false',
+        'System.GC.Concurrent auf false (MSBuild: ConcurrentGarbageCollection)',
+        'GCSettings.LatencyMode auf Batch zur Laufzeit, das ist dasselbe',
+      ],
+      correct: 1,
+      explanation:
+        'Background GC wird über System.GC.Concurrent beziehungsweise ConcurrentGarbageCollection oder DOTNET_gcConcurrent gesteuert und nur beim Start gelesen. ServerGarbageCollection wählt den GC-Modus, der unabhängig davon ist.',
+    },
+  ]}
+/>
+
+{/* TODO(verify): Whether GCLatencyMode.Batch at runtime effectively disables background GC (Microsoft Learn, latency modes); the quiz answer avoids claiming either way. */}
+
+</Block>
+
+<Block n={11} title="Das Wichtigste in Kürze">
+
+- Volle Collections markieren alles Lebende im Heap. Blockierend ausgeführt, verursacht das bei großem Heap **lange Pausen**.
+- **Background GC** markiert und gibt Gen2 auf einem dedizierten Thread frei, während das Programm weiterläuft. Es bleiben zwei **kurze Pausen**, am Anfang und zum Abschluss der Markierung.
+- Background GC gilt **nur für Gen2**. Ephemere Collections sind immer blockierend und dürfen während einer BGC als **Foreground GC** laufen.
+- Damit nebenläufiges Markieren korrekt bleibt, verfolgt die Runtime **beschriebene Seiten** (Write Watch) und arbeitet sie nach, zuletzt in der Abschlusspause.
+- Eine BGC **kompaktiert nicht**. Bei hoher Fragmentierung, hoher Speicherlast oder `GC.Collect()` kommt eine blockierende, kompaktierende Gen2-Collection.
+- Background GC spart **Pausen, nicht CPU-Arbeit**. Große Allokationen können während einer BGC gebremst werden.
+- Standardmäßig aktiv, abschaltbar mit `System.GC.Concurrent`. In GCStats erkennst du sie als `2B`, blockierende volle Collections als `2N`.
+
+</Block>
