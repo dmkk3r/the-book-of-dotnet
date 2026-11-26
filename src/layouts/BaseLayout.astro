@@ -52,6 +52,10 @@ const lessonIndex = {
     <title>{fullTitle}</title>
     {description && <meta name="description" content={description} />}
     <link rel="icon" type="image/svg+xml" href={withBase('favicon.svg')} />
+    <link rel="manifest" href={withBase('manifest.webmanifest')} />
+    <link rel="apple-touch-icon" href={withBase('icons/apple-touch-icon.png')} />
+    <meta name="theme-color" content="#5b3fd9" />
+    <meta name="apple-mobile-web-app-title" content="Book of .NET" />
     <script is:inline>
       // Runs before paint: avoids a flash of the wrong theme and enables JS-only layout.
       document.documentElement.classList.add('js');
@@ -121,6 +125,9 @@ const lessonIndex = {
       </div>
       <div class="backdrop" data-menu-backdrop hidden></div>
       <main id="main" tabindex="-1" data-wide={wide}>
+        <p class="offline-notice" role="status" data-offline-notice hidden>
+          Du bist offline. Du liest die auf diesem Gerät gespeicherte Fassung.
+        </p>
         <slot />
       </main>
       {hasRail && (
@@ -141,6 +148,7 @@ const lessonIndex = {
         <a href={withBase('')}>Kapitel</a>
         <a href={withBase('glossar/')}>Glossar</a>
         <a href={withBase('fortschritt/')}>Fortschritt</a>
+        <a href={withBase('fortschritt/#offline')}>Offline lesen</a>
         <span class="footer-note">
           Inoffizielles Lernprojekt, nicht mit Microsoft verbunden. Code unter MIT, Inhalte unter CC
           BY 4.0.
@@ -152,6 +160,7 @@ const lessonIndex = {
     <script>
       import '@/scripts/theme';
       import '@/scripts/menu';
+      import '@/scripts/sw-register';
       import '@/scripts/side-collapse';
       import '@/scripts/progress-ui';
       import '@/scripts/toc-filter';
@@ -308,6 +317,16 @@ const lessonIndex = {
   .rail > :global(*) {
     position: sticky;
     top: var(--sticky-top);
+  }
+
+  .offline-notice {
+    margin-block: 0 8px;
+    padding: 6px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--surface-alt);
+    font-size: 14px;
+    line-height: 21px;
   }
 
   .site-footer {

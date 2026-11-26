@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build && pagefind --site dist --include-characters \"#<>\" --silent && node scripts/check-links.ts",
+    "build": "astro build && pagefind --site dist --include-characters \"#<>\" --silent && node scripts/build-offline.ts && node scripts/check-links.ts",
     "preview": "astro preview",
     "check": "astro check && eslint .",
     "test": "vitest run",

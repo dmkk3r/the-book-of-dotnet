@@ -5,7 +5,10 @@ import { curriculum } from '@/lib/curriculum';
 import { withBase } from '@/lib/paths';
 ---
 
-<BaseLayout title="Fortschritt" description="Lernfortschritt sichern, übertragen und zurücksetzen.">
+<BaseLayout
+  title="Fortschritt"
+  description="Lernfortschritt sichern, übertragen und zurücksetzen, Inhalte für offline speichern."
+>
   <Breadcrumbs items={[{ label: 'Übersicht', href: withBase('') }, { label: 'Fortschritt' }]} />
   <h1>Dein Fortschritt</h1>
   <p class="lead">
@@ -16,6 +19,31 @@ import { withBase } from '@/lib/paths';
   <noscript>
     <p class="nojs">Für diese Seite wird JavaScript benötigt.</p>
   </noscript>
+
+  <section class="offline" id="offline" data-offline hidden aria-labelledby="offline-title">
+    <h2 id="offline-title">Offline lesen</h2>
+    <p>
+      Speichere alle Lektionen auf diesem Gerät, um sie ohne Internet zu lesen, etwa im Flugzeug.
+      Visualisierungen, Quiz, Glossar und Suche funktionieren dann auch offline. Auf dem Handy
+      kannst du die Seite zusätzlich zum Home-Bildschirm hinzufügen (iPhone: „Teilen“, dann „Zum
+      Home-Bildschirm“), dann startet sie wie eine App.
+    </p>
+    <p class="offline-status" role="status" data-offline-status></p>
+    <progress class="offline-bar" data-offline-progress hidden></progress>
+    <div class="actions" data-offline-actions>
+      <button type="button" class="btn primary" data-offline-save>
+        Für offline speichern
+      </button>
+      <button type="button" class="btn" data-offline-remove hidden>
+        Offline-Daten löschen
+      </button>
+    </div>
+    <p class="hint">
+      Tipp: Öffne die Seite vor einer Reise einmal mit Internet. Sie prüft dann, ob es neue Inhalte
+      gibt. Manche Browser, vor allem Safari, löschen gespeicherte Daten nach einigen Wochen ohne
+      Besuch.
+    </p>
+  </section>
 
   <div class="progress-tools" data-progress-page hidden>
     <p class="summary" data-progress-summary>
@@ -48,10 +76,25 @@ import { withBase } from '@/lib/paths';
 
   <script>
     import '@/scripts/progress-page';
+    import '@/scripts/offline';
   </script>
 </BaseLayout>
 
 <style>
+  .offline {
+    margin-bottom: 8px;
+  }
+  .offline-status {
+    font-weight: 600;
+  }
+  .offline-bar {
+    display: block;
+    width: 100%;
+    max-width: 420px;
+    height: 8px;
+    margin: 0 0 12px;
+    accent-color: var(--accent);
+  }
   .summary {
     font-size: 1.125rem;
     font-weight: 600;
