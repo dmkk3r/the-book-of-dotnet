@@ -1,0 +1,358 @@
+---
+id: unsafe-api
+title: Unsafe und MemoryMarshal
+summary: Wie Unsafe, MemoryMarshal und CollectionsMarshal Prüfungen des Typsystems gezielt abschalten, warum sie mit verwalteten Verweisen statt mit Zeigern arbeiten und welche Fehler entstehen, wenn ihre stillen Annahmen nicht stimmen.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'Unsafe Class (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.unsafe
+  - title: 'MemoryMarshal Class (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.memorymarshal
+  - title: 'CollectionsMarshal Class (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.collectionsmarshal
+  - title: 'Unsafe code, pointer types, and function pointers (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/unsafe-code
+  - title: 'Quellcode: Unsafe.cs in dotnet/runtime'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Runtime/CompilerServices/Unsafe.cs
+  - title: 'Quellcode: MemoryMarshal.cs in dotnet/runtime'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Runtime/InteropServices/MemoryMarshal.cs
+  - title: 'Quellcode: CollectionsMarshal.cs in dotnet/runtime'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Runtime/InteropServices/CollectionsMarshal.cs
+  - title: 'Quellcode: List.cs in dotnet/runtime'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Collections/Generic/List.cs
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './unsafe-api.steps';
+import layoutScript from './unsafe-api-layout.steps';
+import gcScript from './unsafe-api-gc.steps';
+import { sharplabCode, benchmarkCode } from './unsafe-api-verify';
+
+<Block n={1} title="Das Problem">
+
+Das Typsystem von .NET schützt dich ständig, ohne dass du es merkst. Jeder Array-Zugriff wird gegen die Länge geprüft. Jeder Cast prüft die MethodTable des Objekts. Ein `ref` auf ein Element eines `object[]` prüft, ob das Array wirklich `object` speichert und nicht etwa `string` (Array-Kovarianz). Eine Liste prüft beim Aufzählen, ob sie inzwischen verändert wurde. Ein `Dictionary` muss für „Wert erhöhen oder neu anlegen“ den Schlüssel zweimal suchen, weil es keinen Weg gibt, einen Verweis auf seinen internen Speicher herauszugeben.
+
+Für fast allen Code ist das genau richtig. Für einige Stellen ist es zu viel: den Kern von `string.IndexOf`, UTF-8-Kodierung, Protokoll-Parser, Hashfunktionen. Dort läuft dieselbe Schleife Milliarden Mal, und jede Prüfung, die der Autor schon anders ausgeschlossen hat, kostet messbar Zeit. Außerdem fehlen manche Operationen schlicht: „Sieh diese 16 Bytes als zwei `long` an“ lässt sich in sicherem C# nur durch Kopieren ausdrücken.
+
+Früher blieb dafür nur `unsafe` Code mit Zeigern. Der hat zwei Nachteile. Er braucht das Compiler-Flag `AllowUnsafeBlocks`, und Zeiger in verwaltete Objekte sind nur sicher, solange das Objekt fixiert ist. Fixieren behindert den GC (siehe „Pinning und Fragmentierung“).
+
+Die Basisbibliothek bietet deshalb drei statische Klassen, die einzelne Prüfungen gezielt abschalten, aber mit **verwalteten Verweisen** (`ref T`) statt mit Zeigern arbeiten: `Unsafe`, `MemoryMarshal` und `CollectionsMarshal`. Sie sind das Werkzeug, mit dem große Teile der Basisbibliothek selbst geschrieben sind. Diese Lektion zeigt, was sie tun, und vor allem, welche stillen Annahmen du mit jedem Aufruf übernimmst.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Merke dir drei Sätze:
+
+1. **Diese APIs prüfen nichts, sie behaupten.** `Unsafe.As<Kunde>(o)` behauptet, `o` sei ein `Kunde`. `Unsafe.Add(ref r, 10)` behauptet, zehn Elemente weiter liege noch gültiger Speicher. Stimmt die Behauptung nicht, gibt es keine Exception, sondern falsche Daten, einen Absturz oder einen beschädigten Heap.
+2. **Sie arbeiten mit verwalteten Verweisen, nicht mit Zeigern.** Ein `ref T` kennt der GC. Er hält das Objekt dahinter am Leben und passt den Verweis an, wenn er das Objekt verschiebt. Deshalb brauchst du kein `fixed`, und das GC-Problem von Zeigern entfällt.
+3. **Sie kopieren nicht, sie deuten um.** `MemoryMarshal.Cast`, `AsBytes` und `CollectionsMarshal.AsSpan` liefern neue Sichten auf vorhandenen Speicher. Wer durch die Sicht schreibt, ändert das Original.
+
+Die drei Klassen teilen sich die Arbeit so auf:
+
+| Klasse               | Namespace                              | Arbeitet auf                            | Typische Methoden                                     |
+| -------------------- | -------------------------------------- | --------------------------------------- | ----------------------------------------------------- |
+| `Unsafe`             | `System.Runtime.CompilerServices`      | einzelnen Verweisen und Werten          | `As`, `Add`, `ReadUnaligned`, `SizeOf`, `BitCast`     |
+| `MemoryMarshal`      | `System.Runtime.InteropServices`       | Spans und `Memory<T>`                   | `GetReference`, `Cast`, `AsBytes`, `Read`, `CreateSpan` |
+| `CollectionsMarshal` | `System.Runtime.InteropServices`       | dem Innenleben von `List<T>` und `Dictionary` | `AsSpan`, `GetValueRefOrAddDefault`, `SetCount` |
+
+<Callout kind="fehlannahme">
+  „Die Klasse `Unsafe` ist dasselbe wie `unsafe` Code.“ Nein: `unsafe` Code arbeitet mit Zeigern,
+  braucht das Schlüsselwort `unsafe` und `AllowUnsafeBlocks` und ist für den GC unsichtbar. Die
+  meisten Methoden von `Unsafe` nehmen und liefern `ref T`, kommen ohne beides aus, und der GC
+  verfolgt jeden Verweis. Unsicher ist bei ihnen nicht der Mechanismus, sondern die Behauptung, die
+  du damit aufstellst.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Der bekannteste Vertreter ist `CollectionsMarshal.AsSpan`. Er liefert einen `Span<T>` über das interne Array einer `List<T>`. Damit fallen bei jedem Zugriff der Aufruf des Listen-Indexers und seine Prüfung gegen `_size` weg, und du kannst Elemente per `ref` verändern, was bei großen Structs eine Kopie spart. Die Dokumentation knüpft daran eine Bedingung: Solange der Span benutzt wird, dürfen keine Elemente hinzugefügt oder entfernt werden. Was passiert, wenn du dich nicht daran hältst, zeigt der folgende Ablauf. Achte auf Schritt 5, in dem die Liste wächst.
+
+<StepPlayer script={script} />
+
+Bemerkenswert ist, was **nicht** passiert: kein Absturz, keine Exception, keine Speicherbeschädigung. Der Span zeigt korrekt auf ein lebendes Array, nur eben nicht mehr auf das der Liste. Genau diese Art Fehler ist typisch für die Marshal-Klassen: Sie heben keine Speichersicherheit auf, sondern eine **Invariante einer Datenstruktur**, und die bricht still.
+
+Wie `List<T>` wächst und warum sich die Kapazität verdoppelt, erklärt die Lektion „List&lt;T&gt; und Wachstum“. Die Regel für dich: Hol dir den Span erst, wenn die Liste fertig gefüllt ist, und wirf ihn weg, bevor sie sich wieder ändert. Seit .NET 8 gibt es zusätzlich `CollectionsMarshal.SetCount(list, n)`, das die Anzahl setzt, ohne Elemente einzeln hinzuzufügen. Danach füllst du die Liste über `AsSpan` direkt, etwa als Ziel einer Kopie.
+
+{/* TODO(verify): CollectionsMarshal.SetCount added in .NET 8; it grows the backing array if needed and does not clear new elements for unmanaged T. */}
+
+### Ein Verweis in ein Dictionary
+
+`CollectionsMarshal.GetValueRefOrAddDefault(dict, key, out bool exists)` liefert einen `ref TValue` auf den Wert im internen Eintrags-Array. Fehlt der Schlüssel, legt die Methode einen Eintrag mit `default` an. Der klassische Zähler braucht damit nur noch eine Suche statt zwei:
+
+```csharp
+var counts = new Dictionary<string, int>();
+foreach (string word in words)
+{
+    ref int count = ref CollectionsMarshal.GetValueRefOrAddDefault(counts, word, out _);
+    count++;                                   // schreibt direkt in den Eintrag
+}
+```
+
+Die Schwester `GetValueRefOrNullRef(dict, key)` legt nichts an und liefert bei fehlendem Schlüssel einen Null-Verweis, den du mit `Unsafe.IsNullRef(ref value)` prüfst. Für beide gilt dieselbe Regel wie bei `AsSpan`: Der Verweis ist nur gültig, bis das Dictionary seine Einträge neu anlegt, also beim nächsten Hinzufügen, das ein Wachstum auslöst. Wie das Eintrags-Array aufgebaut ist, zeigt „Dictionary von innen“.
+
+</Block>
+
+<Block n={4} title="Unsafe im Einzelnen">
+
+Die Klasse `Unsafe` ist ein Baukasten aus Operationen, die IL kennt, C# aber nicht direkt ausdrücken kann. Die wichtigsten Gruppen:
+
+**Umdeuten von Typen.** `Unsafe.As<T>(object o)` gibt `o` als `T` zurück, ohne die MethodTable zu prüfen. Der normale Cast `(T)o` würde prüfen und notfalls eine `InvalidCastException` werfen. `Unsafe.As<TFrom, TTo>(ref TFrom source)` deutet einen Verweis um: Aus einem `ref float` wird ein `ref int` auf dieselben 4 Byte. Seit .NET 8 gibt es für Werte zusätzlich `Unsafe.BitCast<TFrom, TTo>(value)`. Es nimmt einen Wert, keinen Verweis, und verlangt, dass beide Typen Werttypen gleicher Größe sind, sonst wirft es eine `NotSupportedException`. Für die Bitmuster von Gleitkommazahlen ist es die saubere Wahl, `BitConverter.SingleToInt32Bits` tut dasselbe für diesen einen Fall.
+
+**Rechnen mit Verweisen.** `Unsafe.Add(ref r, n)` liefert einen Verweis `n` Elemente weiter, `Unsafe.AddByteOffset` einen Verweis `n` Byte weiter, `Unsafe.Subtract` und `Unsafe.ByteOffset` die Umkehrungen. `Unsafe.AreSame(ref a, ref b)` vergleicht zwei Verweise auf Identität. Das ist Zeigerarithmetik mit verwalteten Verweisen: Der GC verfolgt das Ergebnis, aber niemand prüft, ob es noch im Objekt liegt.
+
+**Lesen und Schreiben ohne Ausrichtung.** `Unsafe.ReadUnaligned<T>(ref byte source)` liest ein `T` aus beliebigen Bytes, auch wenn die Adresse nicht durch die Größe von `T` teilbar ist. `WriteUnaligned` schreibt entsprechend. Die Varianten ohne „Unaligned“ setzen eine passende Ausrichtung voraus.
+
+**Verweise erzeugen und prüfen.** `Unsafe.AsRef(in value)` macht aus einem schreibgeschützten Verweis einen schreibbaren, und das hebt die Garantie von `readonly` auf. `Unsafe.NullRef<T>()` liefert einen Null-Verweis, `Unsafe.IsNullRef(ref r)` erkennt ihn. Das ist das Muster, mit dem Methoden wie `GetValueRefOrNullRef` „nicht gefunden“ melden, ohne ein `bool` und eine Kopie zu brauchen.
+
+**Größe und Initialisierung.** `Unsafe.SizeOf<T>()` liefert die Größe eines Werts vom Typ `T` in Byte, für Referenztypen die Größe des Verweises, und funktioniert anders als `sizeof(T)` für jedes `T`. `Unsafe.SkipInit(out T value)` erfüllt die Zuweisungspflicht für einen `out`-Parameter, ohne Code zu erzeugen. Der Wert ist danach unbestimmt, sofern der Speicher nicht ohnehin genullt wurde.
+
+{/* TODO(verify): Versions: Unsafe.NullRef/IsNullRef/SkipInit .NET 5, BitCast .NET 8 (NotSupportedException when sizes differ or a type is not a value type). Unsafe.AsRef signature changed to `scoped ref readonly T` in .NET 8. */}
+
+### Was ein unberechtigter Cast anrichtet
+
+`Unsafe.As<T>(object)` ist für Situationen gedacht, in denen du den Typ bereits sicher kennst, etwa weil ein `object`-Feld nachweislich immer ein `T[]` enthält. Stimmt das nicht, entsteht eine Typverwechslung:
+
+```csharp
+object o = new Messwert { Wert = 0x1234 };
+Kunde k = Unsafe.As<Kunde>(o);   // keine Prüfung, kein Fehler
+Console.WriteLine(k.GetType());  // Messwert: die MethodTable im Objekt stimmt noch
+Console.WriteLine(k.Name);       // liest die 8 Byte von Wert als String-Verweis
+
+class Kunde    { public string Name = ""; }
+class Messwert { public long Wert; }
+```
+
+`GetType` liest die MethodTable aus dem Objekt, und virtuelle Aufrufe wie `ToString` laufen über sie. Beide sehen also weiter den echten Typ. Feldzugriffe dagegen übersetzt der JIT nach dem **statischen** Typ: `k.Name` liest die 8 Byte am Offset von `Name`, und dort steht `0x1234`. Der JIT behandelt diese Zahl ab jetzt als Objektverweis, auch in seinen Angaben für den GC. Kommt es zu einer Garbage Collection, während der Wert in einem Register oder Stack-Slot liegt, versucht der GC, ein „Objekt“ an Adresse `0x1234` zu markieren. Das Ergebnis ist ein Absturz, im schlechteren Fall eine Beschädigung des Heaps, die erst viel später auffällt. Genau aus diesem Grund verweigert `MemoryMarshal.Cast` Typen mit Verweisen, wie der nächste Abschnitt zeigt.
+
+</Block>
+
+<Block n={5} title="MemoryMarshal: Speicher umdeuten">
+
+`MemoryMarshal` macht dasselbe für ganze Spans. `MemoryMarshal.AsBytes(span)` liefert einen `Span<byte>` über die Bytes eines `Span<T>`, `MemoryMarshal.Cast<TFrom, TTo>(span)` einen Span eines anderen Elementtyps. Beide Methoden verlangen, dass die Elementtypen **keine Verweise enthalten**, und prüfen das zur Laufzeit. Ein `Cast<byte, string>` wirft eine `ArgumentException`, denn sonst ließe sich aus beliebigen Bytes ein Objektverweis bauen, genau die Typverwechslung von eben.
+
+Der folgende Ablauf deutet ein kleines Struct erst als Bytes und dann als `int` um. Achte auf das Padding-Byte und darauf, dass am Ende eine Änderung über die Bytes im Struct ankommt.
+
+<StepPlayer script={layoutScript} />
+
+Daraus folgen drei Regeln, die für jedes Umdeuten gelten.
+
+**Padding ist Teil der Sicht.** Das Layout eines Structs, inklusive Padding, beschreibt „Struct-Layout und Padding“. `AsBytes` legt alles davon offen. Für ein Dateiformat oder ein Netzwerkprotokoll willst du deshalb Structs ohne Padding, etwa mit `[StructLayout(LayoutKind.Sequential, Pack = 1)]`, oder du schreibst Feld für Feld.
+
+**Die Länge wird abgerundet.** `Cast<byte, int>` über 10 Byte liefert einen Span der Länge 2. Die letzten 2 Byte sind in der neuen Sicht nicht erreichbar.
+
+{/* TODO(verify): MemoryMarshal.Cast length is (length * sizeof(TFrom)) / sizeof(TTo), rounded down, and it throws ArgumentException for types that are or contain references. */}
+
+**Die Bytes stehen in Maschinenreihenfolge.** x64 und Arm64 sind Little Endian, das niederwertigste Byte steht zuerst. Netzwerkprotokolle verwenden oft Big Endian. `MemoryMarshal.Read<int>(bytes)` liest immer in Maschinenreihenfolge und liefert für ein Big-Endian-Feld auf einem Little-Endian-Rechner einen falschen Wert. Für Protokolle nimmst du `BinaryPrimitives.ReadInt32BigEndian` oder `ReadInt32LittleEndian` aus `System.Buffers.Binary`. Diese Methoden drehen die Bytes nur, wenn nötig, und der JIT übersetzt das Drehen in eine einzige Instruktion.
+
+{/* TODO(verify): That BinaryPrimitives.ReverseEndianness becomes a single bswap/movbe or rev instruction on x64 and Arm64. */}
+
+### Ausrichtung
+
+`MemoryMarshal.Read<T>` und `Write<T>` lesen und schreiben ohne Annahme über die Ausrichtung, intern mit `Unsafe.ReadUnaligned` und `WriteUnaligned`. Beim Umdeuten mit `Cast` ist das anders: Beginnt dein `Span<byte>` bei einer ungeraden Adresse, liegen alle `int` des neuen Spans unausgerichtet. Die Dokumentation von `Cast` weist darauf hin, dass die Methode nur auf Plattformen unterstützt ist, die unausgerichtete Zugriffe erlauben, oder wenn du die Ausrichtung selbst sicherstellst. Auf x64 kosten unausgerichtete Zugriffe meist nur wenig, auf anderen Architekturen können einzelne Instruktionen sie gar nicht ausführen.
+
+{/* TODO(verify): Wording of the alignment remark in the MemoryMarshal.Cast docs; which Arm64 instructions fault on misaligned access. */}
+
+### Der Rest von MemoryMarshal
+
+- `GetReference(span)` liefert einen `ref T` auf das erste Element eines Spans. Ist der Span leer, zeigt der Verweis dorthin, wo das erste Element läge. Laut Dokumentation darfst du ihn dann zum Fixieren nutzen, aber niemals lesen oder schreiben.
+- `GetArrayDataReference(array)` liefert einen Verweis auf das erste Element eines Arrays, ohne Längenprüfung und ohne die Kovarianzprüfung, die `ref array[0]` bei Arrays von Referenztypen macht.
+- `CreateSpan(ref r, length)` und `CreateReadOnlySpan` bauen einen Span aus einem Verweis und einer Länge, die niemand prüft.
+- `Read<T>(bytes)` und `Write(bytes, in value)` lesen und schreiben ein Struct ohne Verweise aus beziehungsweise in Bytes. Ist der Span zu kurz, werfen sie. `TryRead` und `TryWrite` melden das stattdessen mit `false`.
+- `TryGetArray(memory, out ArraySegment<T> segment)` holt das Array hinter einem `ReadOnlyMemory<T>` heraus, falls es eines gibt, etwa für ältere APIs mit `byte[]`, Offset und Länge.
+
+{/* TODO(verify): GetArrayDataReference skips the covariance check (docs remark), and its behavior for a null array. */}
+
+</Block>
+
+<Block n={6} title="Verweise gegen Zeiger">
+
+Warum arbeiten diese APIs so konsequent mit `ref T`? Der Unterschied zeigt sich, wenn der GC ein Objekt verschiebt. Das folgende Beispiel hält auf dasselbe Feld einmal einen verwalteten Verweis und einmal einen Zeiger, den `Unsafe.AsPointer` liefert.
+
+<StepPlayer script={gcScript} />
+
+Der JIT trägt für jede Stelle, an der ein GC stattfinden kann, ein, welche Register und Stack-Slots Objektverweise und welche innere Verweise enthalten (siehe „GC-Info und Safe Points“). Ein `ref int` steht dort als innerer Verweis. Ein `int*` steht dort nicht, er ist für den GC eine Zahl wie jede andere. Daraus ergeben sich zwei Regeln:
+
+- Ein **verwalteter Verweis** bleibt gültig, solange er existiert. Er hält das Objekt am Leben und wandert mit, wenn es verschoben wird.
+- Ein **Zeiger** in ein verwaltetes Objekt ist nur gültig, solange das Objekt fixiert ist: mit `fixed`, mit `GCHandle.Alloc(obj, GCHandleType.Pinned)` oder weil das Objekt auf dem Pinned Object Heap liegt. Die Dokumentation von `Unsafe.AsPointer` sagt das ausdrücklich: Der Aufrufer ist dafür verantwortlich, dass das Objekt nicht verschoben wird.
+
+Ein solches Loch in der Sicht des GC heißt **GC-Loch** (GC hole). Es ist der gefährlichste Fehler in diesem Bereich, weil er nur auftritt, wenn eine Garbage Collection genau zwischen dem Erzeugen und dem Benutzen des Zeigers passiert: in Tests kaum, unter Last schon. Was Fixieren für den Heap bedeutet und wann der Pinned Object Heap die bessere Wahl ist, steht in „Pinning und Fragmentierung“.
+
+Verwaltete Verweise haben dafür eine andere Grenze: Sie dürfen nur auf dem Stack und in ref structs leben, wie „ref struct, ref-Locals und scoped“ erklärt. Manche Methoden wie `MemoryMarshal.CreateSpan` umgehen diese Lebensdauerregeln teilweise. Wer einen so gebauten Span über ein lokales Struct aus der Methode hinausgibt, hat einen Verweis auf einen Frame, der nicht mehr existiert.
+
+{/* TODO(verify): Exact escape rules the compiler applies to the result of MemoryMarshal.CreateSpan(ref local, n) in C# 11+ (scoped ref parameter). */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Über das Ende hinaus lesen
+
+`Unsafe.Add` und `GetArrayDataReference` werden gern benutzt, um Bounds-Checks in Schleifen loszuwerden:
+
+```csharp
+ref int start = ref MemoryMarshal.GetArrayDataReference(data);
+for (int i = 0; i < count; i++)                  // count statt data.Length
+    sum += Unsafe.Add(ref start, i);
+```
+
+Ist `count` größer als `data.Length`, liest die Schleife einfach weiter: das Padding am Ende des Arrays, den Header des nächsten Objekts, dessen MethodTable-Zeiger. Es gibt keine Exception, nur falsche Summen. Beim Schreiben überschreibst du fremde Objekte. Bevor du so etwas schreibst, prüfe, ob der JIT die Prüfung nicht ohnehin entfernt. Bei `for (int i = 0; i < span.Length; i++)` tut er das in aller Regel, wie „Bounds-Check-Elimination“ zeigt. Der sichere Code ist dann genauso schnell.
+
+### readonly aushebeln
+
+`Unsafe.AsRef(in value)` und `MemoryMarshal.AsMemory(readOnlyMemory)` entfernen ein `readonly`, so wird auch ein `ReadOnlySpan<char>` über einen String beschreibbar. Die Runtime verlässt sich aber darauf, dass Strings unveränderlich sind, und teilt etwa Literale (siehe „Strings und Interning“). Wer einen String so ändert, ändert ihn für jede Stelle im Prozess, die dasselbe Literal benutzt.
+
+### Ein Verweis in eine Sammlung überlebt ihre Änderung nicht
+
+Das Durchspielen hat es für `List<T>` gezeigt, für `Dictionary` gilt dasselbe. Besonders tückisch ist dieser Code:
+
+```csharp
+ref int a = ref CollectionsMarshal.GetValueRefOrAddDefault(counts, "a", out _);
+ref int b = ref CollectionsMarshal.GetValueRefOrAddDefault(counts, "b", out _);
+a++;   // kann ins alte Eintrags-Array schreiben
+```
+
+Der zweite Aufruf fügt einen Schlüssel hinzu und kann dabei das Eintrags-Array vergrößern. Danach zeigt `a` ins alte Array. Halte solche Verweise so kurz wie möglich: holen, ändern, vergessen. Der Compiler kann dir dabei nicht helfen, er kennt nur Frames und Objekte, keine Invarianten von Sammlungen.
+
+### Typen mit Verweisen
+
+`Unsafe.As<TFrom, TTo>(ref)` prüft anders als `MemoryMarshal.Cast` nicht, ob Verweise im Spiel sind. Wer ein Struct mit einem `long` als Struct mit einem `object` umdeutet, erzeugt dieselbe Typverwechslung wie `Unsafe.As<Kunde>` oben. Die Basisbibliothek schützt sich davor mit `RuntimeHelpers.IsReferenceOrContainsReferences<T>()`, einer Abfrage, die der JIT zu einer Konstanten auswertet. Eigener Code sollte das auch tun, wenn er generisch umdeutet.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die meisten Anwendungen brauchen keine dieser Klassen direkt. Sie benutzen sie indirekt, über die Basisbibliothek, über Serialisierer und über Kestrel. Wenn du sie selbst einsetzt, dann gezielt an gemessenen Engpässen. Diese Tabelle ordnet die häufigsten Aufgaben ein:
+
+| Aufgabe                                          | Werkzeug                                          | Zu beachten                                            |
+| ------------------------------------------------ | ------------------------------------------------- | ------------------------------------------------------ |
+| Schnell über eine fertige `List<T>` laufen       | `CollectionsMarshal.AsSpan`                       | Liste darf sich währenddessen nicht ändern             |
+| Zählen oder Aufsummieren pro Schlüssel           | `CollectionsMarshal.GetValueRefOrAddDefault`      | Verweis nur bis zum nächsten Hinzufügen gültig         |
+| Zahl aus Protokoll-Bytes lesen                   | `BinaryPrimitives.Read…BigEndian/LittleEndian`    | Reihenfolge explizit, kein Padding-Problem             |
+| Struct ohne Verweise in Bytes schreiben          | `MemoryMarshal.Write` oder `AsBytes`              | Padding und Maschinenreihenfolge                       |
+| Bytes als andere Zahlen ansehen (etwa für SIMD)  | `MemoryMarshal.Cast`                              | Länge wird abgerundet, Ausrichtung                     |
+| Bitmuster einer Gleitkommazahl                   | `BitConverter.SingleToInt32Bits`, `Unsafe.BitCast` | gleiche Größe nötig                                   |
+| Bounds-Checks loswerden                          | erst Schleife umbauen, dann `Unsafe.Add`          | meist entfernt der JIT sie schon                       |
+
+Wenn du `Unsafe` oder `MemoryMarshal` verwendest, dokumentiere direkt am Aufruf, **welche Behauptung** du aufstellst und warum sie stimmt: „`count <= data.Length`, geprüft in Zeile 12“. Wer den Code später ändert, sieht sonst nicht, welche Vorbedingung er gerade verletzt. In der Basisbibliothek findest du solche Kommentare an fast jeder Stelle, die `Unsafe` benutzt.
+
+Schreib zuerst die sichere Variante mit Spans, miss sie und sieh dir den Assembler an. Erst wenn dort Prüfungen übrig bleiben, die nachweislich Zeit kosten, lohnt sich `Unsafe`. Bei Hashfunktionen, Kodierungen und SIMD-Code ist das häufig der Fall (siehe „Hardware-Intrinsics und SIMD“), bei Geschäftslogik praktisch nie.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Methoden von `Unsafe` sind keine gewöhnlichen Methoden. In `Unsafe.cs` sind die meisten mit `[Intrinsic]` markiert, der JIT erkennt die Aufrufe und ersetzt sie direkt. `Unsafe.As` erzeugt deshalb überhaupt keinen Maschinencode, es ändert nur, welchen Typ der JIT für den Wert annimmt. `Unsafe.Add` wird zu einer Adressrechnung, `SizeOf<T>` zu einer Konstanten.
+
+{/* TODO(verify): Which Unsafe methods are [Intrinsic] with a throwing placeholder body and IL comment in Unsafe.cs (current main), and which have a real C# body. */}
+
+Für die GC-Sicherheit zählt, wie der JIT Verweise einordnet: `ref T` als innerer Verweis, ein Objektverweis als Objekt, ein Zeiger gar nicht. Bei einem inneren Verweis prüft der GC, ob die Adresse in seinem Heap liegt, und sucht das umgebende Objekt. Deshalb darf ein `ref T` auch auf den Stack zeigen. Ein Objektverweis dagegen muss immer auf den Anfang eines gültigen Objekts zeigen, und genau das bricht ein falsches `Unsafe.As<T>(object)`.
+
+{/* TODO(verify): BOTR / gcinfo terminology: GC_SLOT_INTERIOR for byrefs, how the GC finds the containing object of an interior pointer. */}
+
+`MemoryMarshal.Cast` und `AsBytes` prüfen die Verweisfreiheit mit `RuntimeHelpers.IsReferenceOrContainsReferences<T>()`. Der JIT wertet diese Abfrage bei der Übersetzung für den konkreten Typ zu `true` oder `false` aus und entfernt den nicht genommenen Zweig. Für `Cast<byte, int>` bleibt von der Prüfung im Maschinencode also nichts übrig.
+
+<Callout kind="version">
+  `Unsafe` gab es anfangs nur im NuGet-Paket System.Runtime.CompilerServices.Unsafe, heute liegt die
+  Klasse in der Basisbibliothek. `CollectionsMarshal.AsSpan`, `Unsafe.NullRef`, `IsNullRef` und
+  `SkipInit` kamen mit .NET 5, `GetValueRefOrAddDefault` und `GetValueRefOrNullRef` mit .NET 6,
+  `Unsafe.BitCast` und `CollectionsMarshal.SetCount` mit .NET 8. `new Span<T>(ref value)` für einen
+  Span über einen einzelnen Wert gibt es seit .NET 7.
+</Callout>
+
+{/* TODO(verify): All version numbers in the callout above against the "Applies to" tables on Microsoft Learn; the .NET version in which Unsafe moved into System.Private.CoreLib. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Im SharpLab-Experiment siehst du die Umdeutung ohne Kopie und die veraltete Sicht auf eine Liste. Der Benchmark vergleicht den Listen-Indexer mit `AsSpan` und das Zählen mit zwei Suchen gegen das Zählen mit einer.
+
+{/* TODO(verify): Expected SharpLab output on x64: 8, 01008000020100 00 with an arbitrary byte 3 (usually 00), 514, 2, 2. Expected: no allocations in all four benchmarks; SumAsSpan and CountOneLookup faster than their baselines. */}
+
+<VerifyCard
+  sharplab="Stelle SharpLab auf „Run“. Erwartet: 8 Byte für Header, eine Bytefolge, in der 258 als 02 01 00 00 erscheint, danach 514, weil die Änderung über bytes im Struct ankommt, 2 als Länge des int-Spans und am Ende 2, weil der Span nach dem Wachstum der Liste ins alte Array geschrieben hat."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'SumIndexer', allocated: 'keine' },
+    { method: 'SumAsSpan', allocated: 'keine' },
+    { method: 'CountTwoLookups', allocated: 'keine' },
+    { method: 'CountOneLookup', allocated: 'keine' },
+  ]}
+  note="Keine der Varianten alloziert. Der Unterschied liegt in der Laufzeit: SumAsSpan spart den Indexer-Aufruf, CountOneLookup die zweite Suche nach dem Schlüssel. Wie groß der Gewinn ist, hängt von .NET-Version und Hardware ab."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="unsafe-api"
+  questions={[
+    {
+      q: 'Braucht ein Aufruf von Unsafe.Add(ref r, 4) das Schlüsselwort unsafe?',
+      options: ['Ja, alles aus Unsafe braucht unsafe-Kontext', 'Nein, die Methode arbeitet mit verwalteten Verweisen'],
+      correct: 1,
+      explanation:
+        'Nur die Überladungen mit void* brauchen unsafe-Kontext. Methoden mit ref T kommen ohne aus, und der GC verfolgt ihr Ergebnis.',
+    },
+    {
+      q: 'Span<byte> b hat Länge 10. Was liefert MemoryMarshal.Cast<byte, int>(b)?',
+      options: ['Einen neuen int-Puffer der Länge 3 mit kopierten Werten', 'Einen Span<int> der Länge 2 über denselben Speicher', 'Eine ArgumentException, weil 10 nicht durch 4 teilbar ist'],
+      correct: 1,
+      explanation:
+        'Cast kopiert nicht und rundet die Länge ab: 10 Byte ergeben 2 int. Die letzten 2 Byte sind in der neuen Sicht nicht erreichbar.',
+    },
+    {
+      q: 'Du holst dir span = CollectionsMarshal.AsSpan(list), dann wächst die Liste durch Add. Wohin schreibt span[0] = 1?',
+      options: ['In das neue Array der Liste', 'In das alte Array, das die Liste nicht mehr benutzt', 'Nirgendwohin, es gibt eine InvalidOperationException'],
+      correct: 1,
+      explanation:
+        'Der Span kennt nur das Array, nicht die Liste. Nach dem Wachstum zeigt er weiter auf das alte Array, die Änderung geht still verloren.',
+    },
+    {
+      q: 'Warum wirft MemoryMarshal.Cast<byte, string>(bytes) eine Exception?',
+      options: ['Weil string kein Struct ist und beliebige Bytes sonst zu Objektverweisen würden', 'Weil byte und string unterschiedlich groß sind'],
+      correct: 0,
+      explanation:
+        'Cast erlaubt nur Typen ohne Verweise. Sonst könnte man aus beliebigen Bytes einen Verweis bauen, den der GC als Objekt behandelt.',
+    },
+    {
+      q: 'int* p = (int*)Unsafe.AsPointer(ref obj.Feld) ohne fixed. Was passiert, wenn der GC obj verschiebt?',
+      options: ['Der GC passt p an', 'p zeigt weiter auf die alte Adresse'],
+      correct: 1,
+      explanation:
+        'Zeiger stehen nicht in der GC-Info, der GC weiß nichts von p. Ein ref int an derselben Stelle hätte er angepasst.',
+    },
+    {
+      q: 'Ein Protokoll überträgt eine Länge als 4 Byte Big Endian. Wie liest du sie auf x64 richtig?',
+      options: ['MemoryMarshal.Read<int>(bytes)', 'BinaryPrimitives.ReadInt32BigEndian(bytes)'],
+      correct: 1,
+      explanation:
+        'MemoryMarshal.Read liest in Maschinenreihenfolge, auf x64 also Little Endian. BinaryPrimitives legt die Reihenfolge ausdrücklich fest.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- `Unsafe`, `MemoryMarshal` und `CollectionsMarshal` **schalten einzelne Prüfungen ab**: Typprüfung, Bounds-Check, Kovarianzprüfung, Schutz der Sammlungsinvarianten. Sie prüfen nichts, sie übernehmen deine Behauptung.
+- Sie arbeiten mit **verwalteten Verweisen**. Die verfolgt der GC, deshalb brauchst du kein `fixed`. Die Klasse `Unsafe` ist nicht dasselbe wie `unsafe` Code mit Zeigern.
+- `AsBytes`, `Cast` und `CollectionsMarshal.AsSpan` **kopieren nicht**. Schreibzugriffe über die neue Sicht ändern das Original, Padding und Maschinenreihenfolge werden sichtbar.
+- Ein Span von `AsSpan` oder ein `ref` von `GetValueRefOrAddDefault` ist nur gültig, **bis die Sammlung wächst**. Danach zeigt er still auf den alten Speicher.
+- Ein falsches `Unsafe.As` oder ein Umdeuten von Typen mit Verweisen lässt den JIT eine Zahl als Objektverweis behandeln. Das kann den **GC und den Heap beschädigen**.
+- Ein Zeiger aus `Unsafe.AsPointer` ohne Fixieren ist ein **GC-Loch**: Verschiebt der GC das Objekt, zeigt der Zeiger ins Leere oder in ein fremdes Objekt.
+- Erst messen und den Assembler ansehen. Oft entfernt der JIT die Prüfung schon selbst, und sicherer Code mit Spans ist genauso schnell.
+
+</Block>

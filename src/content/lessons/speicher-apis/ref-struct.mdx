@@ -1,0 +1,343 @@
+---
+id: ref-struct
+title: ref struct, ref-Locals und scoped
+summary: Warum es Typen gibt, die nie auf den Heap dürfen, wie ref-Locals, ref-Rückgaben und ref-Felder funktionieren und mit welchen Regeln der Compiler verhindert, dass ein Verweis seinen Speicher überlebt.
+status: draft
+dotnetVersion: '7+'
+sources:
+  - title: 'ref struct types (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/ref-struct
+  - title: 'Low level struct improvements (C# 11, Feature-Spezifikation in dotnet/csharplang)'
+    url: https://github.com/dotnet/csharplang/blob/main/proposals/csharp-11.0/low-level-struct-improvements.md
+  - title: 'Stephen Toub: All About Span: Exploring a New .NET Mainstay (MSDN Magazine, Januar 2018)'
+    url: https://learn.microsoft.com/en-us/archive/msdn-magazine/2018/january/csharp-all-about-span-exploring-a-new-net-mainstay
+  - title: 'Memory<T> and Span<T> usage guidelines (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/memory-and-spans/memory-t-usage-guidelines
+  - title: 'Quellcode: Span.cs in dotnet/runtime'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Span.cs
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './ref-struct.steps';
+import danglingScript from './ref-struct-dangling.steps';
+import escapeScript from './ref-struct-escape.steps';
+import { sharplabCode } from './ref-struct-verify';
+
+<Block n={1} title="Das Problem">
+
+Die Lektion „Span&lt;T&gt; und Memory&lt;T&gt;“ endet mit einer Behauptung: Ein `Span<T>` darf nie auf den Heap, weil er einen verwalteten Verweis enthält, der in die Mitte eines Objekts, auf den Stack oder in nativen Speicher zeigen kann. Bleibt die Frage, wer das eigentlich durchsetzt. Ein `struct` kann normalerweise überall landen: in einem Feld einer Klasse, geboxt in einer `List<object>`, eingefangen in einer Lambda, als lokale Variable einer async-Methode in der State Machine.
+
+Das gleiche Problem gibt es schon eine Ebene tiefer. Seit C# 7.0 kann eine Methode einen **Verweis** zurückgeben statt eines Werts, und eine lokale Variable kann ein solcher Verweis sein. Das ist nützlich, um ein Element in einem großen Array zu finden und an Ort und Stelle zu ändern, ohne es zu kopieren. Ein Verweis auf eine lokale Variable darf aber auf keinen Fall länger leben als der Frame, zu dem sie gehört.
+
+Die Runtime kann das zur Laufzeit nicht billig prüfen. Ein Verweis ist auf Maschinenebene nur eine Adresse, und ob der Speicher dahinter noch lebt, sieht man ihr nicht an. Deshalb liegt die ganze Last beim **C#-Compiler**: Er muss für jeden Verweis und für jeden Wert, der einen Verweis enthält, beweisen, dass er nicht weiter wandern kann als der Speicher, auf den er zeigt. Dafür gibt es drei Werkzeuge, um die es in dieser Lektion geht:
+
+- `ref struct`: eine Kategorie von Typen, die nie auf den Heap dürfen.
+- Regeln für die Lebensdauer jedes Ausdrucks, die der Compiler bei jeder Zuweisung, jedem Aufruf und jedem `return` prüft.
+- `scoped` und `[UnscopedRef]`, mit denen du diese Lebensdauer ausdrücklich enger oder weiter machst.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Der Compiler stellt sich für jeden Ausdruck zwei Fragen:
+
+1. **Wie weit darf der Wert wandern?** Bei einem `int` oder einem normalen Struct lautet die Antwort immer „überallhin“, denn eine Kopie trägt keinen Verweis. Bei einem ref struct wie `Span<int>` hängt die Antwort davon ab, worauf er zeigen kann. Die Spezifikation nennt das den **safe-context** des Werts.
+2. **Wie weit darf ein Verweis auf die Speicherstelle wandern?** Das ist für `ref`-Ausdrücke wichtig: `ref x`, `ref arr[i]`, `ref this.field`. Die Spezifikation nennt das den **ref-safe-context**.
+
+Beide Antworten sind Stufen auf einer Skala. Die wichtigsten sind **function-member** (nur innerhalb dieser Methode gültig) und **caller-context** (auch beim Aufrufer gültig, darf also per `return` hinaus). Dazwischen liegt seit C# 11 **return-only**: darf zurückgegeben werden, aber nicht über einen `ref`- oder `out`-Parameter hinausgeschrieben werden. Ganz innen gibt es noch den einzelnen Block.
+
+Eine Zuweisung, ein Argument oder ein `return` ist nur erlaubt, wenn das Ziel nicht länger lebt als die Quelle. Das ist die ganze Regel. Der Rest der Lektion beantwortet, welche Stufe welcher Ausdruck bekommt.
+
+<Callout kind="fehlannahme">
+  „ref struct heißt, der Wert liegt immer auf dem Stack und ist deshalb schnell.“ Die Garantie ist
+  eine negative: Ein ref struct liegt **nie auf dem GC-Heap**. Wo genau er liegt, im Frame oder nur
+  in Registern, entscheidet der JIT. Die Daten, auf die er zeigt, liegen oft trotzdem auf dem Heap.
+  Und schnell ist er nicht, weil er auf dem Stack liegt, sondern weil Code mit ihm Allokationen und
+  Kopien vermeidet. Ein großes ref struct wird bei jeder Übergabe als Wert kopiert wie jedes Struct.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Bevor es um ref structs geht, zuerst ihr Fundament: Verweise als lokale Variablen und als Rückgabewerte. Das Beispiel sucht ein Element in einem Array, gibt einen Verweis darauf zurück und biegt diesen Verweis später auf eine lokale Variable um.
+
+<StepPlayer script={script} />
+
+Zwei Dinge solltest du mitnehmen. Erstens: Ein `ref int` ist eine Adresse, keine Zahl. Zuweisen mit `=` schreibt durch den Verweis, `= ref` ändert den Verweis selbst. Zweitens: `Find` darf `ref items[i]` zurückgeben, weil ein Element eines Heap-Arrays den Frame von `Find` überlebt. Hätte `Find` stattdessen `ref i` zurückgegeben, also einen Verweis auf die eigene Schleifenvariable, hätte der Compiler das abgelehnt.
+
+</Block>
+
+<Block n={4} title="Die Regeln für ref struct">
+
+Ein `ref struct` ist ein Struct, das der Compiler so behandelt, als enthielte es einen verwalteten Verweis, ob es tatsächlich einen enthält oder nicht. Jede Regel verhindert einen bestimmten Weg auf den Heap:
+
+| Regel                                                        | Welcher Weg auf den Heap wird verhindert?                       |
+| ------------------------------------------------------------ | --------------------------------------------------------------- |
+| kein Boxing nach `object`, `ValueType` oder Interface         | die Box ist ein Heap-Objekt                                      |
+| kein Feld in einer Klasse oder einem normalen Struct          | das umgebende Objekt kann auf dem Heap liegen                    |
+| kein Element eines Arrays                                     | Arrays sind Heap-Objekte                                         |
+| kein Einfangen in Lambdas und lokalen Funktionen              | eingefangene Variablen werden Felder einer Closure-Klasse        |
+| in async-Methoden und Iteratoren eingeschränkt                | lokale Variablen können Felder der State Machine werden          |
+| als Typargument nur mit `allows ref struct`                   | generischer Code könnte den Wert boxen oder in ein Feld legen    |
+
+Die Gründe für die vierte und fünfte Zeile liegen im Compiler: Eine Lambda, die eine lokale Variable einfängt, macht daraus ein Feld einer generierten Klasse (siehe „Lambdas und Closures“). Eine async-Methode legt Variablen, die ein `await` überleben, in Felder ihrer State Machine, und die landet beim ersten echten Warten auf dem Heap (siehe „Die async State Machine“).
+
+### Was C# 13 gelockert hat
+
+C# 13 (.NET 9) hat drei dieser Regeln gelockert:
+
+- **async und Iteratoren:** ref structs und ref-Locals sind erlaubt, solange sie nicht über ein `await` beziehungsweise `yield return` hinweg leben. Laut Microsoft-Dokumentation dürfen sie nicht im selben Block wie das `await` stehen.
+- **Interfaces:** Ein ref struct darf Interfaces implementieren. Umwandeln in den Interface-Typ bleibt verboten, denn das wäre Boxing. Aufrufen kannst du die Interface-Methoden über Generics.
+- **Generics:** Ein Typparameter mit `where T : allows ref struct` darf ein ref struct sein. Das ist ein Anti-Constraint: Er erlaubt mehr Typen, und dafür prüft der Compiler im generischen Code, dass `T` wie ein ref struct behandelt wird, also nie geboxt und nie in ein Feld gelegt wird.
+
+```csharp
+static int Count<T>(T items) where T : IEnumerable<int>, allows ref struct
+{
+    // kein object o = items; kein Feld vom Typ T, kein Einfangen in Lambdas
+    return 0;
+}
+```
+
+{/* TODO(verify): Example compiles with C# 13 (IEnumerable<int> constraint plus allows ref struct; calling foreach on T). Kept trivial on purpose. */}
+
+### readonly ref struct
+
+Wie bei normalen Structs kannst du `readonly` davorschreiben. Dann müssen alle Felder `readonly` sein, und der Compiler spart sich Schutzkopien beim Aufruf von Methoden. `Span<T>` selbst ist ein `readonly ref struct`: Verweis und Länge eines Spans ändern sich nie, nur der Speicher dahinter.
+
+</Block>
+
+<Block n={5} title="Wie der Compiler Lebensdauern verfolgt">
+
+Das wichtigste Beispiel für die Regeln ist ein Span auf `stackalloc`-Speicher. Spiel zuerst durch, was passieren würde, wenn der Compiler ihn aus der Methode hinausließe.
+
+<StepPlayer script={danglingScript} />
+
+Das Gedankenexperiment zeigt, warum Laufzeitprüfungen hier nicht helfen: Der Bounds-Check besteht, die Adresse ist plausibel, und trotzdem liest der Code fremde Daten. Der Fehler muss also beim Kompilieren gefunden werden.
+
+### Woher ein Ausdruck seine Stufe bekommt
+
+Die Regeln aus der Spezifikation, auf das Wesentliche reduziert:
+
+- Ein Wert, dessen Typ **kein ref struct** ist, hat immer caller-context. Er darf überallhin.
+- Eine **lokale Variable** vom Typ ref struct übernimmt die Stufe ihres Initialisierers. `Span<int> s = new int[3];` bekommt caller-context, `Span<int> s = stackalloc int[3];` bekommt function-member. Der Compiler merkt sich das an der Variable, nicht am Typ.
+- Ein **Parameter** vom Typ ref struct hat caller-context, denn er kommt vom Aufrufer und gilt dort.
+- Ein **Verweis auf eine lokale Variable** (`ref x`) hat function-member. Ein Verweis auf ein Element eines Arrays oder ein Feld eines Objekts hat caller-context, weil das Objekt auf dem Heap liegt.
+- Ein **`ref`-Parameter** hat seit C# 11 den ref-safe-context return-only: Du darfst ihn per `ref` zurückgeben, aber nicht in ein ref-Feld eines anderen Parameters speichern.
+
+{/* TODO(verify): Rule summary against the C# 11 spec („Low level struct improvements“): locals take the safe-context of their initializer; ref/in parameters have ref-safe-context return-only; out parameters are implicitly scoped. */}
+
+Der folgende Ablauf zeigt die Entscheidung für sechs `return`-Anweisungen. Achte darauf, dass dieselbe Zeile `return s;` einmal erlaubt und einmal verboten ist.
+
+<StepPlayer script={escapeScript} />
+
+{/* TODO(verify): Error codes shown in the graph (CS8352, CS8168) in SharpLab with the current compiler. */}
+
+### Wenn Argumente sich gegenseitig gefährden
+
+Die schwierigste Regel betrifft Aufrufe mit mehreren Argumenten. Sieh dir diese Methode an:
+
+```csharp
+static void Copy(ref Span<int> target, Span<int> source) => target = source;
+
+Span<int> heap = new int[4];          // caller-context
+Span<int> stack = stackalloc int[4];  // function-member
+Copy(ref heap, stack);                // Fehler
+```
+
+`Copy` darf `source` nach `target` schreiben, beide haben aus ihrer Sicht caller-context. An der Aufrufstelle würde dadurch aber ein Span auf Stack-Speicher in `heap` landen, das länger leben darf. Der Compiler prüft deshalb an jeder Aufrufstelle, ob die Argumente sich gegenseitig etwas unterschieben könnten: Jedes `ref`-Argument eines ref-struct-Typs muss einen Wert mit der Stufe des kurzlebigsten Arguments aufnehmen können. Die Spezifikation nennt das „method arguments must match“. Gelöst wird es in der Signatur: Schreibst du `scoped Span<int> source`, verspricht `Copy`, `source` nirgends hinzuschreiben, und der Aufruf ist erlaubt. Dafür wird dann `target = source` innerhalb von `Copy` zum Fehler.
+
+{/* TODO(verify): Error code for the call (CS8350 „This combination of arguments … is disallowed because it may expose variables referenced by parameter … outside of their declaration scope“). */}
+
+</Block>
+
+<Block n={6} title="ref-Felder, scoped und [UnscopedRef]">
+
+Bis C# 10 konnte nur die Runtime selbst einen Verweis in einem Struct speichern, über den internen Typ `ByReference<T>`, den der JIT speziell behandelte. Seit C# 11 und .NET 7 darf jedes ref struct **ref-Felder** haben:
+
+```csharp
+public ref struct Counter
+{
+    private ref int _count;
+    public Counter(ref int count) => _count = ref count;
+    public void Increment() => _count++;
+}
+```
+
+Ein ref-Feld ist nur in einem ref struct erlaubt, denn sonst könnte der Verweis auf den Heap gelangen. Es darf `null` sein, prüfen lässt sich das mit `Unsafe.IsNullRef`. Mit `readonly` an verschiedenen Stellen legst du fest, ob der Verweis, der Wert dahinter oder beides unveränderlich ist: `readonly ref` erlaubt `= ref` nur im Konstruktor, `ref readonly` verbietet das Schreiben durch den Verweis. Ein `Counter`, der mit `ref n` erzeugt wurde, bekommt die Stufe von `ref n`: Zeigt er auf eine lokale Variable, darf er die Methode nicht verlassen.
+
+### scoped
+
+`scoped` verengt die Stufe ausdrücklich auf function-member. Du kannst es an Parameter und lokale Variablen schreiben, die `ref` sind oder einen ref-struct-Typ haben. Es hat zwei Seiten:
+
+- **In der Methode** darfst du den Wert nicht zurückgeben, nicht in einen `ref`-Parameter schreiben und nicht in ein Feld legen.
+- **Beim Aufrufer** zählt das Argument nicht mehr für „method arguments must match“. Er darf also auch Spans auf `stackalloc` übergeben, ohne andere Argumente zu gefährden.
+
+Einige Stellen sind seit C# 11 implizit `scoped`: `out`-Parameter und `this` in Instanzmethoden eines Structs.
+
+### [UnscopedRef]
+
+Das Attribut `[UnscopedRef]` aus `System.Diagnostics.CodeAnalysis` macht die Stufe genau eine Ebene weiter. Der häufigste Fall ist ein Struct, das einen Verweis auf eines seiner eigenen Felder herausgeben will:
+
+```csharp
+public struct Holder
+{
+    private int _value;
+    [UnscopedRef] public ref int Value => ref _value;
+}
+```
+
+Ohne das Attribut lehnt der Compiler `ref _value` ab, weil `this` in einem Struct implizit `scoped` ist. Mit ihm darf die Eigenschaft den Verweis zurückgeben. Der Preis: Ein Aufrufer, der `Holder` als lokale Variable hat, bekommt einen Verweis, der nur so lange gilt wie diese Variable, und der Compiler verfolgt das beim Aufrufer weiter.
+
+{/* TODO(verify): Error code without [UnscopedRef] (CS8170 „Struct members cannot return 'this' or other instance members by reference“). */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Die Fehlermeldung zeigt auf die falsche Stelle
+
+Die Meldungen zur Lebensdauer erscheinen oft an einer Stelle, die harmlos aussieht. Bei „method arguments must match“ trifft der Fehler den Aufruf, obwohl die Ursache in der Signatur der aufgerufenen Methode liegt. Die Lösung ist fast immer, in der Signatur `scoped` zu ergänzen, nicht beim Aufrufer zu tricksen.
+
+### Erst deklarieren, später stackalloc
+
+Ein ref-struct-Local bekommt seine Stufe von der Initialisierung. Bei `Span<byte> buf = default;` ist das caller-context. Weist du später `buf = stackalloc byte[64];` zu, verweigert der Compiler das, denn `buf` dürfte ja hinaus. Schreib entweder `stackalloc` direkt in die Initialisierung, gern mit dem Bedingungsoperator, oder deklariere die Variable als `scoped Span<byte> buf;`.
+
+### ref-Locals und Wachstum
+
+Ein ref-Local auf ein Element von `CollectionsMarshal.AsSpan(list)` oder auf einen Wert in einem `Dictionary` über `CollectionsMarshal.GetValueRefOrNullRef` ist nur so lange gültig, wie die Sammlung ihren internen Speicher nicht austauscht. Fügst du danach Elemente hinzu, zeigt der Verweis auf das alte Array. Das ist kein Speicherfehler, der GC hält das alte Array am Leben, aber deine Änderung geht verloren. Die Lebensdauerregeln des Compilers sehen das nicht, sie kennen nur Frames und Objekte, keine Invarianten einer Sammlung.
+
+### ref struct in async-Code
+
+Auch mit C# 13 darf ein Span kein `await` überleben. Teile solche Methoden in einen asynchronen Rahmen, der mit `Memory<T>` arbeitet, und eine synchrone Hilfsmethode, die einen Span bekommt. Das ist nicht nur eine Umgehung, sondern auch die empfohlene Struktur aus den Microsoft-Richtlinien zu `Memory<T>`.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Eigene ref structs lohnen sich in drei Situationen:
+
+- **Enumeratoren über Spans.** Ein Enumerator, der einen Span hält, muss selbst ein ref struct sein. Die Basisbibliothek macht das etwa für `Span<T>.Enumerator` und für das Aufteilen von Spans.
+- **Leser und Schreiber über Puffer.** `Utf8JsonReader` aus System.Text.Json ist ein ref struct, das einen `ReadOnlySpan<byte>` und eine Position hält und so JSON ohne Allokationen liest. Eigene Parser für Binärformate funktionieren genauso.
+- **Builder mit Stack-Puffer.** Ein Struct, das einen `Span<char>` aus `stackalloc` als Startpuffer nimmt und erst bei Bedarf auf ein gemietetes Array umsteigt, baut Strings ohne Heap-Allokation für den Normalfall.
+
+{/* TODO(verify): Utf8JsonReader is a ref struct (API docs: „public ref struct Utf8JsonReader“). */}
+
+Für Methoden gilt: Gib ref-Rückgaben nur heraus, wenn Aufrufer wirklich an Ort und Stelle ändern sollen, etwa in großen Arrays von Structs. Für die meisten APIs ist ein `ReadOnlySpan<T>`-Parameter die richtige Wahl, und mit `scoped` vor Parametern, die du nicht speicherst, machst du die API für Aufrufer mit `stackalloc` benutzbar.
+
+ref-Felder brauchst du selten direkt. Sie sind vor allem für Bibliotheksautoren gedacht, die Span-ähnliche Typen bauen. Wenn du in Anwendungscode mehrere Spans bündeln willst, reicht meistens ein ref struct mit Span-Feldern.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Die Regeln aus dieser Lektion sind fast vollständig Regeln der Sprache C#. Die Runtime sieht davon nur das Ergebnis:
+
+- **Kennzeichnung im IL.** Ein ref struct ist im IL ein gewöhnlicher Werttyp mit dem Attribut `IsByRefLikeAttribute`. Ältere Compiler, die es nicht kennen, hält der C#-Compiler mit einem zusätzlichen `[Obsolete]`-Attribut mit Fehlerstufe davon ab, den Typ zu benutzen.
+- **Prüfungen beim Typladen.** Die Runtime lehnt Typen ab, die ein byref-artiges Feld enthalten, ohne selbst byref-artig zu sein. So bleibt die Garantie auch für IL erhalten, das nicht aus C# stammt.
+- **GC-Info für Verweise.** Der JIT vermerkt für jede Stelle im Code, an der der GC anhalten kann, welche Stack-Slots und Register verwaltete Verweise enthalten, und unterscheidet dabei Objektverweise von inneren Verweisen. Für innere Verweise sucht der GC das umgebende Objekt.
+- **ref-Felder.** Seit .NET 7 meldet die Runtime die Unterstützung über `RuntimeFeature.ByRefFields`. Der Compiler erlaubt ref-Felder nur, wenn die Zielbibliothek diese Fähigkeit anbietet.
+- **Register statt Stack.** Kleine Structs, auch ref structs wie ein Span, kann der JIT in Einzelfelder zerlegen und in Registern halten. Der Span existiert dann nirgends im Speicher als zusammenhängender Wert.
+
+{/* TODO(verify): Exact [Obsolete] message („Types with embedded references are not supported in this version of your compiler.“) and whether newer compilers additionally emit CompilerFeatureRequired("RefStructs"); TypeLoadException for byref-like fields in non-byref-like types (class loader in dotnet/runtime); GC info distinguishes byrefs (GC_BYREF) from object refs; struct promotion applies to Span<T>. */}
+
+<Callout kind="version">
+  ref-Locals und ref-Rückgaben gibt es seit C# 7.0, `ref struct` seit C# 7.2, `= ref` seit C# 7.3.
+  ref-Felder, `scoped` und `[UnscopedRef]` kamen mit C# 11 und .NET 7. Interfaces für ref structs,
+  `allows ref struct` und ref structs in async-Methoden und Iteratoren kamen mit C# 13 und .NET 9.
+</Callout>
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Die Regeln lassen sich am besten am Compiler selbst ausprobieren. SharpLab zeigt Fehler sofort an, ohne dass du ein Projekt anlegen musst.
+
+{/* TODO(verify): Exactly three errors expected (FromStack, PassScoped, Caller) and their codes with the current compiler; Use() returns 2. */}
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein. Erwartet sind drei Fehler: das return in FromStack, das return in PassScoped und der Aufruf von Copy in Caller. Entfernst du [UnscopedRef], kommt ein vierter dazu. Schreib danach scoped vor den Parameter source von Copy: Der Fehler wandert vom Aufruf in die Methode Copy. Entferne zuletzt die fehlerhaften Zeilen und stelle die Ausgabe auf „C#“, um die Attribute zu sehen, die der Compiler an Counter und an scoped-Parameter hängt."
+  code={sharplabCode}
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="ref-struct"
+  questions={[
+    {
+      q: 'Was garantiert das Schlüsselwort ref struct?',
+      options: [
+        'Der Wert liegt immer im Stack-Frame und ist deshalb schneller',
+        'Der Wert gelangt nie auf den GC-Heap',
+        'Der Wert wird nie kopiert',
+      ],
+      correct: 1,
+      explanation:
+        'Die Garantie ist nur, dass der Wert nie auf den Heap gelangt. Ob er im Frame oder in Registern liegt, entscheidet der JIT, und kopiert wird er wie jedes Struct.',
+    },
+    {
+      q: 'ref int slot = ref Find(data, 7); slot = 70; Was ändert sich?',
+      options: ['Nur die Variable slot', 'Das Element im Array data'],
+      correct: 1,
+      explanation:
+        'slot ist ein Verweis auf das Array-Element. Eine Zuweisung mit = schreibt durch den Verweis. Nur = ref würde den Verweis selbst umbiegen.',
+    },
+    {
+      q: 'Span<int> s = new int[3]; return s; und Span<int> s = stackalloc int[3]; return s; Was gilt?',
+      options: ['Beides erlaubt', 'Beides verboten', 'Nur die Variante mit dem Array ist erlaubt'],
+      correct: 2,
+      explanation:
+        'Die lokale Variable übernimmt die Stufe ihres Initialisierers. Das Array lebt auf dem Heap (caller-context), stackalloc nur in diesem Frame (function-member).',
+    },
+    {
+      q: 'Warum darf ein ref struct in C# 12 keine lokale Variable einer async-Methode sein?',
+      options: [
+        'Weil async-Methoden auf einem anderen Thread laufen',
+        'Weil lokale Variablen einer async-Methode Felder der State Machine werden können, und die liegt dann auf dem Heap',
+      ],
+      correct: 1,
+      explanation:
+        'Variablen, die ein await überleben, werden Felder der State Machine. Ab C# 13 ist ein ref struct erlaubt, solange es kein await überlebt.',
+    },
+    {
+      q: 'Was bewirkt scoped vor einem Span-Parameter?',
+      options: [
+        'Der Span wird auf den Stack kopiert',
+        'Die Methode darf den Span nicht hinausgeben, dafür darf der Aufrufer auch Spans auf stackalloc übergeben',
+        'Der Span wird nach dem Aufruf ungültig gemacht',
+      ],
+      correct: 1,
+      explanation:
+        'scoped verengt die Lebensdauer auf function-member. Das ist ein Versprechen der Methode, das der Compiler prüft und das den Aufrufer entlastet.',
+    },
+    {
+      q: 'Ein Struct will mit ref _value einen Verweis auf sein eigenes Feld zurückgeben. Was ist nötig?',
+      options: ['Nichts, das ist immer erlaubt', 'Das Attribut [UnscopedRef] an der Eigenschaft oder Methode', 'Das Struct muss ein ref struct sein'],
+      correct: 1,
+      explanation:
+        'this ist in Structs implizit scoped. [UnscopedRef] macht es eine Stufe weiter, sodass der Verweis zurückgegeben werden darf.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Ein `ref struct` darf **nie auf den GC-Heap**: kein Boxing, keine Felder in Klassen oder normalen Structs, keine Arrays, kein Einfangen in Lambdas, kein Überleben eines `await`. Wo er stattdessen liegt, entscheidet der JIT.
+- `ref`-Locals und `ref`-Rückgaben sind **Adressen**. `=` schreibt durch sie hindurch, `= ref` biegt sie um.
+- Der Compiler verfolgt für jeden Ausdruck, **wie weit der Wert** (safe-context) und **wie weit ein Verweis darauf** (ref-safe-context) wandern darf. Ziel darf nie länger leben als Quelle.
+- Lokale ref-struct-Variablen **erben die Stufe ihres Initialisierers**: Ein Span auf ein Array darf zurückgegeben werden, einer auf `stackalloc` nicht.
+- Bei Aufrufen dürfen sich Argumente nicht gegenseitig kurzlebige Werte unterschieben („method arguments must match“). **`scoped`** in der Signatur löst das.
+- Seit C# 11 gibt es **ref-Felder**, `scoped` und `[UnscopedRef]`, seit C# 13 Interfaces, `allows ref struct` und ref structs in async-Methoden und Iteratoren.
+- Die Runtime sieht fast nichts davon: Sicherheit entsteht beim Kompilieren, die Runtime prüft nur das Typlayout und meldet innere Verweise an den GC.
+
+</Block>

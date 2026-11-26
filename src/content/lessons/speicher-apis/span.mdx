@@ -1,0 +1,324 @@
+---
+id: span
+title: Span<T> und Memory<T>
+summary: Wie Span<T> mit einem Verweis und einer Länge Ausschnitte aus Arrays, Strings, Stack- und nativem Speicher beschreibt, warum er deshalb nie auf den Heap darf und wann du stattdessen Memory<T> brauchst.
+status: draft
+dotnetVersion: '7+'
+sources:
+  - title: 'Stephen Toub: All About Span: Exploring a New .NET Mainstay (MSDN Magazine, Januar 2018)'
+    url: https://learn.microsoft.com/en-us/archive/msdn-magazine/2018/january/csharp-all-about-span-exploring-a-new-net-mainstay
+  - title: 'Memory<T> and Span<T> usage guidelines (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/memory-and-spans/memory-t-usage-guidelines
+  - title: 'Span<T> (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.span-1
+  - title: 'Memory<T> (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.memory-1
+  - title: 'ref struct types (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/ref-struct
+  - title: 'Quellcode: Span.cs in dotnet/runtime'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Span.cs
+  - title: 'Quellcode: Memory.cs in dotnet/runtime'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Memory.cs
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './span.steps';
+import targetsScript from './span-targets.steps';
+import layoutScript from './span-layout.steps';
+import { sharplabCode, benchmarkCode } from './span-verify';
+
+<Block n={1} title="Das Problem">
+
+Stell dir vor, du schreibst einen Parser für Zeilen wie `"12345,67890"`. Der naheliegende Code zerlegt die Zeile mit `Substring` und übergibt die Teile an `int.Parse`. Das funktioniert, kostet aber pro Zeile zwei neue Strings: zwei Allokationen, zwei Kopien, Arbeit für den GC. Und das nur, um Zeichen zu lesen, die schon im Speicher stehen.
+
+Der klassische Ausweg sind Überladungen mit Offset und Länge: `Parse(string s, int start, int length)`. Damit fängt das Problem aber erst an. Kommen die Daten als `char[]`, brauchst du eine zweite Überladung. Kommen sie aus einem Puffer, den du mit `stackalloc` auf dem Stack angelegt hast, oder aus nativem Speicher, den eine C-Bibliothek liefert, hast du nur einen Zeiger. Dann bleibt dir nur `unsafe` Code mit `char*`, ohne Bounds-Checks, und für verwaltete Arrays zusätzlich das Fixieren, damit der GC sie nicht unter dem Zeiger wegschiebt.
+
+Du hättest also gern einen Typ, der vier Dinge vereint:
+
+- Er beschreibt einen **zusammenhängenden Ausschnitt** von Elementen, egal ob dieser in einem Array, einem String, auf dem Stack oder in nativem Speicher liegt.
+- Er lässt sich **ohne Kopie und ohne Allokation** weiter zerschneiden.
+- Jeder Zugriff ist **bounds-geprüft** wie bei einem Array.
+- Er ist **so schnell wie ein Array-Zugriff**, nicht spürbar langsamer.
+
+Genau das ist `Span<T>`. Seit .NET Core 2.1 ist er Teil der Runtime, und ein großer Teil der Basisbibliothek wurde seitdem auf Spans umgestellt. Dieser Typ hat aber eine Eigenschaft, die ihn von allen anderen Typen unterscheidet: Er darf niemals auf dem Heap liegen. Warum das so ist und was du tust, wenn du ihn doch auf dem Heap brauchst, ist der zweite Teil dieser Lektion.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Ein `Span<T>` ist ein kleiner Wert aus genau zwei Teilen:
+
+1. **Ein verwalteter Verweis auf das erste Element** des Ausschnitts. Das ist dieselbe Art Verweis, die entsteht, wenn du `ref arr[2]` an eine Methode übergibst. Er darf mitten in ein Objekt zeigen, auf eine Stack-Adresse oder in nativen Speicher.
+2. **Eine Länge** als `int`.
+
+Alles andere folgt daraus. Ein Zugriff `span[i]` prüft `i` gegen die Länge und rechnet dann Verweis plus `i` mal Elementgröße. `Slice` rechnet einen neuen Verweis und eine neue Länge aus und liefert einen neuen Span. Es wird nie etwas kopiert, und auf dem Heap entsteht nichts. Der Span ist eine **Sicht** auf Speicher, der jemand anderem gehört.
+
+`ReadOnlySpan<T>` ist dasselbe mit einem Indexer, der nur `ref readonly T` liefert. Damit lassen sich auch Strings anschauen, die unveränderlich sind. Ein `Span<T>` lässt sich implizit in einen `ReadOnlySpan<T>` umwandeln, umgekehrt nicht.
+
+Der Haken am verwalteten Verweis: Er ist nur gültig, solange der Speicher dahinter lebt, und er kann vom GC nur dann verfolgt werden, wenn er auf dem Stack oder in einem Register liegt. Deshalb ist `Span<T>` ein `ref struct`: Der Compiler stellt sicher, dass ein Span nie in ein Feld einer Klasse, in eine Box oder in eine Closure gelangt. Für Ausschnitte, die auf dem Heap leben müssen, gibt es `Memory<T>`.
+
+<Callout kind="fehlannahme">
+  „Ein Span ist nur ein Zeiger mit Länge, also so unsicher wie `char*`.“ Nein: Jeder Zugriff wird
+  gegen die Länge geprüft, der GC kennt den Verweis und hält das Objekt dahinter am Leben, und der
+  Compiler verhindert, dass ein Span seinen Speicher überlebt. Unsicher wird es nur dort, wo du
+  selbst `unsafe` schreibst, etwa beim Erzeugen eines Spans aus einem nativen Zeiger.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das erste Beispiel legt ein Array an, erzeugt einen Span über das ganze Array und schneidet daraus einen kleineren heraus. Achte darauf, dass der Heap ab dem ersten Schritt unverändert bleibt, und auf den letzten Schritt: Dort scheitert ein Zugriff, der im Array noch gültig wäre.
+
+<StepPlayer script={script} />
+
+Die drei Wege `arr[2]`, `all[2]` und `mid[0]` führen zur selben Speicherstelle. Der Pfeil im Bild zeigt auf das Array-Objekt, der eigentliche Verweis im Span zeigt aber auf ein bestimmtes Element darin. Ein solcher Verweis in die Mitte eines Objekts heißt **innerer Zeiger** (interior pointer). Er ist der Schlüssel zu allem, was in den nächsten Abschnitten folgt.
+
+</Block>
+
+<Block n={4} title="Eine API für drei Arten von Speicher">
+
+Der eigentliche Gewinn von `Span<T>` liegt darin, dass Code, der einen Span entgegennimmt, nicht wissen muss, woher der Speicher kommt. Das folgende Beispiel ruft dieselbe Methode `Sum` dreimal auf: mit einem Ausschnitt aus einem String, mit einem Puffer auf dem Stack und mit nativem Speicher.
+
+<StepPlayer script={targetsScript} />
+
+Die Adressen im Bild sind erfunden, aber sie zeigen das Prinzip: Für `Sum` sieht jeder Aufruf gleich aus, nur die Adresse im Verweis liegt mal im GC-Heap, mal im Stack, mal außerhalb von beidem. Der JIT erzeugt für `Sum` einen einzigen Maschinencode für alle drei Fälle.
+
+{/* TODO(verify): Fictional address ranges are only illustrative; real stack and heap ranges differ per OS. */}
+
+Wie geht der GC damit um? Er findet beim Durchsuchen des Stacks einen verwalteten Verweis und prüft, ob die Adresse in einem Bereich des GC-Heaps liegt. Wenn ja, ermittelt er das Objekt, in dem sie liegt, und behandelt es als lebendig. Verschiebt er das Objekt beim Kompaktieren, passt er auch den inneren Verweis um denselben Betrag an. Zeigt der Verweis auf den Stack oder in nativen Speicher, gehört die Adresse zu keinem Objekt, und der GC lässt sie in Ruhe. Dein Code muss nichts davon wissen und nichts fixieren.
+
+{/* TODO(verify): How the GC maps an interior pointer to its containing object (brick table, gc.cpp find_object) and that byrefs outside the GC heap are ignored. */}
+
+Die drei Quellen haben aber unterschiedliche Regeln für die Lebensdauer:
+
+| Quelle                          | Wer garantiert, dass der Speicher lebt?               | Erzeugen                                       |
+| ------------------------------- | ----------------------------------------------------- | ---------------------------------------------- |
+| Array, String                   | der GC, solange ein Verweis existiert                 | `arr.AsSpan(…)`, `text.AsSpan(…)`, implizit    |
+| `stackalloc`                    | der Compiler, der den Span an den Frame bindet        | `Span<byte> b = stackalloc byte[n];`           |
+| nativer Speicher, fixierter Puffer | du selbst, mit `unsafe`                            | `new Span<byte>(ptr, length)`                  |
+
+Bei Strings gilt eine Besonderheit: `string.AsSpan()` liefert einen `ReadOnlySpan<char>`, weil Strings unveränderlich sind. Ein Schreibzugriff ist schon beim Kompilieren ausgeschlossen. Der Verweis zeigt dabei direkt auf die UTF-16-Zeichen im String-Objekt, wie die Lektion „Layout von Arrays und Strings“ sie beschreibt.
+
+Spans lassen sich auch umdeuten: `MemoryMarshal.Cast<byte, int>(bytes)` macht aus einem `Span<byte>` einen `Span<int>` über denselben Speicher. Das ist erlaubt, weil beide Elementtypen keine Verweise enthalten. Mehr dazu in „Unsafe und MemoryMarshal“.
+
+</Block>
+
+<Block n={5} title="Warum ein Span nicht auf den Heap darf">
+
+Jetzt zur ungewöhnlichsten Eigenschaft. Der folgende Ablauf zeigt den Span als Struct, so wie er in `Span.cs` in dotnet/runtime definiert ist, zum Vergleich die ältere Variante für .NET Framework und am Ende `Memory<T>`.
+
+<StepPlayer script={layoutScript} />
+
+{/* TODO(verify): 16 B for Span<T> and Memory<T> on x64 via Unsafe.SizeOf (see VerifyCard). */}
+
+Ein Span darf aus drei voneinander unabhängigen Gründen nicht auf dem Heap liegen.
+
+**Innere Zeiger auf dem Heap.** Der GC kann innere Zeiger verfolgen, aber das ist aufwendig: Er muss zu jeder Adresse erst das umgebende Objekt suchen. Auf dem Stack ist das vertretbar, weil die Zahl solcher Verweise klein ist und der GC den Stack ohnehin Frame für Frame durchgeht. Felder in Heap-Objekten dagegen findet der GC über die Beschreibung des Objekttyps, und diese Beschreibung kennt nur Verweise auf Objektanfänge. Die Runtime erlaubt verwaltete Verweise deshalb nur auf dem Stack, in Registern und in ref structs, die selbst nur dort leben.
+
+**Speicher, der vor dem Span stirbt.** Ein Span kann auf `stackalloc`-Speicher zeigen. Läge er in einem Heap-Objekt, könnte er den Frame überleben, zu dem dieser Speicher gehört, und später auf etwas ganz anderes zeigen. Der Compiler kann das nur verhindern, wenn er jeden Weg des Spans verfolgen kann. Ein Feld in einem Objekt, das irgendwer irgendwann liest, entzieht sich dieser Analyse.
+
+**Zerrissene Werte.** Ein Span besteht aus zwei Feldern und ist größer als ein Maschinenwort. Er wird also nicht atomar gelesen oder geschrieben. Läge er in einem Feld, auf das zwei Threads zugreifen, könnte ein Thread den neuen Verweis zusammen mit der alten, größeren Länge lesen. Dann würde der Bounds-Check gegen die falsche Länge prüfen, und aus einem harmlosen Datenrennen würde ein Zugriff außerhalb des Speichers. Auf dem Stack gehört der Span genau einem Thread, das Problem kann nicht auftreten.
+
+Daraus folgen die bekannten Einschränkungen: kein Span als Feld einer Klasse oder eines normalen Structs, kein Boxing, kein Einfangen in Lambdas, keine Verwendung über ein `await` hinweg. Wie der Compiler diese Regeln durchsetzt und was `scoped` damit zu tun hat, erklärt die Lektion „ref struct, ref-Locals und scoped“.
+
+</Block>
+
+<Block n={6} title="Ausschnitte, die auf den Heap dürfen">
+
+Viele Ausschnitte müssen länger leben als ein Methodenaufruf. Ein `Stream.ReadAsync` bekommt einen Puffer, wartet auf das Netzwerk und schreibt erst später hinein. Dazwischen liegt ein `await`, und lokale Variablen einer async-Methode landen in der State Machine, also unter Umständen auf dem Heap (siehe „Die async State Machine“). Ein Span kann das nicht überleben.
+
+Dafür gibt es `Memory<T>`. Es ist ein gewöhnliches `readonly struct` aus drei Feldern: einem Objektverweis auf den **Besitzer** des Speichers, einem Startindex und einer Länge. Weil der Objektverweis auf den Anfang eines Objekts zeigt, ist er für den GC ein ganz normaler Verweis. `Memory<T>` darf deshalb in Feldern, in Listen, in Closures und über `await` hinweg leben. `Slice` gibt es auch hier, es ändert nur Index und Länge.
+
+Zum Arbeiten mit den Daten holst du dir über die Eigenschaft `.Span` einen Span:
+
+```csharp
+static async Task<int> ReadAndSumAsync(Stream stream, Memory<byte> buffer)
+{
+    int read = await stream.ReadAsync(buffer);   // Memory über await hinweg
+    return Sum(buffer.Span.Slice(0, read));       // synchron: Span
+}
+
+static int Sum(ReadOnlySpan<byte> data) { /* … */ return 0; }
+```
+
+Was `.Span` tun muss, hängt vom Besitzer ab. `_object` kann ein Array sein, bei `ReadOnlyMemory<char>` auch ein String, oder ein `MemoryManager<T>`. Die Eigenschaft prüft deshalb erst, was sie vor sich hat, berechnet dann Startverweis und Länge und prüft die Grenzen. Bei einem `MemoryManager<T>` ruft sie zusätzlich die virtuelle Methode `GetSpan` auf. Das ist billig, aber nicht kostenlos, und es passiert bei jedem Zugriff auf `.Span` erneut.
+
+{/* TODO(verify): Exact type checks in Memory<T>.Span (string, array via RuntimeHelpers.ObjectHasComponentSize, MemoryManager<T>.GetSpan) in Memory.cs of the current release. */}
+
+### MemoryManager&lt;T&gt; für eigenen Speicher
+
+Willst du nativen Speicher, eine Speicher-gemappte Datei oder einen eigenen Pool als `Memory<T>` anbieten, leitest du von `MemoryManager<T>` ab. Die Klasse verlangt im Wesentlichen drei Dinge: `GetSpan()` liefert den Span über den verwalteten Speicher, `Pin` und `Unpin` fixieren ihn für Code, der einen Zeiger braucht, und `Dispose` gibt ihn frei. Der Manager selbst ist ein Objekt auf dem Heap, und genau auf ihn zeigt `_object` im `Memory<T>`.
+
+Eng verwandt ist `IMemoryOwner<T>`: ein Besitzer, der ein `Memory<T>` herausgibt und mit `Dispose` signalisiert, dass der Speicher zurückgegeben wird. `MemoryPool<T>.Shared.Rent` liefert so einen Besitzer. Wie Pools darunter arbeiten, zeigt „ArrayPool und Pooling“.
+
+### Die vier Typen im Überblick
+
+| Typ                    | Art               | Darf auf den Heap | Schreibzugriff | Typischer Einsatz                         |
+| ---------------------- | ----------------- | ----------------- | -------------- | ----------------------------------------- |
+| `Span<T>`              | `ref struct`      | nein              | ja             | synchrone Verarbeitung, Parameter         |
+| `ReadOnlySpan<T>`      | `ref struct`      | nein              | nein           | Parsen, Strings, konstante Daten          |
+| `Memory<T>`            | `struct`          | ja                | über `.Span`   | Puffer für async-I/O, Felder              |
+| `ReadOnlyMemory<T>`    | `struct`          | ja                | nein           | gespeicherte Ausschnitte aus Strings      |
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+### Memory&lt;T&gt; ist nicht so schnell wie Span&lt;T&gt;
+
+Eine verbreitete Annahme lautet: „`Memory<T>` ist dasselbe wie `Span<T>`, nur ohne Einschränkungen.“ Die Einschränkungen fehlen tatsächlich, aber jeder Zugriff auf die Daten führt über `.Span`, und das kostet jedes Mal eine Typprüfung und eine Berechnung. In einer Schleife wie `for (…) sum += memory.Span[i];` passiert das bei jedem Element. Hol dir den Span einmal vor der Schleife und arbeite mit ihm. Die Faustregel aus den Microsoft-Richtlinien: Synchrone Methoden nehmen `Span<T>` oder `ReadOnlySpan<T>` entgegen, `Memory<T>` brauchst du nur, wo der Ausschnitt eine Methode überleben muss.
+
+### Ein Span sieht keine Vergrößerung
+
+Ein Span auf ein Array bleibt an genau diesem Array hängen. Mit `CollectionsMarshal.AsSpan(list)` bekommst du einen Span über das interne Array einer `List<T>`. Wächst die Liste danach, legt sie ein neues, größeres Array an. Dein Span zeigt weiter auf das alte, und Änderungen landen dort, wo die Liste sie nie wieder liest. Der GC hält das alte Array am Leben, es gibt also keinen Absturz, nur still falsche Daten.
+
+### Memory über einen Methodenaufruf hinaus behalten
+
+Nimmt eine Methode ein `Memory<T>` entgegen, darf sie es nicht einfach in einem Feld speichern, wenn der Aufrufer davon ausgeht, dass er den Puffer danach zurückgeben darf, etwa an einen Pool. Die Richtlinien von Microsoft formulieren dafür Besitzregeln: Wer ein `IMemoryOwner<T>` hält, besitzt den Speicher, wer nur ein `Memory<T>` bekommt, leiht ihn für die Dauer des Aufrufs. Verstöße fallen erst auf, wenn zwei Stellen denselben gepoolten Puffer beschreiben.
+
+### stackalloc ohne Obergrenze
+
+`Span<byte> buf = stackalloc byte[length];` ist bequem, aber ein großes oder vom Benutzer gesteuertes `length` führt zu einer `StackOverflowException`, die sich nicht abfangen lässt. Das übliche Muster begrenzt die Größe und weicht sonst auf den Heap aus:
+
+```csharp
+Span<byte> buf = length <= 256 ? stackalloc byte[256] : new byte[length];
+buf = buf.Slice(0, length);
+```
+
+Die konkrete Grenze ist eine Abwägung, kein fester Wert. Details stehen in „stackalloc“.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Die Basisbibliothek bietet für fast jede Operation auf Strings und Puffern eine Span-Variante. Die wichtigsten Muster:
+
+- **Zerlegen ohne Teilstrings:** `text.AsSpan()`, dann `IndexOf`, `Slice`, `Trim`, `StartsWith` aus `MemoryExtensions`. Ein `ReadOnlySpan<char>` vergleicht sich mit `SequenceEqual` oder `Equals(…, StringComparison)` wie ein String.
+- **Parsen aus Spans:** `int.Parse(ReadOnlySpan<char>)`, `int.TryParse(…)`, ebenso für `double`, `DateTime`, `Guid` und viele andere. Seit .NET 7 bündelt das Interface `ISpanParsable<T>` dieses Muster.
+- **Formatieren in Spans:** `value.TryFormat(Span<char> destination, out int charsWritten, …)` schreibt direkt in deinen Puffer statt in einen neuen String. Das Interface dafür heißt `ISpanFormattable`.
+- **Direkt in UTF-8:** `Utf8Parser` und `Utf8Formatter` in `System.Buffers.Text` arbeiten auf `ReadOnlySpan<byte>`, ohne Umweg über UTF-16. Seit .NET 8 gibt es dafür zusätzlich `IUtf8SpanFormattable` und `IUtf8SpanParsable<T>` an den Zahlentypen. Das Suffix `u8` an einem String-Literal (`"GET "u8`) liefert seit C# 11 direkt einen `ReadOnlySpan<byte>`.
+- **Strings ohne Zwischenpuffer bauen:** `string.Create(length, state, (span, state) => …)` legt den String an und lässt dich seine Zeichen über einen Span füllen, bevor er sichtbar wird.
+
+{/* TODO(verify): Versions: ISpanParsable<T> (.NET 7), ISpanFormattable (.NET 6), IUtf8SpanFormattable and IUtf8SpanParsable<T> (.NET 8), u8 literals (C# 11). */}
+
+Für eigene APIs gilt: Nimm `ReadOnlySpan<T>` entgegen, wenn du nur liest, `Span<T>` für Ziele, in die du schreibst, und gib die Zahl geschriebener Elemente über `out int` zurück, statt Arrays zu liefern. Biete `Memory<T>` nur an, wenn die Methode asynchron ist oder den Puffer behalten muss. Ein Array lässt sich implizit in alle vier Typen umwandeln, Aufrufer verlieren also nichts.
+
+Ein Span ersetzt aber keine Datenstruktur. Er beschreibt immer nur einen festen, zusammenhängenden Bereich. Für wachsende Daten bleibt `List<T>` oder ein Puffer aus einem Pool zuständig, für nicht zusammenhängende Daten gibt es `ReadOnlySequence<T>`, das „System.IO.Pipelines“ benutzt.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Ohne Hilfe der Runtime wäre `Span<T>` nicht so schnell wie ein Array. Drei Bausteine sorgen dafür:
+
+- **Ein echter innerer Verweis als Feld.** Seit .NET 7 ist `_reference` ein `ref`-Feld, ein Sprachmittel von C# 11, das die Runtime direkt unterstützt. Vorher steckte an derselben Stelle der interne Typ `ByReference<T>`, den der JIT als Sonderfall behandelte und wie ein ref-Feld übersetzte. Für den Maschinencode ändert sich damit nichts, aber seit .NET 7 können auch eigene ref structs solche Felder haben.
+- **Indexer als Intrinsic.** Der JIT erkennt den Indexer von `Span<T>` und `ReadOnlySpan<T>` und erzeugt dafür direkt einen Vergleich mit der Länge und einen Speicherzugriff, wie beim Array.
+- **Bounds-Check-Elimination.** In einer Schleife `for (int i = 0; i < span.Length; i++)` und in `foreach` über einen Span kann der JIT beweisen, dass `i` im Bereich liegt, und lässt die Prüfung im Schleifenrumpf weg. Stephen Toub zeigt in „All About Span“, dass der erzeugte Assembler fast identisch mit dem für ein Array ist. Wann das gelingt und wann nicht, behandelt „Bounds-Check-Elimination“.
+
+Dazu kommt eine Optimierung des C#-Compilers: `static ReadOnlySpan<byte> Table => new byte[] { 1, 2, 3 };` alloziert kein Array. Der Compiler legt die Bytes in die Assembly, und der Span zeigt direkt auf diese Daten.
+
+{/* TODO(verify): Which element types the compiler supports for the static ReadOnlySpan<T> data optimization (byte, sbyte, bool always; other primitives via RuntimeHelpers.CreateSpan since .NET 7 / C# 11). */}
+
+<Callout kind="version">
+  `Span<T>` ist seit .NET Core 2.1 Teil der Runtime. Für .NET Framework und ältere .NET-Core-Versionen
+  gibt es ihn über das NuGet-Paket System.Memory, dort aber in einer Variante ohne
+  Runtime-Unterstützung, die einen Objektverweis und einen Byte-Abstand speichert und langsamer ist.
+  Das `ref`-Feld in `Span<T>` gibt es seit .NET 7 und C# 11, vorher `ByReference<T>`.
+</Callout>
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente: In SharpLab (Modus „Run“) siehst du Größe und Abstand der Werte, im Benchmark die Allokationen und die Kosten von `.Span`.
+
+{/* TODO(verify): Expected SharpLab output on x64: 16, 16, 8, 99, 4711. Expected benchmark allocations: ParseSubstring 64 B (two 5-char strings of 32 B each), all others none. Mean times not given on purpose. */}
+
+<VerifyCard
+  sharplab="Stelle SharpLab auf „Run“ und führe den Code aus. Erwartet auf 64-Bit: 16 Byte für Span und für Memory, ein Abstand von 8 Byte zwischen arr[0] und mid[0] (zwei int weiter), danach 99 und 4711. Kein Schritt legt ein neues Array oder einen neuen String an."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'ParseSubstring', allocated: '64 B' },
+    { method: 'ParseSpan', allocated: 'keine' },
+    { method: 'SumSpanOnce', allocated: 'keine' },
+    { method: 'SumMemorySpanEachTime', allocated: 'keine' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. ParseSubstring legt zwei kurze Strings an, ParseSpan nichts. Beide Summen allozieren nichts, SumMemorySpanEachTime ist aber langsamer, weil .Span bei jedem Element neu berechnet wird."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="span"
+  questions={[
+    {
+      q: 'int[] arr = new int[100]; Span<int> s = arr.AsSpan(10, 20); Was entsteht dabei auf dem Heap?',
+      options: ['Ein neues int[20] mit einer Kopie', 'Nichts, s ist ein Wert aus Verweis und Länge', 'Ein kleines Span-Objekt'],
+      correct: 1,
+      explanation:
+        'Ein Span ist ein ref struct aus einem Verweis auf arr[10] und der Länge 20. Er liegt im Frame, auf dem Heap entsteht nichts.',
+    },
+    {
+      q: 'Span<int> mid = arr.AsSpan(2, 3); Was passiert bei mid[3] = 1, wenn arr 6 Elemente hat?',
+      options: ['arr[5] wird 1', 'IndexOutOfRangeException'],
+      correct: 1,
+      explanation:
+        'Der Span prüft gegen seine eigene Länge 3. Dass arr[5] im Array noch existiert, spielt keine Rolle.',
+    },
+    {
+      q: 'Warum darf ein Span<T> kein Feld einer Klasse sein?',
+      options: [
+        'Weil Felder in Klassen höchstens 8 Byte groß sein dürfen',
+        'Weil sein innerer Verweis auf dem Heap nicht verfolgt werden kann, auf Stack-Speicher zeigen kann und zwischen Threads zerreißen könnte',
+        'Weil Spans immer gepinnt sind',
+      ],
+      correct: 1,
+      explanation:
+        'Innere Zeiger erlaubt die Runtime nur auf dem Stack. Außerdem könnte ein Span auf dem Heap seinen stackalloc-Speicher überleben, und Verweis und Länge könnten nicht atomar gelesen werden.',
+    },
+    {
+      q: 'Eine async-Methode soll in einen Puffer lesen und danach summieren. Welchen Parametertyp nimmt sie für den Puffer?',
+      options: ['Span<byte>', 'Memory<byte>'],
+      correct: 1,
+      explanation:
+        'Der Puffer muss das await überleben. Memory<byte> darf auf dem Heap liegen. Für die synchrone Summe danach holst du dir mit .Span einen Span.',
+    },
+    {
+      q: 'Welche Schleife ist schneller: sum += memory.Span[i] in jedem Durchlauf oder einmal var s = memory.Span und dann sum += s[i]?',
+      options: ['Beide gleich, Memory und Span sind gleich schnell', 'Die Variante mit einmal geholtem Span'],
+      correct: 1,
+      explanation:
+        '.Span prüft bei jedem Aufruf den Besitzertyp und die Grenzen. Einmal vor der Schleife geholt, bleibt nur der Indexer, dessen Prüfung der JIT oft entfernt.',
+    },
+    {
+      q: 'Was liefert "hallo".AsSpan()?',
+      options: ['Span<char> auf eine Kopie der Zeichen', 'ReadOnlySpan<char> direkt auf die Zeichen im String-Objekt'],
+      correct: 1,
+      explanation:
+        'Strings sind unveränderlich, deshalb gibt es nur einen ReadOnlySpan. Er zeigt ohne Kopie auf die Zeichen im String.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Ein `Span<T>` besteht aus einem **verwalteten Verweis auf das erste Element und einer Länge**, auf 64-Bit 16 Byte. Er beschreibt Speicher, der jemand anderem gehört.
+- Spans zeigen gleichermaßen in **Arrays, Strings, `stackalloc`-Puffer und nativen Speicher**. Code, der einen Span nimmt, funktioniert für alle vier.
+- `Slice` und `AsSpan` **kopieren nichts und allozieren nichts**. Jeder Zugriff wird gegen die Länge des Spans geprüft, nicht gegen die des Arrays.
+- Ein Span ist ein `ref struct` und **darf nie auf den Heap**: Innere Verweise sind dort nicht verfolgbar, Stack-Speicher könnte vor ihm sterben, und zwei Felder könnten zwischen Threads zerreißen.
+- `Memory<T>` speichert Besitzer, Index und Länge und **darf auf den Heap und über `await`**. Für die Arbeit an den Daten holst du dir einmal `.Span`.
+- Synchrone APIs nehmen `ReadOnlySpan<T>` oder `Span<T>`, `Memory<T>` nur, wo der Ausschnitt den Aufruf überleben muss.
+- JIT und Runtime behandeln Spans wie Arrays: Indexer als Intrinsic, wegfallende Bounds-Checks in Schleifen, seit .NET 7 mit echtem `ref`-Feld.
+
+</Block>

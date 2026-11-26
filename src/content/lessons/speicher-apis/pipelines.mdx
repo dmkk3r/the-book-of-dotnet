@@ -1,0 +1,382 @@
+---
+id: pipelines
+title: System.IO.Pipelines
+summary: Wie eine Pipe Puffer, Teilnachrichten und Gegendruck für dich verwaltet, was ReadOnlySequence und SequenceReader beim Parsen über Segmentgrenzen leisten und warum der Unterschied zwischen consumed und examined über Leistung und Endlosschleifen entscheidet.
+status: draft
+sources:
+  - title: 'System.IO.Pipelines in .NET (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/io/pipelines
+  - title: 'Work with Buffers in .NET: ReadOnlySequence und SequenceReader (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/standard/io/buffers
+  - title: 'David Fowler: System.IO.Pipelines: High performance IO in .NET (.NET Blog)'
+    url: https://devblogs.microsoft.com/dotnet/system-io-pipelines-high-performance-io-in-net/
+  - title: 'PipeOptions Class (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.io.pipelines.pipeoptions
+  - title: 'ReadOnlySequence<T> Struct (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.buffers.readonlysequence-1
+  - title: 'SequenceReader<T> Struct (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.buffers.sequencereader-1
+  - title: 'Quellcode: System.IO.Pipelines in dotnet/runtime'
+    url: https://github.com/dotnet/runtime/tree/main/src/libraries/System.IO.Pipelines
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './pipelines.steps';
+import sequenceScript from './pipelines-sequence.steps';
+import { sharplabCode, benchmarkCode } from './pipelines-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein Server empfängt über TCP Nachrichten, die jeweils mit einem Zeilenumbruch enden. Der erste Entwurf liest aus einem `Stream` und sucht nach `\n`:
+
+```csharp
+async Task ProcessLinesAsync(Stream stream)
+{
+    var buffer = new byte[1024];
+    await stream.ReadAsync(buffer, 0, buffer.Length);
+    ProcessLine(buffer);   // enthält das schon eine ganze Zeile?
+}
+```
+
+Dieser Code ist auf drei Arten falsch, und jede Korrektur macht ihn länger. TCP kennt keine Nachrichten, nur einen Bytestrom. Ein `ReadAsync` kann eine halbe Zeile liefern, drei Zeilen oder zweieinhalb. Du musst also den Rest einer unvollständigen Zeile aufheben und beim nächsten Lesen davor setzen. Eine Zeile kann länger als 1024 Byte sein, also brauchst du einen wachsenden Puffer. Und damit jede Verbindung nicht dauerhaft einen eigenen großen Puffer hält, willst du Puffer aus einem Pool leihen und zurückgeben.
+
+Am Ende hast du eine eigene kleine Pufferverwaltung: Arrays aus dem `ArrayPool`, Verschieben von Restbytes an den Anfang (also Kopieren), Vergrößern bei langen Zeilen (noch mal Kopieren), Indizes für „bis hier gelesen“ und „bis hier verarbeitet“. Das ist schwer richtig zu bekommen, und jeder Fehler äußert sich als verlorene oder doppelt verarbeitete Bytes unter Last. Dazu kommt ein Problem, das der einfache Code gar nicht sieht: Ist der Verarbeiter langsamer als das Netz, wächst der Puffer ohne Grenze.
+
+`System.IO.Pipelines` übernimmt genau diese Arbeit. Das ASP.NET-Core-Team hat die Bibliothek für Kestrel gebaut, David Fowler beschreibt ihre Motivation im .NET-Blog mit genau diesem Zeilenbeispiel. Dein Code beschreibt nur noch, wie eine Nachricht aussieht. Puffer, Restbytes, Pool und Gegendruck verwaltet die Pipe.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Eine `Pipe` ist ein Puffer zwischen zwei Parteien:
+
+1. **Der Writer füllt.** Er leiht sich mit `GetMemory` oder `GetSpan` Speicher **von der Pipe**, schreibt hinein, meldet mit `Advance(n)`, wie viel er geschrieben hat, und macht die Bytes mit `FlushAsync` für den Reader sichtbar.
+2. **Der Reader liest, ohne zu kopieren.** `ReadAsync` liefert **alle** bisher ungelesenen Bytes als `ReadOnlySequence<byte>`. Das sind die Segmente der Pipe selbst, keine Kopie.
+3. **Der Reader meldet zwei Positionen zurück.** Mit `AdvanceTo(consumed, examined)` sagt er: Alles vor `consumed` ist verarbeitet und darf freigegeben werden. Alles bis `examined` habe ich angesehen, und es reicht nicht, ich brauche mehr Daten.
+
+Unter der Haube besteht die Pipe aus einer verketteten Liste von **Segmenten**, Speicherblöcken aus einem `MemoryPool<byte>`. Der Writer schreibt in das letzte Segment, bis es voll ist, dann hängt die Pipe ein neues an. Der Reader gibt Segmente zurück, sobald `consumed` hinter ihnen liegt. Wie der Pool darunter funktioniert, zeigt „ArrayPool und Pooling“.
+
+Das Entscheidende ist Punkt 3. Weil der Reader immer alle ungelesenen Bytes bekommt, auch die, die er beim letzten Mal schon gesehen und nicht verbraucht hat, muss er sich keine Restbytes merken. Die Pipe hebt sie für ihn auf.
+
+<Callout kind="fehlannahme">
+  „`AdvanceTo(consumed, examined)`: examined heißt, die Daten sind verarbeitet.“ Nein: Verarbeitet
+  und freigegeben ist nur, was vor `consumed` liegt. Bytes zwischen `consumed` und `examined` bleiben
+  in der Pipe und kommen beim nächsten `ReadAsync` wieder. `examined` steuert nur, **wann** dieses
+  nächste `ReadAsync` zurückkehrt: erst, wenn hinter `examined` neue Bytes eingetroffen sind.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Der klassische Aufbau hat zwei Schleifen, die unabhängig voneinander laufen. Die eine füllt die Pipe aus einem Socket, die andere liest Zeilen aus der Pipe. Der folgende Ablauf zeigt beide nebeneinander. Achte auf Schritt 5: Dort wartet der Writer, obwohl der Socket Daten hätte.
+
+<StepPlayer script={script} />
+
+Die Schleifen dazu sind kurz. So sieht die Writer-Seite aus, angelehnt an das Beispiel in der Microsoft-Dokumentation:
+
+```csharp
+async Task FillPipeAsync(Socket socket, PipeWriter writer)
+{
+    while (true)
+    {
+        Memory<byte> memory = writer.GetMemory(512);      // mindestens 512 Byte
+        int read = await socket.ReceiveAsync(memory, SocketFlags.None);
+        if (read == 0) break;                             // Verbindung geschlossen
+        writer.Advance(read);
+
+        FlushResult result = await writer.FlushAsync();   // Gegendruck wirkt hier
+        if (result.IsCompleted) break;                    // Reader hat aufgehört
+    }
+    await writer.CompleteAsync();
+}
+```
+
+Der Socket schreibt direkt in den Speicher der Pipe. Es gibt keinen Zwischenpuffer, aus dem später kopiert wird. `GetMemory(512)` garantiert mindestens 512 Byte, kann aber mehr liefern, typischerweise den freien Rest des aktuellen Segments.
+
+Und die Reader-Seite:
+
+```csharp
+async Task ReadPipeAsync(PipeReader reader)
+{
+    while (true)
+    {
+        ReadResult result = await reader.ReadAsync();
+        ReadOnlySequence<byte> buffer = result.Buffer;
+
+        while (TryReadLine(ref buffer, out ReadOnlySequence<byte> line))
+            ProcessLine(line);
+
+        reader.AdvanceTo(buffer.Start, buffer.End);       // consumed, examined
+        if (result.IsCompleted) break;
+    }
+    await reader.CompleteAsync();
+}
+
+bool TryReadLine(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> line)
+{
+    SequencePosition? position = buffer.PositionOf((byte)'\n');
+    if (position == null) { line = default; return false; }
+
+    line = buffer.Slice(0, position.Value);
+    buffer = buffer.Slice(buffer.GetPosition(1, position.Value));   // hinter das \n
+    return true;
+}
+```
+
+Lies die Zeile `reader.AdvanceTo(buffer.Start, buffer.End)` genau. `TryReadLine` hat `buffer` nach jeder gefundenen Zeile vorne gekürzt. Nach der Schleife beginnt `buffer` also beim ersten Byte, das zu keiner vollständigen Zeile gehört. Das ist `consumed`. `buffer.End` als `examined` sagt: Ich habe bis zum Ende gesucht und kein weiteres `\n` gefunden, weck mich erst wieder, wenn neue Bytes kommen.
+
+Der Reader prüft `IsCompleted` erst **nach** der Verarbeitung. Auch das gehört zum Muster: Das letzte `ReadResult` kann noch Daten enthalten, und wer bei `IsCompleted` sofort abbricht, verliert sie.
+
+</Block>
+
+<Block n={4} title="ReadOnlySequence: Daten in Segmenten">
+
+`ReadOnlySequence<T>` ist das Gegenstück zu `ReadOnlySpan<T>` für Daten, die **nicht zusammenhängend** im Speicher liegen. Sie beschreibt eine Kette von Segmenten mit einer Start- und einer Endposition. Jedes Segment ist ein `ReadOnlySequenceSegment<T>` mit drei Eigenschaften: `Memory` (der Inhalt), `Next` (das nächste Segment) und `RunningIndex` (wie viele Elemente in allen Segmenten davor stehen). Eine Position ist ein `SequencePosition`, im Kern ein Paar aus Segment und Index darin.
+
+Der folgende Ablauf zeigt, wie die Lese-Schleife von oben eine Sequenz aus drei Segmenten durcharbeitet. Die Segmente sind zur Anschauung nur 8 Byte groß. Achte auf die zweite Zeile, die über eine Segmentgrenze reicht, und auf die beiden Positionen, die `AdvanceTo` bekommt.
+
+<StepPlayer script={sequenceScript} />
+
+Die wichtigsten Operationen einer Sequenz:
+
+- `Length` und `IsEmpty` beziehen sich auf alle Segmente zusammen. `Length` ist ein `long`, weil eine Sequenz größer als 2 GB sein kann.
+- `IsSingleSegment` sagt, ob alles in einem Segment liegt. Dann liefert `FirstSpan` die kompletten Daten als `ReadOnlySpan<T>`, und du kannst mit den normalen Span-Methoden arbeiten. Das ist der schnelle Pfad, und er ist der häufigste.
+- `Slice(start, end)` schneidet eine Teilsequenz heraus, ohne zu kopieren. `PositionOf(value)` findet das erste Vorkommen eines Werts, `GetPosition(offset, origin)` rechnet eine Position weiter.
+- `Start` und `End` sind die Positionen, die du an `AdvanceTo` zurückgibst. Positionen gelten nur für die Sequenz, aus der sie stammen, und ihre Teilsequenzen.
+- Mit `foreach` gehst du die Segmente als `ReadOnlyMemory<T>` durch. `ToArray()` kopiert alles in ein neues Array: bequem für Tests, im heißen Pfad meist ein Zeichen, dass etwas fehlt.
+
+{/* TODO(verify): SequencePosition internally stores an object and an int; ReadOnlySequence encodes the sequence kind in the high bits of the start/end integers (ReadOnlySequence.cs). FirstSpan available since .NET Core 3.0 or .NET 5. */}
+
+</Block>
+
+<Block n={5} title="SequenceReader: Parsen über Segmentgrenzen">
+
+`PositionOf` reicht für Zeilen. Für ein echtes Protokoll willst du Zahlen lesen, Trennzeichen überspringen und Präfixe vergleichen, egal wo die Segmentgrenzen liegen. Das leistet `SequenceReader<T>`, ein `ref struct`, das eine Sequenz von vorne nach hinten durchläuft und sich seine Position merkt.
+
+```csharp
+bool TryParseMessage(ref ReadOnlySequence<byte> buffer, out Message message)
+{
+    var reader = new SequenceReader<byte>(buffer);
+
+    if (!reader.TryReadBigEndian(out int length) ||    // 4 Byte Längenpräfix
+        reader.Remaining < length)
+    {
+        message = default;
+        return false;                                  // Nachricht unvollständig
+    }
+
+    ReadOnlySequence<byte> payload = reader.Sequence.Slice(reader.Position, length);
+    reader.Advance(length);
+
+    message = new Message(payload);
+    buffer = buffer.Slice(reader.Position);            // verbrauchten Teil abschneiden
+    return true;
+}
+```
+
+Das Muster ist dasselbe wie bei `TryReadLine`: Ist die Nachricht vollständig, wird sie herausgeschnitten und `buffer` gekürzt. Fehlen Bytes, bleibt `buffer` unverändert, und die äußere Schleife meldet mit `AdvanceTo(buffer.Start, buffer.End)`, dass mehr Daten nötig sind.
+
+Die wichtigsten Methoden:
+
+- `TryRead(out T value)` liest ein Element, `TryReadBigEndian` und `TryReadLittleEndian` lesen `short`, `int` oder `long` mit fester Bytereihenfolge (Erweiterungsmethoden für `SequenceReader<byte>`). Liegen die 4 Byte eines `int` auf zwei Segmente verteilt, setzt der Reader sie selbst zusammen.
+- `TryReadTo(out ReadOnlySequence<T> sequence, delimiter)` liest bis zu einem Trennzeichen. Es gibt auch eine Überladung mit `out ReadOnlySpan<T>`. Sie ist bequemer, muss aber kopieren, wenn das Ergebnis über eine Segmentgrenze reicht.
+- `IsNext(value)`, `AdvancePast(value)` und `TryAdvanceTo(delimiter)` prüfen und überspringen.
+- `UnreadSpan` ist der ungelesene Rest des aktuellen Segments. Wer die letzte Leistung braucht, arbeitet darauf mit Span-Methoden und fällt nur an Segmentgrenzen auf die allgemeinen Methoden zurück.
+
+{/* TODO(verify): SequenceReader<T>.TryReadTo(out ReadOnlySpan<T>, ...) copies into a new array when the result spans segments; TryReadBigEndian/TryReadLittleEndian exist for short, int, long in SequenceReaderExtensions. */}
+
+Weil `SequenceReader<T>` ein `ref struct` ist, kann er kein `await` überleben. Das ist kein Nachteil, sondern passt zum Muster: Geparst wird synchron in einer Hilfsmethode, gewartet wird nur in der äußeren Schleife. Warum das so sein muss, erklärt „ref struct, ref-Locals und scoped“.
+
+</Block>
+
+<Block n={6} title="Gegendruck und Optionen">
+
+Eine Pipe ohne Grenze würde bei einem langsamen Reader beliebig viele Segmente anfordern. Deshalb hat sie zwei Schwellen, die du über `PipeOptions` einstellst:
+
+- **`PauseWriterThreshold`**: Liegen mehr ungelesene Bytes in der Pipe, kehrt `FlushAsync` nicht zurück. Der Writer wartet.
+- **`ResumeWriterThreshold`**: Fällt die Menge durch `AdvanceTo` unter diesen Wert, wird das wartende `FlushAsync` fertig.
+
+Laut Dokumentation liegen die Standardwerte bei 64 KiB zum Pausieren und 32 KiB zum Fortsetzen. Die Lücke dazwischen ist Absicht: Mit nur einer Schwelle würde der Writer bei jeder kleinen Freigabe kurz loslaufen und sofort wieder anhalten. Mit `PauseWriterThreshold = 0` schaltest du den Gegendruck ganz ab.
+
+{/* TODO(verify): Default PauseWriterThreshold 65,536 and ResumeWriterThreshold 32,768 bytes, and that 0 disables back pressure (PipeOptions docs). */}
+
+Gegendruck ist der Mechanismus, der eine Pipe unter Last stabil hält. Während der Writer wartet, liest er nichts vom Socket. Der Empfangspuffer des Betriebssystems läuft voll, und TCP signalisiert dem Sender, langsamer zu senden. Der langsame Verbraucher bremst so über die ganze Kette bis zum Absender, statt den Speicher des Servers zu füllen. „Channels und Async Streams“ zeigt dasselbe Prinzip für Objekte statt Bytes.
+
+Weitere Optionen:
+
+- **`Pool`**: der `MemoryPool<byte>`, aus dem die Segmente kommen. Standard ist `MemoryPool<byte>.Shared`. Kestrel verwendet einen eigenen Pool.
+- **`MinimumSegmentSize`**: wie groß ein neues Segment mindestens ist.
+- **`ReaderScheduler` und `WriterScheduler`**: wo die Fortsetzungen von `ReadAsync` und `FlushAsync` laufen. Standard ist der ThreadPool. `PipeScheduler.Inline` führt sie direkt auf dem Thread aus, der die Gegenseite weckt. Das spart einen Wechsel, aber dann läuft dein Parser im Thread des Writers.
+- **`UseSynchronizationContext`**: ob ein vorhandener `SynchronizationContext` für die Fortsetzungen genutzt wird.
+
+{/* TODO(verify): Default MinimumSegmentSize 4096, default schedulers ThreadPool, UseSynchronizationContext default true (PipeOptions docs). */}
+
+</Block>
+
+<Block n={7} title="Stolperfallen">
+
+Die Microsoft-Dokumentation listet die typischen Fehler mit dem `PipeReader` ausdrücklich auf. Fast alle drehen sich um `AdvanceTo`.
+
+### AdvanceTo vergessen
+
+Nach jedem `ReadAsync` muss genau ein `AdvanceTo` folgen, bevor du wieder liest. Ein zweites `ReadAsync` ohne `AdvanceTo` dazwischen ist ein Fehler und führt zu einer Exception. Wer in einem frühen `return` oder einem `catch`-Zweig das `AdvanceTo` vergisst, bekommt diesen Fehler erst im seltenen Fehlerfall zu sehen.
+
+{/* TODO(verify): Exception type (InvalidOperationException) when calling ReadAsync twice without AdvanceTo on the default Pipe reader. */}
+
+### Den Puffer nach AdvanceTo benutzen
+
+Nach `AdvanceTo` gehören die freigegebenen Segmente wieder dem Pool. Eine `ReadOnlySequence`, ein Span daraus oder eine Zeile, die du dir in einem Feld gemerkt hast, zeigt dann auf Speicher, den der Writer gleich mit anderen Daten überschreibt. Die Dokumentation nennt das ausdrücklich einen Use after free. Es gibt keine Exception, nur falsche Daten. Brauchst du einen Teil länger, kopiere ihn vorher: `line.ToArray()`, `Encoding.UTF8.GetString(line)` oder in einen gepoolten Puffer.
+
+### examined zu weit vorne: Endlosschleife
+
+Ruft der Reader nach einer unvollständigen Nachricht `AdvanceTo(buffer.Start)` auf, steht `examined` gleich `consumed`. Die Pipe nimmt an, dass der Reader die vorhandenen Bytes noch gar nicht angesehen hat, und `ReadAsync` kehrt sofort mit denselben Bytes zurück. Der Reader findet wieder keine vollständige Nachricht, meldet wieder dasselbe, und die Schleife dreht sich mit voller CPU-Last, ohne auf neue Daten zu warten.
+
+### examined zu weit hinten: Daten bleiben liegen
+
+Der umgekehrte Fehler ist subtiler. Ein Reader verarbeitet pro Runde nur **eine** Nachricht und ruft dann `AdvanceTo(endOfMessage, buffer.End)` auf. Liegen im Puffer schon drei vollständige Nachrichten, hat er zwei davon als angesehen markiert, aber nicht verarbeitet. `ReadAsync` wartet nun auf neue Bytes, und die zwei Nachrichten bleiben liegen, bis der Sender wieder etwas schickt. Bei einem Protokoll mit Anfrage und Antwort kann das bedeuten: nie. Die Regel lautet deshalb: Verarbeite in einer Runde alles, was vollständig ist, und setze `examined` nur dann ans Ende, wenn wirklich nichts Vollständiges mehr übrig ist.
+
+### Ohne Grenze puffern
+
+Findet der Reader nie ein Ende, etwa weil ein Client eine endlose Zeile ohne `\n` schickt, wächst der ungelesene Teil immer weiter. Der Gegendruck hilft hier nicht, er hält nur den Writer an, und dann steht die Verbindung. Ein robuster Parser prüft deshalb `buffer.Length` gegen eine Höchstgröße für Nachrichten und bricht die Verbindung sonst ab.
+
+### Nicht abschließen
+
+`Complete` oder `CompleteAsync` auf beiden Seiten gibt die verbleibenden Segmente an den Pool zurück und signalisiert der Gegenseite das Ende. Fehlt es, bleiben Segmente geliehen. Bei einem `PipeReader.Create` über einen Stream schließt `Complete` außerdem den Stream, sofern du das nicht über `StreamPipeReaderOptions(leaveOpen: true)` abstellst.
+
+{/* TODO(verify): StreamPipeReaderOptions.LeaveOpen default false, i.e. Complete disposes the stream. */}
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Den größten Teil der Pipelines-Nutzung siehst du nie. Kestrel, der Webserver von ASP.NET Core, verbindet Sockets und HTTP-Parser über Pipes. Jede Verbindung ist dort ein `IDuplexPipe`, ein Paar aus `PipeReader` und `PipeWriter`. In ASP.NET Core bekommst du davon `HttpRequest.BodyReader` und `HttpResponse.BodyWriter` zu sehen, über die du den Body ohne `Stream` lesen und schreiben kannst. Auch SignalR baut auf diesen Typen auf.
+
+Für eigenen Code gibt es drei typische Einstiege:
+
+- **Über einen vorhandenen Stream:** `PipeReader.Create(stream)` und `PipeWriter.Create(stream)` legen eine Pipe-Schnittstelle über jeden `Stream`, etwa eine Datei, eine `SslStream` oder einen `NetworkStream`. Dein Parser bekommt so das bequeme Lesemodell, ohne dass du eine `Pipe` und eine Füllschleife selbst baust. Umgekehrt macht `reader.AsStream()` aus einem `PipeReader` einen `Stream` für APIs, die einen solchen verlangen.
+- **Eigene Pipe zwischen zwei Schleifen:** `new Pipe()` mit einer Füllschleife und einer Leseschleife, wie im Durchspielen. Das lohnt sich, wenn Empfangen und Verarbeiten wirklich entkoppelt laufen sollen.
+- **Mindestmenge lesen:** `ReadAtLeastAsync(minimumSize)` kehrt erst zurück, wenn mindestens so viele Bytes vorliegen. Bei Protokollen mit Längenpräfix spart das Runden, in denen der Reader nur feststellt, dass noch Bytes fehlen.
+
+{/* TODO(verify): PipeReader.ReadAtLeastAsync added in .NET 6; PipeReader.Create/PipeWriter.Create since .NET Core 3.0; SignalR uses IDuplexPipe. */}
+
+Wann lohnt sich das nicht? Wenn du eine Datei einmal komplett liest, ein kleines JSON-Dokument deserialisierst oder ein Protokoll ohnehin nur über eine fertige Bibliothek sprichst. Pipelines lohnt sich bei langen Verbindungen mit vielen Nachrichten, bei eigenen Binär- oder Textprotokollen und überall, wo Puffer pro Verbindung und Kopien messbar ins Gewicht fallen.
+
+In Konsolen- oder Bibliotheksprojekten ohne ASP.NET Core kommt der Namespace aus dem NuGet-Paket System.IO.Pipelines. `ReadOnlySequence<T>` und `SequenceReader<T>` liegen dagegen in der Basisbibliothek im Namespace `System.Buffers` und sind auch ohne Pipes nützlich, etwa für Daten, die in mehreren gepoolten Puffern liegen.
+
+{/* TODO(verify): System.IO.Pipelines is part of the ASP.NET Core shared framework but not of Microsoft.NETCore.App, so console apps need the NuGet package. */}
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+Pipelines ist eine reine Bibliothek, die Runtime kennt keine Sonderfälle dafür. Ihre Leistung kommt aus drei Bausteinen, die andere Lektionen im Detail erklären.
+
+**Keine Allokation pro Lesen.** `ReadAsync` und `FlushAsync` liefern `ValueTask<ReadResult>` beziehungsweise `ValueTask<FlushResult>`. Liegen schon Daten bereit, ist das Ergebnis sofort fertig und es entsteht kein `Task`-Objekt. Muss gewartet werden, stützt sich die Pipe auf eigene, wiederverwendbare Objekte statt auf ein neues `Task` pro Aufruf. Das Prinzip dahinter erklärt „ValueTask und IValueTaskSource“.
+
+{/* TODO(verify): The default Pipe reader/writer implement IValueTaskSource<ReadResult>/IValueTaskSource<FlushResult> and reuse one awaitable per side (Pipe.cs, PipeAwaitable). */}
+
+**Gepoolte Segmente.** Die Segmente kommen aus einem `MemoryPool<byte>`, die Segmentobjekte selbst hält die Pipe ebenfalls in einem kleinen Vorrat. Im eingeschwungenen Zustand entsteht pro Nachricht nichts auf dem Heap, was der GC später einsammeln müsste.
+
+{/* TODO(verify): Pipe keeps a small pool of BufferSegment objects (segment pool size) in Pipe.cs. */}
+
+**Spans für die eigentliche Arbeit.** Am Ende landet jede Verarbeitung bei `ReadOnlySpan<byte>`: `FirstSpan` im einfachen Fall, `UnreadSpan` im `SequenceReader`. Damit greifen alle Optimierungen, die der JIT für Spans hat, inklusive vektorisierter Suche in `IndexOf`, auf die sich `PositionOf` stützt. Was ein Span ist und warum er so schnell ist, steht in „Span&lt;T&gt; und Memory&lt;T&gt;“.
+
+Für die Synchronisierung zwischen Writer und Reader verwendet die Pipe intern eine Sperre. Writer und Reader dürfen deshalb auf verschiedenen Threads laufen, aber jede Seite für sich darf nur von **einem** Aufrufer gleichzeitig benutzt werden. Zwei Tasks, die parallel in denselben `PipeWriter` schreiben, brauchen eine eigene Abstimmung.
+
+{/* TODO(verify): Pipe uses a lock object (_sync) for state shared between reader and writer; concurrent use of one side is not supported. */}
+
+<Callout kind="version">
+  System.IO.Pipelines erschien mit .NET Core 2.1 als NuGet-Paket. `PipeReader.Create` und
+  `PipeWriter.Create` für Streams kamen mit .NET Core 3.0 hinzu, `ReadAtLeastAsync` mit .NET 6. Die
+  Grundbegriffe (`GetMemory`, `Advance`, `FlushAsync`, `ReadAsync`, `AdvanceTo`) sind seit der
+  ersten Version gleich geblieben.
+</Callout>
+
+{/* TODO(verify): Version numbers in the callout above against the "Applies to" tables on Microsoft Learn. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Das erste Experiment schickt die Zeilen aus dem Durchspielen in drei Stücken durch eine Pipe und zeigt, was jedes `ReadAsync` sieht. Der Benchmark vergleicht das zeilenweise Lesen mit `StreamReader` und mit `PipeReader`.
+
+{/* TODO(verify): Expected console output (each ReadAsync sees the unread rest including the partial line) and benchmark allocations: StreamReaderLines allocates one string per line (10,000 strings) plus its buffers, PipeReaderLines only a small constant amount for the reader. */}
+
+<VerifyCard
+  sharplab="Das Beispiel braucht das Paket System.IO.Pipelines. Läuft es in SharpLab nicht, führe es als Konsolenanwendung aus (dotnet add package System.IO.Pipelines). Erwartet: Jedes ReadAsync meldet alle noch ungelesenen Bytes, auch die halbe Zeile aus dem vorigen Stück. Die Zeilen PING, ECHO hi und TIME 1 erscheinen vollständig, obwohl ECHO hi und TIME 1 jeweils auf zwei Stücke verteilt ankommen."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  note="StreamReaderLines erzeugt für jede Zeile einen String und muss die Bytes erst nach UTF-16 dekodieren. PipeReaderLines zählt direkt auf den Bytes und alloziert pro Zeile nichts. Die genauen Werte hängen von .NET-Version und Segmentgröße ab, achte auf die Größenordnung in der Spalte Allocated."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="pipelines"
+  questions={[
+    {
+      q: 'Was liefert PipeReader.ReadAsync im Buffer des ReadResult?',
+      options: ['Nur die Bytes, die seit dem letzten ReadAsync neu geschrieben wurden', 'Alle ungelesenen Bytes, auch die, die beim letzten Mal nicht verbraucht wurden', 'Eine Kopie der Daten in einem neuen Array'],
+      correct: 1,
+      explanation:
+        'Alles ab der letzten consumed-Position kommt wieder, ohne Kopie, direkt aus den Segmenten der Pipe. Deshalb muss der Reader keine Restbytes selbst aufheben.',
+    },
+    {
+      q: 'Der Reader ruft AdvanceTo(consumed, examined) mit consumed vor einer halben Zeile und examined am Ende auf. Was passiert mit der halben Zeile?',
+      options: ['Sie wird verworfen', 'Sie bleibt in der Pipe und kommt beim nächsten ReadAsync wieder'],
+      correct: 1,
+      explanation:
+        'Nur was vor consumed liegt, ist freigegeben. examined sagt nur, dass ReadAsync erst bei neuen Bytes zurückkehren soll.',
+    },
+    {
+      q: 'Ein Reader findet keine vollständige Nachricht und ruft AdvanceTo(buffer.Start) auf. Was ist die Folge?',
+      options: ['ReadAsync wartet auf neue Daten', 'ReadAsync kehrt sofort mit denselben Bytes zurück, die Schleife dreht leer'],
+      correct: 1,
+      explanation:
+        'Mit nur einem Argument ist examined gleich consumed. Die Pipe glaubt, die Bytes seien noch nicht angesehen, und liefert sie sofort wieder.',
+    },
+    {
+      q: 'Was passiert, wenn mehr als PauseWriterThreshold Bytes ungelesen in der Pipe liegen?',
+      options: ['FlushAsync wirft eine Exception', 'FlushAsync kehrt erst zurück, wenn der Reader genug freigegeben hat', 'Die ältesten Bytes werden verworfen'],
+      correct: 1,
+      explanation:
+        'Das ist Gegendruck. Der Writer wartet ohne Thread, bis die ungelesene Menge unter ResumeWriterThreshold fällt.',
+    },
+    {
+      q: 'Du merkst dir eine Zeile als ReadOnlySequence<byte> in einem Feld und rufst danach AdvanceTo auf. Darfst du sie später lesen?',
+      options: ['Ja, die Sequenz hält ihre Segmente am Leben', 'Nein, die Segmente können schon an den Pool zurückgegangen und überschrieben sein'],
+      correct: 1,
+      explanation:
+        'Nach AdvanceTo gehört der freigegebene Speicher wieder der Pipe. Was länger leben soll, muss vorher kopiert werden.',
+    },
+    {
+      q: 'Das letzte ReadResult hat IsCompleted = true und enthält noch 30 Byte. Was ist richtig?',
+      options: ['Sofort aus der Schleife springen', 'Erst die 30 Byte verarbeiten, dann AdvanceTo, dann die Schleife verlassen'],
+      correct: 1,
+      explanation:
+        'IsCompleted heißt nur, dass der Writer nichts mehr schreibt. Die Daten im letzten Puffer gehören noch dazu und gingen sonst verloren.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Eine `Pipe` übernimmt die **Pufferverwaltung** für Bytestrom-Protokolle: Speicher aus einem Pool, Restbytes unvollständiger Nachrichten, Freigabe und Gegendruck.
+- Der Writer schreibt mit `GetMemory`/`GetSpan` und `Advance` **direkt in den Speicher der Pipe**, `FlushAsync` macht die Bytes sichtbar.
+- `ReadAsync` liefert **alle ungelesenen Bytes** als `ReadOnlySequence<byte>`, eine Kette von Segmenten ohne Kopie. Im häufigen Fall `IsSingleSegment` arbeitest du mit `FirstSpan`.
+- `AdvanceTo(consumed, examined)`: **consumed** gibt frei, **examined** steuert nur, wann `ReadAsync` wieder zurückkehrt. Zu weit vorne gibt eine Endlosschleife, zu weit hinten bleiben Nachrichten liegen.
+- Nach `AdvanceTo` ist der alte Puffer **tabu**. Was länger leben soll, wird vorher kopiert.
+- `PauseWriterThreshold` und `ResumeWriterThreshold` bremsen den Writer, bis der Reader aufholt. Das hält den Speicher unter Last begrenzt und bremst über TCP den Sender.
+- `SequenceReader<T>` parst über Segmentgrenzen hinweg, `PipeReader.Create` und `PipeWriter.Create` bringen das Modell auf jeden `Stream`.
+
+</Block>

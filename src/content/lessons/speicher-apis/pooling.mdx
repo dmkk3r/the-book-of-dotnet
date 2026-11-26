@@ -1,0 +1,316 @@
+---
+id: pooling
+title: ArrayPool und Pooling
+summary: Wie ArrayPool<T>.Shared Arrays ausleiht und zurücknimmt, welche Regeln der Vertrag von Rent und Return hat und wann ein Pool mehr kostet, als er spart.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'ArrayPool<T> (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.buffers.arraypool-1
+  - title: 'ArrayPool<T>.Rent (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.buffers.arraypool-1.rent
+  - title: 'MemoryPool<T> (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.buffers.memorypool-1
+  - title: 'Objektwiederverwendung mit ObjectPool in ASP.NET Core (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/aspnet/core/performance/objectpool
+  - title: 'Quellcode: SharedArrayPool.cs (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Buffers/SharedArrayPool.cs
+  - title: 'Quellcode: Utilities.cs mit den Größenklassen (dotnet/runtime)'
+    url: https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Buffers/Utilities.cs
+  - title: 'Stephen Toub: Performance Improvements in .NET 8'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './pooling.steps';
+import gcScript from './pooling-gc.steps';
+import lifecycleScript from './pooling-lifecycle.steps';
+import { sharplabCode, benchmarkCode } from './pooling-verify';
+
+<Block n={1} title="Das Problem">
+
+Ein Webserver liest pro Anfrage den Body in einen Puffer, ein Kompressor braucht pro Datei ein Arbeitsarray, ein Serializer pro Nachricht einen Zwischenspeicher. All diese Arrays haben dasselbe Schicksal: Sie werden angelegt, ein paar Millisekunden benutzt und dann weggeworfen. Für kleine Arrays ist das in Ordnung, dafür ist Gen0 gebaut. Bei großen Arrays geht diese Rechnung nicht mehr auf.
+
+Ab 85.000 Byte landet ein Array nicht in Gen0, sondern direkt im Large Object Heap. Der LOH wird nur bei vollen Gen2-Collections aufgeräumt, und die sind teuer. Ein Puffer von 128 KB pro Anfrage bedeutet also: Jede Anfrage hinterlässt 128 KB Müll an der Stelle des Heaps, die am seltensten aufgeräumt wird. Die Lektion „LOH, POH und Non-GC-Heap“ beschreibt diesen Mechanismus genauer.
+
+<StepPlayer script={gcScript} />
+
+Die Idee eines Pools ist so alt wie die Speicherverwaltung selbst: Statt den Puffer wegzuwerfen, gibst du ihn an eine zentrale Stelle zurück, und die nächste Anfrage leiht ihn sich von dort. Aus Tausenden Allokationen wird eine Handvoll. Der Preis ist, dass die automatische Speicherverwaltung für diese Arrays aufhört: Du bist wieder selbst dafür verantwortlich, wann ein Puffer frei ist, mit allen Fehlern, die man aus C kennt.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Ein Array aus einem Pool ist ein ganz gewöhnliches `T[]` auf dem verwalteten Heap. Der GC behandelt es wie jedes andere Objekt. Neu ist nur ein **Vertrag** zwischen dir und dem Pool:
+
+1. **`Rent(n)` liefert mindestens `n` Elemente, oft mehr.** Der Pool arbeitet mit Größenklassen und rundet auf. Die gewünschte Länge musst du selbst mitführen.
+2. **Der Inhalt ist beliebig.** Ein geliehenes Array kann Daten des vorigen Benutzers enthalten oder, frisch angelegt, gar nicht genullt sein.
+3. **`Return` überträgt das Eigentum zurück.** Danach darfst du das Array nicht mehr anfassen, und du darfst es genau einmal zurückgeben.
+4. **Vergessen ist erlaubt, doppelt nicht.** Ein Array, das nie zurückkommt, sammelt der GC normal ein. Ein Array, das zweimal zurückkommt, haben später zwei Besitzer gleichzeitig.
+
+Der Pool prüft nichts davon. Er kann es auch nicht, denn ein `byte[]` trägt keine Information darüber, wer es gerade benutzt.
+
+<Callout kind="fehlannahme">
+  „Rent(100) gibt mir ein Array mit genau 100 Elementen.“ Nein. Die Dokumentation verspricht nur
+  „mindestens“, und `ArrayPool<T>.Shared` liefert für 100 tatsächlich ein Array der Länge 128. Wer
+  danach mit `buf.Length` rechnet, verarbeitet 28 Elemente zu viel, im schlimmsten Fall mit Daten
+  eines früheren Aufrufs.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das Beispiel kopiert zweimal Eingabedaten in einen geliehenen Puffer und schickt ihn weiter. Es enthält einen typischen Fehler: In Zeile 5 wird das ganze Array verschickt statt nur des benutzten Teils. Achte auf die Adresse des Arrays im zweiten Aufruf und darauf, was nach dem zweiten `CopyTo` noch darin steht.
+
+<StepPlayer script={script} />
+
+Drei Beobachtungen nimmst du mit. Erstens lebt der Pool-Cache selbst auf dem Heap und gehört zum Thread, nicht zum Aufruf. Zweitens kommt beim zweiten `Rent` exakt dasselbe Objekt zurück, das ist der ganze Gewinn. Drittens bleibt nach `Return` jeder alte Verweis gültig: Die Runtime würde dich nicht daran hindern, weiter hineinzuschreiben.
+
+</Block>
+
+<Block n={4} title="Wie ArrayPool<T>.Shared aufgebaut ist">
+
+`ArrayPool<T>.Shared` ist eine statische Instanz pro Elementtyp. Ein `ArrayPool<byte>.Shared` und ein `ArrayPool<char>.Shared` sind also zwei getrennte Pools. Die Implementierung heißt `SharedArrayPool<T>` und ist auf zwei Ziele optimiert: Ausleihen ohne Locks im häufigen Fall und begrenzter Speicherverbrauch im seltenen Fall.
+
+### Größenklassen
+
+Der Pool verwaltet Arrays in Buckets, deren Größen Zweierpotenzen sind: 16, 32, 64, 128 und so weiter. Aus der angeforderten Länge berechnet er den Bucket mit einer kleinen Bit-Rechnung (`Log2((n - 1) | 15) - 3`). Daraus ergibt sich:
+
+| Anforderung          | Bucket | Gelieferte Länge |
+| -------------------- | ------ | ---------------- |
+| `Rent(1)` bis `Rent(16)` | 0  | 16               |
+| `Rent(17)`           | 1      | 32               |
+| `Rent(100)`          | 3      | 128              |
+| `Rent(4097)`         | 9      | 8192             |
+| `Rent(0)`            | keiner | leeres Array, nicht gepoolt |
+
+Zweierpotenzen verschwenden im schlimmsten Fall knapp die Hälfte, haben aber einen großen Vorteil: Wenige Buckets decken einen riesigen Bereich ab, und ein Array einer Größe passt für alle Anfragen zwischen der halben und der vollen Größe. In aktuellen Versionen gibt es 27 Buckets, der größte hält Arrays mit 2<sup>30</sup> Elementen. Größere Anfragen bedient der Pool mit einem frisch allozierten Array in genau der angeforderten Länge und nimmt es beim `Return` nicht wieder auf.
+
+{/* TODO(verify): NumBuckets = 27 (largest bucket 1024 * 1024 * 1024 elements) since which .NET version; earlier versions pooled only up to 1024 * 1024 elements (17 buckets). */}
+
+### Zwei Ebenen: Thread-Slot und Partitionen
+
+Für jeden Bucket hat jeder Thread genau **einen** eigenen Slot, gespeichert in einer `[ThreadStatic]`-Variablen. `Rent` schaut zuerst dort nach. Weil kein anderer Thread auf diesen Slot zugreift, braucht dieser Weg weder Lock noch atomare Operation. `Return` legt das Array ebenfalls zuerst in den Thread-Slot. War der schon belegt, wandert das ältere Array eine Ebene tiefer, damit das zuletzt benutzte und damit wahrscheinlich noch im CPU-Cache liegende Array griffbereit bleibt.
+
+Die zweite Ebene sind Partitionen pro Bucket, standardmäßig so viele, wie der Rechner Prozessoren hat. Jede Partition ist ein kleiner Stapel mit Platz für 32 Arrays und durch einen eigenen Lock geschützt. Ein Thread beginnt bei der Partition, die zu seinem aktuellen Prozessor passt, und probiert bei Bedarf die anderen durch. So verteilen sich Zugriffe mehrerer Threads auf verschiedene Locks. Sind alle Partitionen voll, wird ein zurückgegebenes Array einfach fallen gelassen.
+
+{/* TODO(verify): Partition count = Environment.ProcessorCount (configurable via DOTNET_SYSTEM_BUFFERS_SHAREDARRAYPOOL_MAXPARTITIONCOUNT), 32 arrays per partition (DOTNET_SYSTEM_BUFFERS_SHAREDARRAYPOOL_MAXARRAYSPERPARTITION), partitions protected by Monitor locks, start partition chosen from the current processor id. */}
+
+Diese Zweiteilung erklärt ein Detail, das in asynchronem Code wichtig ist. Leihst du ein Array auf Thread A und gibst es nach einem `await` auf Thread B zurück, landet es im Slot von Thread B. Das ist völlig korrekt, nur trifft das nächste `Rent` auf Thread A seinen Slot leer an und muss in die Partitionen.
+
+</Block>
+
+<Block n={5} title="Der Vertrag von Rent und Return">
+
+Alles, was der Pool nicht prüft, musst du im Code sicherstellen. Die folgende Zustandsmaschine zeigt das Leben eines einzelnen Arrays, einschließlich der Pfade, die zu Fehlern führen.
+
+<StepPlayer script={lifecycleScript} />
+
+Daraus ergeben sich die Regeln für jede Stelle, an der du `Rent` aufrufst:
+
+- **Return in `finally`.** Wirft der Code zwischen `Rent` und `Return` eine Exception, ist das Array zwar nicht verloren, der GC räumt es auf. Aber eine Exception, die regelmäßig auftritt, macht den Pool wirkungslos.
+- **Genau ein Besitzer.** Wer ein Array zurückgibt, setzt seinen Verweis am besten gleich auf `null`. Bei Feldern in Klassen, die ein Array über mehrere Methoden halten, ist das die wichtigste Absicherung gegen doppeltes `Return`.
+- **Die Länge selbst mitführen.** Arbeite mit `buf.AsSpan(0, length)` und nie mit `buf.Length`.
+- **Nur eigene Arrays zurückgeben.** `Shared` akzeptiert nur Arrays, deren Länge exakt einer Größenklasse entspricht. Ein `new byte[100]` quittiert `Return` mit einer `ArgumentException`. Ein selbst angelegtes `new byte[128]` dagegen nimmt der Pool kommentarlos an, denn er führt keine Liste seiner Arrays.
+
+### clearArray und Datenlecks
+
+`Return` hat einen zweiten Parameter, `clearArray`, mit dem Standardwert `false`. Der Pool leert zurückgegebene Arrays also nicht. Das ist eine bewusste Entscheidung: Leeren kostet Zeit proportional zur Größe, und die meisten Benutzer überschreiben den Puffer ohnehin vollständig. Für Arrays, die Passwörter, Schlüssel oder personenbezogene Daten enthielten, ist `Return(buf, clearArray: true)` aber Pflicht. Der Pool ist ein prozessweit geteilter Speicher, und jeder andere Code im Prozess kann das Array als Nächstes bekommen.
+
+Umgekehrt bedeutet das auch: Ein frisch geliehenes Array kann Müll enthalten. Selbst ein neu angelegtes Array ist nicht sicher genullt, weil der Pool es für primitive Elementtypen mit `GC.AllocateUninitializedArray` anlegt. Die Dokumentation von `Rent` sagt dazu knapp, das Array sei möglicherweise nicht mit Nullen initialisiert.
+
+Für Arrays mit Verweisen, etwa `ArrayPool<string>`, kommt ein weiterer Aspekt hinzu: Solange ein zurückgegebenes Array noch Verweise enthält, hält es die referenzierten Objekte am Leben. Hier ist `clearArray: true` nicht nur eine Frage der Sicherheit, sondern auch des Speichers.
+
+</Block>
+
+<Block n={6} title="Andere Pools">
+
+`ArrayPool<T>.Shared` ist der Standard für Puffer, aber nicht der einzige Pool in .NET.
+
+**`ArrayPool<T>.Create()`** liefert einen eigenen, privaten Pool mit konfigurierbarer Höchstlänge und Anzahl der Arrays pro Bucket. Er hat keine Thread-Slots, sondern schützt jeden Bucket mit einem Lock. Sinnvoll ist er, wenn eine Komponente ihre Puffer von denen des restlichen Prozesses trennen will, etwa um sie gezielt freizugeben oder um sehr große Arrays zu poolen.
+
+{/* TODO(verify): ArrayPool<T>.Create() defaults (maxArrayLength 1024 * 1024, maxArraysPerBucket 50), implementation ConfigurableArrayPool with a SpinLock per bucket. */}
+
+**`MemoryPool<T>`** verleiht keine Arrays, sondern Besitzerobjekte vom Typ `IMemoryOwner<T>`. Ihr Property `Memory` liefert den Puffer als `Memory<T>`, und `Dispose` gibt ihn zurück. Der Vorteil ist das klare Besitzmodell: Wer das `IMemoryOwner<T>` hält, besitzt den Puffer, und `using` sorgt für die Rückgabe. Die Standardinstanz `MemoryPool<T>.Shared` baut intern auf `ArrayPool<T>.Shared` auf. Was `Memory<T>` von `Span<T>` unterscheidet, steht in „Span&lt;T&gt; und Memory&lt;T&gt;“.
+
+{/* TODO(verify): MemoryPool<T>.Shared is implemented by ArrayMemoryPool<T> on top of ArrayPool<T>.Shared, and its Memory may be longer than the requested minimum. */}
+
+**`ObjectPool<T>`** aus dem Paket `Microsoft.Extensions.ObjectPool` poolt beliebige Objekte, nicht nur Arrays. Eine Policy (`IPooledObjectPolicy<T>`) legt fest, wie ein Objekt erzeugt und beim Zurückgeben zurückgesetzt wird, ein typisches Beispiel ist ein `StringBuilder`, der vor der Wiederverwendung geleert wird. Wichtig: Der Pool begrenzt nicht, wie viele Objekte erzeugt werden, sondern nur, wie viele er behält. Die Dokumentation empfiehlt ihn ausdrücklich nur für Objekte, die teuer zu erzeugen sind, und erst nach einer Messung.
+
+{/* TODO(verify): DefaultObjectPool keeps at most Environment.ProcessorCount * 2 objects by default (MaximumRetained). */}
+
+**`RecyclableMemoryStream`** aus dem Paket `Microsoft.IO.RecyclableMemoryStream` ersetzt `MemoryStream` durch eine Variante, die ihren Inhalt in gepoolten Blöcken hält. Sie lohnt sich dort, wo viele große `MemoryStream`-Instanzen entstehen.
+
+</Block>
+
+<Block n={7} title="Stolperfalle: wenn Pooling schadet">
+
+Pooling ist kein kostenloser Gewinn. Es tauscht Allokationen gegen Verwaltungsaufwand, Speicher, der dauerhaft belegt bleibt, und eine Fehlerklasse, die es ohne Pool nicht gibt. In mehreren Fällen geht dieser Tausch schlecht aus.
+
+**Kleine, kurzlebige Arrays.** Eine Gen0-Allokation von 64 Byte ist ein Zeigersprung im Allocation Context. Ein `Rent` dagegen berechnet den Bucket, liest einen Thread-statischen Slot, und `Return` schreibt ihn zurück. Bei sehr kleinen Arrays kann das teurer sein als die Allokation, deren Garbage Gen0 billig wegräumt, weil tote Objekte dort nichts kosten. Für kleine, begrenzte Größen ist ohnehin oft `stackalloc` die bessere Wahl, siehe „stackalloc“.
+
+**Arrays, die nie zurückkommen.** Wer in einem Producer-Consumer-Muster auf vielen Threads leiht und auf anderen zurückgibt oder einen Puffer an eine langlebige Struktur übergibt, landet bei leeren Thread-Slots und vollen Partitionen. Der Pool alloziert dann trotzdem ständig neu und verwirft Arrays beim Zurückgeben.
+
+**Speicher, der nie zurückkehrt.** Ein Pool hält Arrays, die vielleicht nie wieder gebraucht werden. Eine einmalige Lastspitze mit vielen parallelen 1-MB-Puffern hinterlässt einen Pool voller großer Arrays. `SharedArrayPool` trimmt sich deshalb nach Gen2-Collections selbst, ein eigener Pool mit `Create()` oder ein selbst geschriebener Pool tut das nicht.
+
+**Alte Arrays, junge Verweise.** Gepoolte Arrays leben lange und landen deshalb in Gen2 (oder liegen als große Arrays von Anfang an im LOH, der logisch zu Gen2 gehört). Für ein `byte[]` ist das gleichgültig. Ein Array mit **Verweisen**, etwa aus `ArrayPool<object>`, ist dagegen ein altes Objekt, in das ständig Verweise auf junge Objekte geschrieben werden. Jeder dieser Schreibzugriffe läuft durch die Write Barrier und markiert Karten in der Card Table, und jede Gen0-Collection muss diese Karten durchsuchen. Ein frisches Array in Gen0 hätte dieses Problem nicht. Wie das genau abläuft, zeigt die Lektion „Write Barriers und Card Tables“, warum alte Objekte so behandelt werden, erklärt „Generationen“.
+
+Die Faustregel: Poole große Puffer (ab einigen Kilobyte) und Puffer, die sehr häufig entstehen. Poole nicht reflexhaft jedes Array, und miss vorher und nachher.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+Das Standardmuster für einen gepoolten Puffer sieht so aus:
+
+```csharp
+byte[] buffer = ArrayPool<byte>.Shared.Rent(size);
+try
+{
+    int read = await stream.ReadAsync(buffer.AsMemory(0, size));
+    Process(buffer.AsSpan(0, read));
+}
+finally
+{
+    ArrayPool<byte>.Shared.Return(buffer);
+}
+```
+
+Für kleine Größen kombinierst du es mit `stackalloc`: Bis zu einer festen Grenze liegt der Puffer auf dem Stack, darüber kommt er aus dem Pool. Dieses Hybridmuster ist in der Lektion „stackalloc“ ausführlich beschrieben.
+
+Wo du nicht selbst poolen musst, weil es die Bibliothek tut:
+
+- **`Stream.CopyTo` und `Stream.CopyToAsync`** leihen ihren Kopierpuffer bereits aus dem Pool.
+- **System.IO.Pipelines** verwaltet Puffer in Segmenten aus einem Pool und gibt sie zurück, sobald du die Daten als gelesen markierst. Für Netzwerkprotokolle ist das meist der bessere Weg als Puffer von Hand.
+- **String-Interpolation** (`$"..."`) baut den Text über einen Interpolated String Handler zusammen, der seinen Zwischenpuffer aus `ArrayPool<char>.Shared` leiht.
+
+{/* TODO(verify): Stream.CopyTo/CopyToAsync and the interpolated string handler (DefaultInterpolatedStringHandler) rent their buffers from ArrayPool<T>.Shared. */}
+
+Um zu sehen, ob sich ein Pool lohnt, beobachte die Allokationsrate und die Zahl der Gen2-Collections, etwa mit `dotnet-counters`. Sinken beide nach der Umstellung deutlich, hat sich der Pool gelohnt. Sinkt nur die Allokationsrate, während Gen0-Pausen länger werden, ist oft genau die Card-Table-Falle aus dem vorigen Abschnitt der Grund.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+`ArrayPool<T>` ist reiner Bibliothekscode, der JIT behandelt ihn nicht besonders. An drei Stellen arbeitet der Pool aber eng mit der Runtime zusammen.
+
+**Uninitialisierte Allokation.** Muss der Pool ein neues Array anlegen, nutzt er für primitive Elementtypen `GC.AllocateUninitializedArray<T>`. Damit darf die Runtime auf das Nullen verzichten, was bei großen Arrays spürbar Zeit spart. Für Typen mit Verweisen geht das nicht: Der GC darf nie zufällige Bitmuster als Verweis sehen, deshalb nutzt der Pool dort ein normales `new T[]`.
+
+{/* TODO(verify): GC.AllocateUninitializedArray only skips zeroing above a size threshold (about 2 KB?) and never for types containing references. */}
+
+**Rückmeldung vom GC.** Beim ersten Benutzen registriert der Pool einen Rückruf, den die Runtime nach jeder Gen2-Collection aufruft. In diesem Rückruf trimmt der Pool sich selbst. Dabei misst er die Speicherauslastung: Ab 70 Prozent der Schwelle für hohe Speicherlast gilt der Druck als mittel, ab 90 Prozent als hoch. Bei niedrigem und mittlerem Druck gibt er Arrays frei, die seit einer Minute niemand geliehen hat, und zwar nur wenige pro Durchgang. Bei hohem Druck wartet er nur zehn Sekunden und leert auch die Thread-Slots vollständig.
+
+{/* TODO(verify): Trim thresholds from SharedArrayPool.cs and Utilities.GetMemoryPressure: 0.70 and 0.90 of HighMemoryLoadThresholdBytes, TrimAfterMS 60 s, HighTrimAfterMS 10 s, 1, 2 or all arrays per partition for low, medium and high pressure, thread-local slots after 30 s (15 s under medium pressure), all of them under high pressure. */}
+
+**Diagnose.** Der Pool meldet Ereignisse über die EventSource `System.Buffers.ArrayPoolEventSource`: wenn ein Array geliehen, neu angelegt, zurückgegeben, verworfen oder getrimmt wird. Mit `dotnet-trace` lässt sich so nachweisen, ob ein Pool tatsächlich Arrays wiederverwendet oder ständig neu alloziert.
+
+{/* TODO(verify): EventSource name "System.Buffers.ArrayPoolEventSource" and its events (BufferRented, BufferAllocated, BufferReturned, BufferTrimmed, BufferDropped). */}
+
+<Callout kind="version">
+  Der Aufbau von `SharedArrayPool` hat sich mehrfach geändert. Ältere Versionen poolten nur Arrays
+  bis 2^20 Elemente (rund eine Million) und hielten weniger Arrays pro Prozessor. In aktuellen Versionen reichen die
+  Größenklassen bis 2^30 Elemente, und die Zahl der Partitionen und Arrays lässt sich über
+  Umgebungsvariablen einstellen. Prüfe bei Zahlen aus älteren Blogposts immer, auf welche Version
+  sie sich beziehen.
+</Callout>
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente. Das erste zeigt die Größenklassen, die Wiederverwendung und die Prüfung beim `Return`. Das zweite vergleicht `new` und Pool für ein kleines und ein großes Array.
+
+{/* TODO(verify): Expected output of the SharpLab program and expected allocations: New(64) 88 B, New(131072) about 131 KB, Pooled allocates nothing in both cases after warm-up; Pooled(64) may be slower than New(64). */}
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „Run“. Erwartet sind die Längen 16, 16, 32, 128, 1024 und 8192, danach True für dasselbe Array und eine ArgumentException für das selbst angelegte byte[100]."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'New (64)', allocated: '88 B' },
+    { method: 'Pooled (64)', allocated: 'keine' },
+    { method: 'New (131072)', allocated: 'rund 128 KB' },
+    { method: 'Pooled (131072)', allocated: 'keine' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. Bei 64 Byte ist der Pool nicht unbedingt schneller als new, bei 128 KB spart er die LOH-Allokation und die Gen2-Collections, die sie auslöst."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="pooling"
+  questions={[
+    {
+      q: 'Wie lang ist das Array aus ArrayPool<byte>.Shared.Rent(100)?',
+      options: ['Genau 100', 'Mindestens 100, derzeit 128'],
+      correct: 1,
+      explanation:
+        'Die Dokumentation garantiert nur mindestens die angeforderte Länge. Shared rundet auf die nächste Größenklasse auf, eine Zweierpotenz ab 16.',
+    },
+    {
+      q: 'Was passiert mit der Variable buf nach ArrayPool<byte>.Shared.Return(buf)?',
+      options: [
+        'Sie wird auf null gesetzt',
+        'Sie zeigt weiter auf das Array, darf es aber nicht mehr benutzen',
+      ],
+      correct: 1,
+      explanation:
+        'Return ändert nichts an deinen Verweisen. Das Array gehört jetzt dem Pool und kann jederzeit an jemand anderen gehen. Jeder weitere Zugriff ist ein Fehler.',
+    },
+    {
+      q: 'Ein Array wird zweimal an ArrayPool<T>.Shared zurückgegeben. Was passiert?',
+      options: [
+        'Eine InvalidOperationException',
+        'Nichts Sichtbares, aber zwei spätere Rent-Aufrufe können dasselbe Array bekommen',
+      ],
+      correct: 1,
+      explanation:
+        'Der gemeinsame Pool erkennt doppelte Rückgaben nicht. Das Array liegt dann zweimal im Pool, und zwei Besitzer schreiben in denselben Speicher.',
+    },
+    {
+      q: 'Ein Array aus Rent wird nie zurückgegeben. Ist das ein Speicherleck?',
+      options: ['Ja, der Pool hält es für immer', 'Nein, der GC sammelt es ein, wenn es unerreichbar ist'],
+      correct: 1,
+      explanation:
+        'Der Pool kennt verliehene Arrays nicht. Ein vergessenes Return kostet nur die Wiederverwendung, der Pool muss beim nächsten Mal neu allozieren.',
+    },
+    {
+      q: 'Was passiert bei ArrayPool<byte>.Shared.Return(new byte[100])?',
+      options: ['Das Array wird aufgenommen', 'ArgumentException', 'Es wird still verworfen'],
+      correct: 1,
+      explanation:
+        '100 ist keine Größenklasse des Pools. Shared prüft, ob die Länge exakt zu einem Bucket passt, und wirft sonst eine ArgumentException.',
+    },
+    {
+      q: 'Warum kann ein großes, gepooltes object[] die Gen0-Collections verlangsamen?',
+      options: [
+        'Weil gepoolte Arrays bei jeder Collection kopiert werden',
+        'Weil es in Gen2 liegt und Verweise auf junge Objekte Karten in der Card Table markieren',
+      ],
+      correct: 1,
+      explanation:
+        'Das langlebige Array ist alt, die hineingeschriebenen Objekte sind jung. Die Write Barrier markiert die Karten, und jede Gen0-Collection muss sie durchsuchen. Bei byte[] gibt es dieses Problem nicht.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- Ein Pool tauscht **Allokationen gegen Verantwortung**: Gepoolte Arrays sind normale Heap-Objekte, deren Lebensende du selbst bestimmst.
+- `Rent(n)` liefert **mindestens** `n` Elemente, bei `Shared` die nächste Zweierpotenz ab 16. Die echte Länge musst du selbst mitführen.
+- Der Inhalt eines geliehenen Arrays ist **beliebig**. Für sensible Daten `Return(buf, clearArray: true)` verwenden.
+- **Genau einmal zurückgeben, danach nicht mehr anfassen.** Der Pool erkennt weder doppeltes `Return` noch Zugriffe danach. Ein vergessenes `Return` ist dagegen harmlos.
+- `ArrayPool<T>.Shared` arbeitet mit **einem Slot pro Thread und Bucket** und Partitionen pro Prozessor, und er trimmt sich nach Gen2-Collections.
+- Pooling lohnt sich für **große oder sehr häufige** Puffer. Bei kleinen Arrays ist Gen0 oft billiger, bei Arrays mit Verweisen droht die Card-Table-Falle.
+
+</Block>

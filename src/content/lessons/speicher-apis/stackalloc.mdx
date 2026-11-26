@@ -1,0 +1,334 @@
+---
+id: stackalloc
+title: stackalloc
+summary: Wie du kleine temporäre Puffer direkt im Stack-Frame anlegst, warum der Speicher erst beim Rücksprung frei wird und wann stackalloc gefährlicher ist als ein gewöhnliches Array.
+status: draft
+dotnetVersion: '8+'
+sources:
+  - title: 'stackalloc-Ausdruck (C#-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/stackalloc
+  - title: 'SkipLocalsInitAttribute (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.skiplocalsinitattribute
+  - title: 'StackOverflowException (API-Referenz, Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/api/system.stackoverflowexception
+  - title: 'CA2014: stackalloc nicht in Schleifen verwenden (Microsoft Learn)'
+    url: https://learn.microsoft.com/en-us/dotnet/fundamentals/code-analysis/quality-rules/ca2014
+  - title: 'ECMA-335 (CLI-Standard), Partition III: localloc'
+    url: https://www.ecma-international.org/publications-and-standards/standards/ecma-335/
+  - title: 'Stephen Toub: Performance Improvements in .NET 8'
+    url: https://devblogs.microsoft.com/dotnet/performance-improvements-in-net-8/
+updated: 2026-11-26
+---
+
+import { Block, Callout, Legend, VerifyCard, Quiz } from '@/components/lesson';
+import { StepPlayer } from '@/components/viz';
+import script from './stackalloc.steps';
+import loopScript from './stackalloc-loop.steps';
+import decisionScript from './stackalloc-decision.steps';
+import { sharplabCode, benchmarkCode } from './stackalloc-verify';
+
+<Block n={1} title="Das Problem">
+
+Viele Methoden brauchen kurz einen Zwischenpuffer: Eine Zahl soll als Text formatiert werden, ein String als UTF-8 kodiert, ein paar Bytes einer Prüfsumme gesammelt. Der Puffer lebt nur wenige Mikrosekunden und wird nach dem Rücksprung nie wieder angefasst.
+
+Mit `new byte[64]` wird daraus trotzdem ein vollwertiges Objekt auf dem verwalteten Heap. Es bekommt einen Object Header, einen MethodTable-Zeiger und ein Längenfeld, die Runtime nullt es und der GC muss es später als tot erkennen. Einzeln ist das sehr billig, wie die Lektion „Allokation und Allocation Contexts“ zeigt: In Gen0 schiebt die Runtime nur einen Zeiger weiter. Teuer wird es durch die Menge. Ein Parser, der pro Token einen kleinen Puffer anlegt, erzeugt Millionen kurzlebiger Objekte pro Sekunde, und jede dieser Allokationen bringt die nächste Gen0-Collection ein Stück näher.
+
+Dabei gibt es für genau diesen Fall einen Speicher, der ohne GC auskommt: den Stack. Jede Methode bekommt beim Aufruf einen Stack-Frame für ihre lokalen Variablen, und beim Rücksprung verschwindet er wieder, ohne dass irgendjemand aufräumen muss. Mit `stackalloc` darfst du in diesem Frame einen Block beliebiger Größe anfordern. Die Frage dieser Lektion ist, was dabei genau passiert und warum ausgerechnet diese billige Technik einen Prozess ohne Vorwarnung beenden kann.
+
+</Block>
+
+<Block n={2} title="Das mentale Modell">
+
+Stell dir den Stack eines Threads als einen einzigen zusammenhängenden Speicherbereich vor, in dem ein Zeiger die aktuelle Spitze markiert. Jeder Methodenaufruf schiebt diesen Zeiger um die Größe seines Frames weiter, jeder Rücksprung setzt ihn zurück. Daraus folgen vier Sätze:
+
+1. **`stackalloc` vergrößert den aktuellen Frame.** Der Stackzeiger rückt um die angeforderte Größe weiter, der Block liegt mitten zwischen den lokalen Variablen der Methode. Es entsteht kein Objekt, also auch kein Header und keine MethodTable.
+2. **Freigegeben wird beim Rücksprung der Methode**, nicht am Ende des Blocks, in dem `stackalloc` steht. Es gibt keine Möglichkeit, den Speicher früher zurückzugeben.
+3. **Der GC sieht den Block nicht.** Er wird weder gescannt noch verschoben noch eingesammelt. Deshalb darf er auch keine Verweise auf verwaltete Objekte enthalten.
+4. **Der Stack ist klein und endlich.** Wer zu viel anfordert, löst einen Stack Overflow aus, und den kann .NET nicht abfangen: Der Prozess endet sofort.
+
+<Callout kind="fehlannahme">
+  „stackalloc ist immer schneller als new.“ Nicht unbedingt. Eine Gen0-Allokation ist ebenfalls
+  nur ein Zeigersprung, und beide Varianten nullen ihren Speicher. Der Gewinn von stackalloc liegt
+  vor allem darin, dass später keine GC-Arbeit anfällt. Bei großen Blöcken kostet das Nullen
+  dagegen genauso viel wie auf dem Heap, und der Stack wird knapp.
+</Callout>
+
+<Legend />
+
+</Block>
+
+<Block n={3} title="Durchspielen">
+
+Das folgende Beispiel gibt eine Zahl hexadezimal aus, einmal mit einem Puffer aus `stackalloc` und einmal mit einem gewöhnlichen Array. Achte darauf, wo der Puffer jeweils liegt und was nach dem Rücksprung von ihm übrig bleibt.
+
+<StepPlayer script={script} />
+
+Im Tab „IL“ siehst du die eigentliche Arbeit: Der Compiler rechnet die Größe in Byte aus (8 Zeichen zu je 2 Byte), die Instruktion `localloc` liefert einen Zeiger auf den neuen Block, und der Konstruktor von `Span<char>` verpackt Zeiger und Länge. Die Kopfzeile `.locals init` ist das Flag, das den Block nullt. Dazu gleich mehr.
+
+{/* TODO(verify): IL of WriteHex in a Release build (SharpLab): constant folded size, conv.u, localloc, Span<char>..ctor(void*, int32). */}
+
+Der Unterschied zur Heap-Variante liegt nicht beim Anlegen, sondern danach. Der Stack-Block verschwindet mit dem Frame, ohne dass irgendetwas zu tun ist. Das Array dagegen bleibt als tote Masse in Gen0 liegen, bis die nächste Collection es findet.
+
+</Block>
+
+<Block n={4} title="Span oder Zeiger">
+
+`stackalloc` gibt es in zwei Formen. Die ältere stammt aus der Zeit vor `Span<T>` und liefert einen Zeiger:
+
+```csharp
+unsafe
+{
+    int* p = stackalloc int[16];
+    p[20] = 1;   // keine Prüfung: überschreibt fremde Teile des Stacks
+}
+```
+
+Zeiger brauchen einen `unsafe`-Kontext, und mit gutem Grund: Über `p[20]` schreibst du ungeprüft hinter das Ende des Blocks, mitten in andere lokale Variablen oder in die Rücksprungadresse. Auf dem Heap würde ein solcher Fehler ein fremdes Objekt zerstören, auf dem Stack kann er den Kontrollfluss des Programms verbiegen.
+
+Seit C# 7.2 lässt sich das Ergebnis direkt einem `Span<T>` oder `ReadOnlySpan<T>` zuweisen, ganz ohne `unsafe`:
+
+```csharp
+Span<int> s = stackalloc int[16];
+s[20] = 1;   // IndexOutOfRangeException, der Stack bleibt heil
+```
+
+{/* TODO(verify): C# 7.2 as the version that allowed stackalloc to Span<T> without unsafe, and C# 8 for stackalloc in nested expressions (e.g. the conditional operator). */}
+
+Der `Span` kennt seine Länge und prüft jeden Zugriff. Er ist ein `ref struct` und darf deshalb nicht auf den Heap gelangen: kein Feld in einer Klasse, keine Box, keine Rückgabe aus der Methode, die den Block angelegt hat. Genau diese Regeln sorgen dafür, dass nie ein Verweis auf einen bereits abgebauten Frame übrig bleibt. Wie der Compiler das prüft, erklärt die Lektion „ref struct, ref-Locals und scoped“. Was ein `Span` intern ist, steht in „Span&lt;T&gt; und Memory&lt;T&gt;“.
+
+Zwei weitere Regeln folgen direkt aus dem Modell:
+
+- **Nur unmanaged Typen.** In `stackalloc T[n]` muss `T` ein unmanaged Typ sein, also eine Zahl, ein `char`, ein `bool`, ein Enum, ein Zeiger oder ein Struct, das rekursiv nur solche Felder enthält. `stackalloc string[4]` lässt der Compiler nicht zu, weil der GC Verweise in diesem Block nie finden würde.
+- **Nicht in `catch` und `finally`.** Die Laufzeit erlaubt `localloc` nicht innerhalb von Exception-Handlern, und der Compiler setzt das als Fehler durch.
+
+{/* TODO(verify): Compiler error CS0255 "stackalloc may not be used in a catch or finally block" and ECMA-335 rule that localloc is not allowed in filter, catch, finally or fault blocks. */}
+
+</Block>
+
+<Block n={5} title="Wie viel Stack es gibt">
+
+Der Heap wächst, solange das Betriebssystem Speicher hergibt. Der Stack eines Threads dagegen wird beim Start des Threads mit einer festen Größe reserviert und wächst danach nie über diese Größe hinaus. Wie groß er ist, hängt vom Betriebssystem und davon ab, wer den Thread erzeugt hat:
+
+| Thread                              | Typische Stackgröße                                 |
+| ----------------------------------- | --------------------------------------------------- |
+| Haupt-Thread unter Windows          | 1 MB, festgelegt im Header der ausführbaren Datei   |
+| Haupt-Thread unter Linux            | Vorgabe der Shell (`ulimit -s`), oft 8 MB           |
+| Von .NET erzeugte Threads unter Linux und macOS | 1,5 MB                                   |
+| `new Thread(start, maxStackSize)`   | so viel, wie du angibst (gerundet vom System)       |
+
+{/* TODO(verify): All values in this table: 1 MB main thread on Windows x64 (PE header of dotnet.exe / apphost), Linux main thread from ulimit -s, 1.5 MB default for threads created by the runtime on Linux and macOS, ThreadPool threads using the same default, and the DOTNET_DefaultStackSize setting. */}
+
+Die genauen Zahlen sind weniger wichtig als die Folgerung: Ein und derselbe Code kann auf dem Haupt-Thread unter Linux funktionieren und auf einem Worker-Thread unter Windows abstürzen. Und dein `stackalloc` teilt sich den Stack mit allen Frames darüber. Eine Methode, die 100 KB anfordert, ist harmlos, wenn sie aus `Main` gerufen wird, und tödlich, wenn sie tief in einer Rekursion steckt.
+
+### Warum ein Stack Overflow den Prozess beendet
+
+Am Ende des reservierten Stack-Bereichs liegt eine Schutzseite (Guard Page). Wer sie berührt, löst eine Ausnahme des Betriebssystems aus. Die Runtime könnte daraus eine `StackOverflowException` machen, aber in genau diesem Moment ist kein Platz mehr auf dem Stack, um einen `catch`-Block, einen `finally`-Block oder auch nur die Suche nach einem Handler auszuführen. Seit .NET Framework 2.0 gilt deshalb: Eine `StackOverflowException` lässt sich nicht mit `try`/`catch` abfangen, der Prozess wird beendet. Es laufen keine `finally`-Blöcke, keine Finalizer und keine Logging-Handler.
+
+<Callout kind="warnung">
+  Kommt die Größe eines `stackalloc` aus einer Eingabe, etwa der Länge eines Request-Headers, dann
+  kann ein Angreifer mit einer einzigen langen Eingabe deinen Prozess beenden. Eine Obergrenze ist
+  deshalb keine Optimierung, sondern eine Sicherheitsmaßnahme.
+</Callout>
+
+Microsoft Learn empfiehlt darum, die Größe immer zu begrenzen und oberhalb einer Grenze auf ein Array auszuweichen. Die Dokumentation verwendet dafür 1024 Byte als Beispiel und betont, dass man die Grenze konservativ wählen soll, weil der verfügbare Stack von der Umgebung abhängt. In dotnet/runtime selbst sind Grenzen von einigen hundert Byte üblich.
+
+{/* TODO(verify): Typical stackalloc thresholds used in dotnet/runtime (e.g. 256 or 512 bytes, StackallocThreshold constants). */}
+
+</Block>
+
+<Block n={6} title="Nullen oder nicht: SkipLocalsInit">
+
+Die C#-Spezifikation nennt den Inhalt eines frischen `stackalloc`-Blocks **undefiniert**. In der Praxis findest du trotzdem Nullen, und das liegt an einem Flag im Methodenkopf: Der C#-Compiler markiert jede Methode mit `.locals init`. Für dieses Flag schreibt der CLI-Standard vor, dass alle lokalen Variablen und auch der Speicher aus `localloc` genullt werden. Der JIT erzeugt dafür Code, der den Block vor der ersten Verwendung mit Nullen füllt.
+
+Für 16 Byte ist das bedeutungslos. Für 16 KB ist es eine Schleife über 16.384 Byte, die bei jedem Aufruf läuft, auch wenn der Code den Puffer danach sowieso vollständig überschreibt. Hier setzt `[SkipLocalsInit]` an (seit C# 9 und .NET 5):
+
+```csharp
+[SkipLocalsInit]
+static int Encode(string s)
+{
+    Span<byte> buf = stackalloc byte[4096];   // nicht genullt
+    int n = Encoding.UTF8.GetBytes(s, buf);
+    return Checksum(buf[..n]);                // liest nur, was geschrieben wurde
+}
+```
+
+{/* TODO(verify): SkipLocalsInit requires AllowUnsafeBlocks (compiler error otherwise), introduced with C# 9 and .NET 5. */}
+
+Das Attribut weist den Compiler an, das Flag wegzulassen. Es wirkt auf die Methode und alle darin geschachtelten Lambdas und lokalen Funktionen, auf einen Typ oder auf ein ganzes Modul angewendet entsprechend auf alles darin. Weil der Code dadurch uninitialisierten Speicher sehen kann, gilt es als unsicher und verlangt die Compiler-Option `AllowUnsafeBlocks`.
+
+Zwei Dinge bleiben dabei sicher. Erstens sorgt der JIT weiterhin dafür, dass lokale Verweisvariablen genullt sind, denn der GC darf nie einen zufälligen Wert für einen Verweis halten. Zweitens nullt `new` auf dem Heap immer, das Attribut betrifft nur lokale Variablen und `stackalloc`. Gefährlich wird es nur, wenn du aus dem Block liest, bevor du hineingeschrieben hast. Dann siehst du Reste früherer Frames, im schlimmsten Fall Teile von Passwörtern oder Schlüsseln, die eine andere Methode zuvor auf dem Stack hatte.
+
+{/* TODO(verify): The JIT still zero-initializes GC reference locals under SkipLocalsInit. */}
+
+</Block>
+
+<Block n={7} title="Stolperfalle: stackalloc in Schleifen">
+
+Satz 2 des Modells klingt harmlos, hat aber eine unangenehme Folge. Die Variable, der du den Block zuweist, verliert am Ende des Schleifenrumpfs ihren Gültigkeitsbereich. Der Block selbst bleibt liegen. Steht `stackalloc` in einer Schleife, wächst der Frame mit jeder Iteration.
+
+<StepPlayer script={loopScript} />
+
+Das Tückische daran: Mit kleinen Testdaten funktioniert der Code einwandfrei. Erst die Produktionsdatei mit 10.000 Zeilen bringt den Prozess zum Absturz, und zwar ohne Exception im Log, weil keine Behandlung mehr läuft. Der Analyzer CA2014 meldet `stackalloc` in Schleifen deshalb als Warnung. Die Lösung ist immer dieselbe: den Block vor der Schleife anlegen und in jeder Iteration wiederverwenden, notfalls mit `Clear()` dazwischen.
+
+Dasselbe Problem hat eine versteckte Variante: Rekursion. Eine rekursive Methode mit `stackalloc byte[512]` verbraucht pro Ebene 512 Byte zusätzlich zu ihrem normalen Frame. Bei einer Rekursionstiefe, die von den Daten abhängt, etwa beim Durchlaufen eines Baums, ist der Overflow nur eine Frage der Eingabe.
+
+</Block>
+
+<Block n={8} title="In der Praxis">
+
+`stackalloc` ist ein Werkzeug für einen engen Fall: kleiner, nach oben begrenzter Puffer, der die Methode nicht verlässt. Für alles andere gibt es bessere Wege. Die folgende Entscheidung spielt vier typische Fälle durch.
+
+<StepPlayer script={decisionScript} />
+
+### Das Hybridmuster
+
+Der zweite Fall ist in dotnet/runtime allgegenwärtig: kleine Eingaben auf dem Stack, große aus dem Pool. Vollständig sieht das Muster so aus:
+
+```csharp
+const int StackLimit = 256;
+
+char[]? rented = null;
+Span<char> buf = path.Length <= StackLimit
+    ? stackalloc char[StackLimit]
+    : (rented = ArrayPool<char>.Shared.Rent(path.Length));
+try
+{
+    buf = buf[..path.Length];          // auf die echte Länge zuschneiden
+    int n = Normalize(path, buf);
+    return new string(buf[..n]);
+}
+finally
+{
+    if (rented is not null)
+        ArrayPool<char>.Shared.Return(rented);
+}
+```
+
+Drei Details sind wichtig. Erstens steht in `stackalloc` die **Konstante** `StackLimit`, nicht die tatsächliche Länge. So ist die Stack-Belegung unabhängig von der Eingabe immer gleich, und der JIT sieht eine feste Größe. Zweitens ist `buf` danach so lang wie der Stack-Block oder das geliehene Array, nicht so lang wie die Eingabe, deshalb das Zuschneiden. Ein geliehenes Array kann ohnehin länger sein als angefordert. Drittens gehört die Rückgabe an den Pool in `finally`. Warum, und was beim Zurückgeben schiefgehen kann, zeigt die Lektion „ArrayPool und Pooling“.
+
+Wer kein `ArrayPool` will, ersetzt den Pool-Zweig durch `new char[path.Length]`, so wie im Beispiel von Microsoft Learn. Dann entfällt auch der `try`/`finally`-Block.
+
+### Wann stackalloc nicht passt
+
+- **Über `await` hinweg:** Ein `Span` darf nicht über ein `await` hinaus leben, weil der Frame nach dem `await` ein ganz anderer sein kann. Für asynchronen Code ist ein gepooltes Array oder `Memory<T>` das Mittel der Wahl.
+- **Große Puffer:** Ab einigen Kilobyte überwiegt das Risiko. 64 KB auf dem Stack sind auf einem Thread mit 1 MB Stack schon ein Sechzehntel des Ganzen.
+- **Ergebnisse:** Was der Aufrufer behalten soll, gehört auf den Heap. Der Compiler verhindert es ohnehin, einen `Span` über `stackalloc` zurückzugeben.
+
+</Block>
+
+<Block n={9} title="Was Runtime und JIT dazu tun">
+
+`stackalloc` wird im IL zur Instruktion `localloc`. Sie nimmt eine Größe in Byte vom Evaluation Stack und legt einen Zeiger auf den neuen Block zurück. Was der JIT daraus macht, hängt stark davon ab, ob die Größe eine Konstante ist.
+
+**Dynamische Größe.** Der JIT erzeugt Code, der den Stackzeiger um die (auf die Ausrichtung gerundete) Größe verringert. Weil der Block größer als eine Speicherseite sein kann, darf er die Seiten nicht in beliebiger Reihenfolge berühren, sonst würde er über die Guard Page hinwegspringen, ohne sie auszulösen. Der JIT fügt deshalb Stack Probes ein: Code, der jede neue Seite der Reihe nach einmal anfasst. Ist `.locals init` gesetzt, folgt die Schleife, die den Block nullt.
+
+**Konstante Größe.** Ist die Größe klein, konstant und steht `stackalloc` nicht in einer Schleife, kann der JIT auf `localloc` ganz verzichten und den Block wie eine gewöhnliche lokale Variable fest in den Frame einplanen. Dann entfällt die Anpassung des Stackzeigers zur Laufzeit. Das ist ein weiterer Grund, im Hybridmuster eine Konstante zu verwenden.
+
+{/* TODO(verify): Exact x64 assembly for localloc with variable size (stack probe loop, zeroing loop, alignment to 16 bytes), and the size limit below which RyuJIT converts constant-size localloc into a fixed frame local (JitStackAllocToLocalSize?). */}
+
+**Schutz vor Überläufen.** Microsoft Learn schreibt, dass `stackalloc` automatisch die Erkennung von Pufferüberläufen der Runtime einschaltet. Der JIT legt dafür einen Kontrollwert (GS-Cookie) in den Frame und prüft ihn vor dem Rücksprung. Wurde er überschrieben, beendet die Runtime den Prozess sofort, damit eingeschleuster Code nicht zum Zug kommt. Mit `Span` bist du davor schon durch die Bereichsprüfung geschützt, die Zeiger-Form hat diesen Schutz nicht.
+
+{/* TODO(verify): Name "GS cookie" and that RyuJIT places it in methods with localloc or unsafe buffers. */}
+
+**Inlining.** Methoden mit `localloc` waren für den JIT lange ein Ausschlussgrund beim Inlining: Würde er sie in eine Schleife des Aufrufers einbetten, wüchse plötzlich dessen Frame mit jeder Iteration, genau wie in der Stolperfalle oben. Neuere JIT-Versionen erlauben das Inlining für kleine, konstante Größen. Verlass dich nicht darauf, dass ein Helfer mit `stackalloc` inlined wird. Mehr dazu in „Inlining“.
+
+{/* TODO(verify): .NET version since which the JIT can inline methods containing a small constant-size stackalloc, and the conditions (not in a loop of the caller). */}
+
+<Callout kind="version">
+  Ab .NET 10 kann die Escape-Analyse des JIT kleine Arrays mit Werttyp-Elementen selbst auf den
+  Stack legen, wenn sie die Methode nachweislich nicht verlassen. Ein `new byte[16]` kostet dann
+  keine Heap-Allokation mehr. Das ersetzt `stackalloc` nicht, denn sobald das Array an eine nicht
+  inlinte Methode geht, gilt es als entkommen. Details in „Escape Analysis“.
+</Callout>
+
+{/* TODO(verify): .NET 10 stack allocation of small fixed-size value-type arrays by escape analysis, and which conditions make an array escape. */}
+
+</Block>
+
+<Block n={10} title="Selbst nachweisen">
+
+Zwei Experimente. In SharpLab siehst du, wie unterschiedlich der JIT konstante und dynamische Größen behandelt und was `[SkipLocalsInit]` am Assembler ändert. Der Benchmark zeigt die Allokationen und die Kosten des Nullens bei einem großen Block.
+
+{/* TODO(verify): Expected results on x64 and .NET 8: Heap allocates 56 B (char[16]), the stack variants allocate nothing; Stack16KNoInit measurably faster than Stack16K. On .NET 10 Heap may allocate nothing due to escape analysis. */}
+
+<VerifyCard
+  sharplab="Füge den Code auf sharplab.io ein und stelle die Ausgabe auf „IL“. In allen drei Methoden steht localloc, im Methodenkopf von NoInit fehlt aber init bei .locals. Schalte dann auf „JIT Asm“ (Release): Hex kommt ohne Anpassung des Stackzeigers aus, Dynamic enthält eine Schleife zum Nullen, NoInit nicht."
+  code={sharplabCode}
+  benchmark={benchmarkCode}
+  expected={[
+    { method: 'Heap', allocated: '56 B' },
+    { method: 'Stack', allocated: 'keine' },
+    { method: 'Stack16K', allocated: 'keine' },
+    { method: 'Stack16KNoInit', allocated: 'keine' },
+  ]}
+  note="Werte für 64-Bit-Prozesse. Stack16K und Stack16KNoInit unterscheiden sich nur im Nullen der 16 KB. Unter .NET 10 kann auch Heap ohne Allokation auskommen, wenn die Escape-Analyse greift."
+/>
+
+</Block>
+
+<Block n={11} title="Prüfen">
+
+<Quiz
+  client:visible
+  lessonId="stackalloc"
+  questions={[
+    {
+      q: 'Wann wird der Speicher aus Span<byte> b = stackalloc byte[64]; in einem if-Block freigegeben?',
+      options: ['Am Ende des if-Blocks', 'Beim Rücksprung der Methode', 'Bei der nächsten Gen0-Collection'],
+      correct: 1,
+      explanation:
+        'Speicher aus localloc lebt bis zum Rücksprung der Methode. Nur der Name b verliert am Blockende seine Gültigkeit. Der GC ist überhaupt nicht beteiligt.',
+    },
+    {
+      q: 'Kann ein try/catch um einen zu großen stackalloc den Absturz verhindern?',
+      options: ['Ja, mit catch (StackOverflowException)', 'Nein, der Prozess wird beendet'],
+      correct: 1,
+      explanation:
+        'Eine StackOverflowException lässt sich seit .NET Framework 2.0 nicht abfangen. Es laufen weder catch noch finally. Schützen kann nur eine Obergrenze vor dem stackalloc.',
+    },
+    {
+      q: 'Eine Schleife mit 5.000 Iterationen enthält Span<byte> tmp = stackalloc byte[512];. Wie viel Stack belegt der Frame am Ende?',
+      options: ['512 Byte', 'Rund 2,5 MB', 'Das hängt vom GC ab'],
+      correct: 1,
+      explanation:
+        'Jede Iteration fordert einen neuen Block an, keiner wird vor dem Rücksprung frei. 5.000 mal 512 Byte sind rund 2,5 MB, mehr als ein typischer Thread-Stack. Den Block vor die Schleife ziehen.',
+    },
+    {
+      q: 'Span<char> buf = n <= 256 ? stackalloc char[256] : new char[n]; Wie lang ist buf bei n = 10?',
+      options: ['10', '256'],
+      correct: 1,
+      explanation:
+        'Der Stack-Block hat die feste Größe 256, und genau so lang ist der Span. Deshalb schneidet man ihn danach mit buf[..n] auf die benötigte Länge zu.',
+    },
+    {
+      q: 'Was steht in stackalloc byte[64] in einer Methode mit [SkipLocalsInit], bevor du hineinschreibst?',
+      options: ['Garantiert Nullen', 'Was zuvor an dieser Stelle des Stacks lag'],
+      correct: 1,
+      explanation:
+        'Ohne das Flag .locals init nullt der JIT den Block nicht. Du siehst Reste früherer Frames. Lies deshalb nur, was du selbst geschrieben hast.',
+    },
+    {
+      q: 'Warum kompiliert Span<string> s = stackalloc string[4]; nicht?',
+      options: [
+        'Weil string kein unmanaged Typ ist und der GC Verweise im Block nicht finden würde',
+        'Weil stackalloc nur mit byte funktioniert',
+      ],
+      correct: 0,
+      explanation:
+        'stackalloc verlangt einen unmanaged Elementtyp. Der GC scannt den Block nicht, ein Verweis darin wäre für ihn unsichtbar und das Objekt könnte verschwinden.',
+    },
+  ]}
+/>
+
+</Block>
+
+<Block n={12} title="Das Wichtigste in Kürze">
+
+- `stackalloc` vergrößert den aktuellen **Stack-Frame**. Es entsteht kein Objekt, der GC ist nicht beteiligt, Freigeben kostet nichts.
+- Freigegeben wird beim **Rücksprung der Methode**, nicht am Ende des Blocks. In Schleifen und Rekursionen wächst der Frame deshalb immer weiter.
+- Der Stack ist klein (je nach Thread und System etwa 1 bis 8 MB), und ein **Stack Overflow beendet den Prozess**. Größen aus Eingaben immer begrenzen.
+- Bevorzuge die Form mit **`Span<T>`**: Sie braucht kein `unsafe` und prüft jeden Zugriff. Elementtypen müssen unmanaged sein.
+- Der Inhalt ist laut Sprache undefiniert. Genullt wird er nur wegen `.locals init`, und **`[SkipLocalsInit]`** spart dieses Nullen ein.
+- Das Standardmuster: kleine Größen mit **konstantem** `stackalloc`, große aus `ArrayPool` oder mit `new`, danach auf die echte Länge zuschneiden.
+
+</Block>

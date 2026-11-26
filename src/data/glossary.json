@@ -804,6 +804,83 @@
       "aliases": ["Binding Redirects"],
       "definition": "Eintrag in der app.config von .NET Framework, der Anfragen nach einer Assembly-Version auf eine andere umleitet. In .NET (Core) gibt es diesen Mechanismus nicht.",
       "lesson": "binding"
+    },
+    {
+      "id": "ref-struct",
+      "term": "ref struct",
+      "aliases": ["ref structs", "byref-like"],
+      "definition": "Struct, der nie auf den Heap gelangen darf: kein Boxing, kein Feld in Klassen, keine Erfassung in Lambdas. Der Compiler prüft das. Span<T> ist das bekannteste Beispiel.",
+      "lesson": "ref-struct"
+    },
+    {
+      "id": "verwalteter-verweis",
+      "term": "Verwalteter Verweis",
+      "aliases": ["Verwaltete Verweise", "byref", "Managed Pointer"],
+      "definition": "Ein ref in C#: zeigt auf eine Variable, ein Array-Element oder ein Feld, auch mitten in ein Objekt. Anders als ein roher Zeiger kennt der GC solche Verweise und passt sie beim Verschieben an.",
+      "lesson": "ref-struct"
+    },
+    {
+      "id": "innerer-zeiger",
+      "term": "Innerer Zeiger",
+      "aliases": ["Interior Pointer", "innere Zeiger"],
+      "definition": "Verweis auf eine Stelle innerhalb eines Objekts, etwa auf ein Array-Element. Der GC muss daraus das zugehörige Objekt bestimmen, damit es am Leben bleibt.",
+      "lesson": "span"
+    },
+    {
+      "id": "memory-t",
+      "term": "Memory<T>",
+      "aliases": ["ReadOnlyMemory<T>"],
+      "definition": "Gegenstück zu Span<T>, das auch auf dem Heap gespeichert werden darf, etwa in Feldern oder über await hinweg. Über die Eigenschaft Span erhält man bei Bedarf einen Span.",
+      "lesson": "span"
+    },
+    {
+      "id": "stackalloc",
+      "term": "stackalloc",
+      "aliases": [],
+      "definition": "Legt einen Puffer im aktuellen Stack-Frame an. Er wird beim Verlassen der Methode frei, ohne den GC zu beschäftigen, ist aber durch die Stack-Größe begrenzt.",
+      "lesson": "stackalloc"
+    },
+    {
+      "id": "skiplocalsinit",
+      "term": "SkipLocalsInit",
+      "aliases": ["SkipLocalsInitAttribute"],
+      "definition": "Attribut, das den Compiler anweist, lokale Variablen und stackalloc-Speicher nicht mit Nullen vorzubelegen. Spart Arbeit, der Inhalt ist dann aber undefiniert.",
+      "lesson": "stackalloc"
+    },
+    {
+      "id": "arraypool",
+      "term": "ArrayPool",
+      "aliases": ["ArrayPool<T>"],
+      "definition": "Pool für wiederverwendbare Arrays: Rent leiht ein Array von mindestens der verlangten Länge, Return gibt es zurück. Spart Allokationen bei großen oder häufigen Puffern.",
+      "lesson": "pooling"
+    },
+    {
+      "id": "objectpool",
+      "term": "ObjectPool",
+      "aliases": ["ObjectPool<T>"],
+      "definition": "Pool für wiederverwendbare Objekte aus Microsoft.Extensions.ObjectPool, etwa für StringBuilder.",
+      "lesson": "pooling"
+    },
+    {
+      "id": "gc-loch",
+      "term": "GC-Loch",
+      "aliases": ["GC hole"],
+      "definition": "Fehler, bei dem ein roher Zeiger auf ein verwaltetes Objekt zeigt, das der GC verschoben oder freigegeben hat, weil er den Zeiger nicht kannte. Danach liest oder schreibt der Code an einer falschen Stelle.",
+      "lesson": "unsafe-api"
+    },
+    {
+      "id": "gegendruck",
+      "term": "Gegendruck",
+      "aliases": ["Back Pressure"],
+      "definition": "Mechanismus, der einen schnellen Schreiber bremst, wenn der Leser nicht hinterherkommt, damit sich nicht unbegrenzt Daten im Speicher stauen.",
+      "lesson": "pipelines"
+    },
+    {
+      "id": "readonlysequence",
+      "term": "ReadOnlySequence",
+      "aliases": ["ReadOnlySequence<T>"],
+      "definition": "Folge von Speicherabschnitten (Segmenten), die wie ein zusammenhängender Puffer gelesen werden kann, ohne sie zu kopieren. PipeReader liefert gelesene Daten in dieser Form.",
+      "lesson": "pipelines"
     }
   ]
 }
